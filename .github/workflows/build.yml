@@ -14,34 +14,11 @@ permissions:
   contents: write  # needed for Releases
 
 jobs:
-  # Preflight: fail fast with an actionable message if PROTO_REPO_TOKEN isn't
-  # set on the repo. Without it, the matrix build can't clone the private
-  # paperanywhere/backend repo for the proto crate. The token must be a
-  # fine-grained PAT with `Contents: Read` on paperanywhere/backend.
-  preflight:
-    name: preflight (check secrets)
-    runs-on: ubuntu-latest
-    steps:
-      - name: verify PROTO_REPO_TOKEN is set
-        env:
-          HAS_TOKEN: ${{ secrets.PROTO_REPO_TOKEN != '' }}
-        run: |
-          if [ "${HAS_TOKEN}" != "true" ]; then
-            echo "::error::PROTO_REPO_TOKEN repo secret is not set."
-            echo ""
-            echo "Create a fine-grained PAT with Contents: Read on paperanywhere/backend,"
-            echo "then add it as a repo secret named PROTO_REPO_TOKEN under"
-            echo "Settings -> Secrets and variables -> Actions."
-            exit 1
-          fi
-          echo "PROTO_REPO_TOKEN is set; matrix build can proceed."
-
   # Per-board build matrix. Runs on every PR + push, and is the data source
   # the release job picks up artifacts from.
   build:
     name: cargo build (${{ matrix.board }})
     runs-on: ubuntu-latest
-    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -54,35 +31,7 @@ jobs:
           - inkplate-10
           - generic-esp32s3-waveshare-75
     steps:
-      # 1. Check out the firmware at workspace root.
       - uses: actions/checkout@v4
-
-      # 2. Check out the private backend repo alongside it. The backend hosts
-      #    `paperanywhere-proto`, which the firmware depends on. Using
-      #    actions/checkout authenticates via the standard GitHub token flow
-      #    (PROTO_REPO_TOKEN must have `Contents: read` on paperanywhere/backend)
-      #    so we avoid the cargo-libgit2 auth pitfall entirely.
-      - uses: actions/checkout@v4
-        with:
-          repository: paperanywhere/backend
-          token: ${{ secrets.PROTO_REPO_TOKEN }}
-          path: backend
-          fetch-depth: 1
-
-      # 3. Cargo patch override: redirect the firmware's git dep on
-      #    paperanywhere-proto to the local checkout. `[patch]` sections must
-      #    live in Cargo.toml (not .cargo/config.toml — that file is for cargo
-      #    configuration, not workspace overrides). We append a CI-only patch
-      #    here so the source Cargo.toml stays git-dep-form for normal builds.
-      - name: apply cargo patch override
-        run: |
-          cat >> Cargo.toml <<'EOF'
-
-          [patch."https://github.com/paperanywhere/backend"]
-          paperanywhere-proto = { path = "backend/crates/proto" }
-          EOF
-          echo "── Cargo.toml tail after patch ──"
-          tail -10 Cargo.toml
 
       - uses: esp-rs/xtensa-toolchain@v1.5
         with:

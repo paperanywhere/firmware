@@ -23,11 +23,10 @@ board-inkplate-10 = []
 board-generic-esp32s3-waveshare-75 = []
 
 [dependencies]
-# Shared wire types with the backend — same git ref bumped together.
-# Pull from the backend repo via path during local dev:
-#   paperanywhere-proto = { path = "../paperanywhere/crates/proto", default-features = false }
-# In CI / release builds, use a git ref:
-paperanywhere-proto = { git = "https://github.com/paperanywhere/backend", branch = "main", default-features = false }
+# Shared wire types — public repo, no auth needed.
+# Sibling-checkout dev: swap to a path dep against a local clone:
+#   paperanywhere-proto = { path = "../paperanywhere-proto", default-features = false }
+paperanywhere-proto = { git = "https://github.com/paperanywhere/proto", branch = "main", default-features = false }
 
 # ── esp-rs core ──
 esp-hal = { version = "0.22", features = ["esp32s3"] }

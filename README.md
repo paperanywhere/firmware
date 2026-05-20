@@ -73,11 +73,14 @@ performs irreversible hardware operations on your behalf.
 
 ## Wire types
 
-`paperanywhere-proto` is consumed as a git dependency so this firmware always
-agrees with the running backend on `ServerMsg` / `DeviceMsg` JSON. To develop
-both repos in lockstep, change the `paperanywhere-proto` line in `Cargo.toml`
-to a path dependency:
+`paperanywhere-proto` is consumed as a git dependency on the **public**
+[paperanywhere/proto](https://github.com/paperanywhere/proto) repo — same crate the backend
+consumes, so the wire format never diverges. For sibling-checkout dev:
 
 ```toml
-paperanywhere-proto = { path = "../paperanywhere/crates/proto", default-features = false }
+paperanywhere-proto = { path = "../paperanywhere-proto", default-features = false }
 ```
+
+Tag releases of `paperanywhere-proto` are the canonical schema boundary; both
+this firmware and the backend should pin to the same git rev (or version
+once published to crates.io) for any production build.
