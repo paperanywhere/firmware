@@ -298,6 +298,10 @@ pub struct BuildInfo {
     pub fw_version: &'static str,
     /// e.g. `2026-05-20 22:13 UTC`
     pub build_time: &'static str,
+    /// `true` when the device was flashed via `provtool --dev`. The
+    /// boot screen tags the version line with " (DEV)" so it's
+    /// visually obvious the firmware is on the dev channel.
+    pub is_dev: bool,
 }
 
 impl BuildInfo {

@@ -134,7 +134,7 @@ pub fn run(resources: FirmwareResources) -> ! {
     panel_ref.write_chunk(BOOT_SCREEN);
     {
         let mut region = panel_ref.main_region_mut();
-        crate::BUILD_INFO.render_into(&mut region);
+        crate::build_info(nvs_ref.load_is_dev_build()).render_into(&mut region);
     }
     panel_ref.compose();
     let pending = panel_ref.pending_hash();

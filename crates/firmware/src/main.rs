@@ -52,10 +52,16 @@ pub const FW_VERSION: &str = env!("PAPERANYWHERE_FW_VERSION");
 /// device can be cross-checked against the release that built it.
 pub const BUILD_TIME: &str = env!("PAPERANYWHERE_BUILD_TIME");
 
-/// `BuildInfo` the compositor uses to draw the boot-screen overlay.
-/// Cheap to construct from the two `&'static str` consts above.
-pub const BUILD_INFO: paperanywhere_compositor::BuildInfo =
-    paperanywhere_compositor::BuildInfo { fw_version: FW_VERSION, build_time: BUILD_TIME };
+/// Construct the `BuildInfo` the compositor uses to draw the boot-
+/// screen overlay. `is_dev` is sourced from NVS (set by `provtool --dev`)
+/// so the boot screen visibly tags dev firmware with " (DEV)".
+pub fn build_info(is_dev: bool) -> paperanywhere_compositor::BuildInfo {
+    paperanywhere_compositor::BuildInfo {
+        fw_version: FW_VERSION,
+        build_time: BUILD_TIME,
+        is_dev,
+    }
+}
 
 #[cfg(not(any(
     feature = "board-reterminal-e1001",

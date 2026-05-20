@@ -324,8 +324,16 @@ pub fn draw_build_info(region: &mut MainRegion<'_>, info: &BuildInfo) {
     .draw(&mut target);
 
     let bold = MonoTextStyle::new(&FONT_8X13_BOLD, BinaryColor::On);
+    // Compose "<version> (DEV)" when the dev flag is set, else plain
+    // version. heapless::String<48> is sized for the longest possible
+    // SHA-suffixed version + " (DEV)" tail.
+    let mut version_line: HString<48> = HString::new();
+    let _ = version_line.push_str(info.fw_version);
+    if info.is_dev {
+        let _ = version_line.push_str(" (DEV)");
+    }
     let _ = Text::with_text_style(
-        info.fw_version,
+        version_line.as_str(),
         Point::new(center_x, bottom_y - 14),
         bold,
         centered,

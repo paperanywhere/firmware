@@ -175,36 +175,19 @@ where
     // flash error) the updater logs and we continue with the rest of the
     // wake so the panel still gets refreshed.
     if let Some(update) = state.firmware_update.as_ref() {
-        if nvs.load_is_dev_build() {
-            // Dev signal baked in at flash time — skip OTA entirely so a
-            // hand-built dev binary doesn't get overwritten by the next
-            // release. Production devices land here with the flag false
-            // and proceed through the normal install path.
-            info!(
-                "wake: backend offered firmware update {} but device is in DEV mode — skipping",
-                update.version
-            );
-            // Drop through to the image-render path below so the panel
-            // still refreshes this wake.
-        } else {
-            info!(
-                "wake: backend offered firmware update {} (revoke={}, {} bytes)",
-                update.version, update.revoke, update.byte_len
-            );
-            if !ota_screen.is_empty() {
-                let ota_screen_hash = paperanywhere_ports::hash_bytes(ota_screen);
-                if Some(ota_screen_hash) != nvs.load_last_render_hash() {
-                    panel.set_chrome(sleeper.battery_mv(), wifi.rssi_dbm());
-                    panel.write_chunk(ota_screen);
-                    panel.refresh();
-                    nvs.save_last_render_hash(ota_screen_hash);
-                }
-            }
-            if let Err(e) = fw_updater.apply(http, &token, update).await {
-                warn!("wake: firmware update failed: {:?}", e);
-                // fall through — non-fatal; resume the normal render path.
-            }
-        }
+        // No device today consumes the backend-served firmware_update
+        // field. Production devices will pull releases from GitHub
+        // directly (task #74). Dev devices receive updates via a
+        // direct HTTP PUT to the device itself (task #79). The /state
+        // field is reserved for future use; for now we just log + skip.
+        info!(
+            "wake: /state firmware_update {} offered but no consumer wired for this channel — skipping",
+            update.version
+        );
+        let _ = update.revoke;
+        let _ = update.byte_len;
+        let _ = ota_screen;
+        let _ = fw_updater;
     }
 
     if let Some(image) = state.image.as_ref() {
@@ -213,29 +196,33 @@ where
         // image stream so the status bar reflects "just associated,
         // currently rendering image N" rather than stale values.
         panel.set_chrome(sleeper.battery_mv(), wifi.rssi_dbm());
-        // Stamp the last-update field NOW so it makes it into the
-        // hash dedup — if the time is the only thing that differs
-        // from the previous wake, we still refresh to update the bar.
-        let now = sleeper.unix_now();
-        if now > 0 {
-            let hh = (now / 3600) % 24;
-            let mm = (now / 60) % 60;
-            let mut buf: alloc::string::String = alloc::string::String::with_capacity(8);
-            let _ = core::fmt::write(&mut buf, format_args!("{:02}:{:02}", hh, mm));
-            panel.set_last_update(&buf);
-        }
         let render_result = stream_image_to_panel(http, panel, &token, image).await;
         let phase = match &render_result {
             Ok(()) => {
-                // Driver-level dedup: compose, hash, compare. Skips
-                // the slow e-ink refresh if nothing (image OR status
-                // bar) actually changed since last persisted state.
+                // Driver-level dedup: compose, hash, compare. The
+                // dedup question is "do the image bytes + the OTHER
+                // chrome (battery, wifi, usb, device id) differ from
+                // last refresh?" The last-update time is excluded
+                // from this compose so a clock-tick alone doesn't
+                // trigger a wasted e-ink refresh.
                 panel.compose();
                 let pending = panel.pending_hash();
                 let cached = nvs.load_last_render_hash();
                 if pending.is_none() || pending != cached {
+                    // We ARE going to refresh — stamp last_update
+                    // with the wall-clock now (so the user sees when
+                    // the panel was last touched), then recompose so
+                    // the new text lands in the bar before flushing.
+                    if let Some(stamp) = format_local_now(sleeper) {
+                        panel.set_last_update(&stamp);
+                        panel.compose();
+                    }
                     panel.refresh();
-                    if let Some(h) = pending {
+                    // Save the hash of what we actually flushed, not
+                    // the pre-stamp hash — otherwise the next wake
+                    // would think the panel needs a refresh again
+                    // just to show the same time.
+                    if let Some(h) = panel.pending_hash() {
                         nvs.save_last_render_hash(h);
                     }
                 } else {
@@ -298,4 +285,20 @@ where
     // compose() + the driver-level hash dedup before deciding to flush.
     let _ = image.byte_len.to_string(); // silence unused-import lint paths
     Ok(())
+}
+
+/// HH:MM stamp of the current wall-clock, or `None` when the device
+/// clock hasn't been NTP-synced yet (sleeper returns 0 in that case).
+/// Used by the runtime to set the status bar's "last update" field at
+/// the moment we commit to a panel refresh.
+fn format_local_now<S: Sleeper>(sleeper: &S) -> Option<alloc::string::String> {
+    let now = sleeper.unix_now();
+    if now == 0 {
+        return None;
+    }
+    let hh = (now / 3600) % 24;
+    let mm = (now / 60) % 60;
+    let mut buf: alloc::string::String = alloc::string::String::with_capacity(8);
+    let _ = core::fmt::write(&mut buf, format_args!("{:02}:{:02}", hh, mm));
+    Some(buf)
 }
