@@ -10,7 +10,7 @@ rustflags = [
 
 [unstable]
 # Xtensa rust ships without prebuilt std/core for the target — rebuild from
-# rust-src. `panic_immediate_abort` shaves a few KB and avoids pulling in
-# unwinding machinery we'd never use on no_std anyway.
+# rust-src. The `panic_immediate_abort` build-std-feature was renamed to a
+# real panic strategy in newer rust; we get the same effect via the
+# `panic = "abort"` profile setting in Cargo.toml.
 build-std = ["alloc", "core"]
-build-std-features = ["panic_immediate_abort"]
