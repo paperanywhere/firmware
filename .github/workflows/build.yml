@@ -53,6 +53,7 @@ jobs:
 
       - name: extract .bin via espflash
         run: |
+          sudo apt-get update && sudo apt-get install -y libudev-dev
           cargo install --locked espflash --version "^3"
           espflash save-image \
             --chip esp32s3 \
