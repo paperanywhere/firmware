@@ -56,9 +56,20 @@ The dashboard wizard surfaces all four as explicit choices when creating a devic
 
 Long-press the primary button at boot (≥ 5 seconds) to wipe NVS. The device falls back to step 1 on the next cold boot — flash a new prov bundle, drop a new SD config, or use captive portal.
 
-### Production security
+### Threat model + what this firmware does (and doesn't) do
 
-For fleets the recommended defense-in-depth is **ESP32-S3 flash encryption + secure boot V2** (Espressif's standard). Burn the key into eFuses once, and the `prov` partition (along with the rest of flash) is encrypted at rest. Out of the box this firmware ships with plaintext flash because physical access to a stolen device already compromises it — the trade-off is honest, and the prov partition is erased after first boot to limit exposure.
+This firmware ships with **plaintext flash**. Physical access to a stolen device
+gives the attacker WiFi credentials and the device token. We mitigate exposure
+by erasing the `prov` partition after the first successful boot — the
+provisioning bundle is a one-time bootstrap channel, not the persistent store.
+
+We do **not** burn eFuses, configure flash encryption, or enable secure boot.
+Those operations are *permanent* on ESP32 hardware — once an eFuse bit is
+written you cannot rewrite it, and a misconfiguration bricks the device for
+that configuration forever. If you have a stronger threat model than "trusted
+physical environment", the Espressif documentation covers those features, but
+**enabling them is your decision and your action** — paperanywhere never
+performs irreversible hardware operations on your behalf.
 
 ## Wire types
 
