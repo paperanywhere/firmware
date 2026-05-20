@@ -30,6 +30,7 @@ board-generic-esp32s3-waveshare-75 = []
 paperanywhere-ports.workspace = true
 paperanywhere-runtime.workspace = true
 paperanywhere-panel-uc8179.workspace = true
+paperanywhere-compositor.workspace = true
 
 # ── esp-rs (current matrix) ──
 # `esp-wifi` was renamed to `esp-radio` for the 1.x line. `esp-radio` 0.18 uses

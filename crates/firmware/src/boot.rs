@@ -8,7 +8,7 @@
 
 use embassy_net::Stack;
 use esp_println::println;
-use paperanywhere_ports::NvsStore;
+use paperanywhere_ports::{EpaperPanel, NvsStore, Sleeper};
 use static_cell::StaticCell;
 
 use crate::boards;
@@ -102,7 +102,7 @@ pub fn run(resources: FirmwareResources) -> ! {
     let wifi_ref = WIFI.init(wifi);
     let http_ref = HTTP.init(FwHttp::new(stack_ref, backend_url.as_deref()));
     let nvs_ref = NVS.init(nvs);
-    let panel_ref = PANEL.init(boards::build_panel(panel, board.panel_data_inverted));
+    let panel_ref = PANEL.init(boards::build_panel(panel, board));
     let sleeper_ref = SLEEPER.init(FwSleeper::new(lpwr));
     let ota_ref = OTA.init(FwOta::new());
 
@@ -128,22 +128,49 @@ pub fn run(resources: FirmwareResources) -> ! {
     // associates and /state polls in the background. Same mechanism the
     // runtime uses for image updates, so a real image push and a
     // boot-screen render are deduplicated by the same path.
-    let boot_screen_hash = paperanywhere_ports::hash_bytes(BOOT_SCREEN);
-    let boot_screen_bytes: &'static [u8] =
+    // Boot-screen content hash factors in the version stamp so an OTA
+    // install (which changes the overlaid version text) re-renders the
+    // splash on first boot of the new firmware. Without the suffix the
+    // version label would be stale through one extra wake.
+    let boot_screen_hash = {
+        let logo = paperanywhere_ports::hash_bytes(BOOT_SCREEN);
+        let version = paperanywhere_ports::hash_bytes(crate::FW_VERSION.as_bytes());
+        logo ^ version
+    };
+    let render_boot_screen =
         if nvs_ref.load_last_render_hash() == Some(boot_screen_hash) {
-            &[]
+            false
         } else {
             // Save the hash *before* spawning the runtime — if the refresh
             // panics or the device resets mid-flash we accept the lost
             // splash rather than re-flashing on every retry.
             nvs_ref.save_last_render_hash(boot_screen_hash);
-            BOOT_SCREEN
+            true
         };
+    if render_boot_screen {
+        // Paint the logo into the main region, overlay version + build
+        // time below it, then flush. Subsequent wake cycles skip this
+        // because of the hash match above.
+        panel_ref.init();
+        // No live state yet at cold-boot (WiFi not associated, no
+        // battery sample). Compositor renders the bar with `None`
+        // inputs: disconnected wifi icon, empty battery outline.
+        panel_ref.set_chrome(sleeper_ref.battery_mv(), None);
+        panel_ref.write_chunk(BOOT_SCREEN);
+        {
+            let mut region = panel_ref.main_region_mut();
+            crate::BUILD_INFO.render_into(&mut region);
+        }
+        panel_ref.refresh();
+    }
 
     let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
     executor.run(|spawner| {
         let net_token = crate::network::net_task(runner).expect("net_task pool");
         spawner.spawn(net_token);
+        // Boot screen is already on the panel by this point (paint
+        // above), so the runtime doesn't need to render it again. Pass
+        // an empty slice to short-circuit its boot-screen path.
         let rt_token = runtime_task(
             wifi_ref,
             http_ref,
@@ -152,7 +179,7 @@ pub fn run(resources: FirmwareResources) -> ! {
             sleeper_ref,
             ota_ref,
             policy,
-            boot_screen_bytes,
+            &[],
             OTA_SCREEN,
         )
         .expect("runtime_task pool");

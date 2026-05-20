@@ -89,6 +89,10 @@ where
 {
     panel.init();
     if !boot_screen.is_empty() {
+        // No WiFi yet, no battery reading yet; the compositor renders
+        // the bar with `None` inputs (disconnected wifi icon, empty
+        // battery outline). Subsequent wakes refresh with live state.
+        panel.set_chrome(sleeper.battery_mv(), wifi.rssi_dbm());
         panel.write_chunk(boot_screen);
         panel.refresh();
     }
@@ -134,8 +138,15 @@ where
     let creds = nvs.load_wifi_creds().ok_or(WakeError::NoWifiCreds)?;
     wifi.associate(&creds).map_err(|e| {
         error!("wake: wifi.associate: {:?}", e);
+        // Tell the compositor we're disconnected before bailing so any
+        // subsequent forced refresh (e.g. boot screen on a retry) shows
+        // the slashed wifi icon.
+        panel.on_wifi_state_changed(None);
         WakeError::WifiAssociate
     })?;
+    // Association succeeded — push the new RSSI into the status bar.
+    panel.on_wifi_state_changed(wifi.rssi_dbm());
+    panel.on_battery_sample(sleeper.battery_mv());
 
     let token = nvs.load_device_token().ok_or(WakeError::NoDeviceToken)?;
 
@@ -162,6 +173,7 @@ where
             // dedup check correctly decides whether to refresh again.
             let ota_screen_hash = paperanywhere_ports::hash_bytes(ota_screen);
             if Some(ota_screen_hash) != nvs.load_last_render_hash() {
+                panel.set_chrome(sleeper.battery_mv(), wifi.rssi_dbm());
                 panel.write_chunk(ota_screen);
                 panel.refresh();
                 nvs.save_last_render_hash(ota_screen_hash);
@@ -181,6 +193,10 @@ where
         let new_hash = paperanywhere_ports::hash_bytes(image.sha256_hex.as_bytes());
         if Some(new_hash) != nvs.load_last_render_hash() {
             info!("wake: new image {} (hash {:#x}), streaming to panel", image.image_id, new_hash);
+            // Push current chrome state into the compositor BEFORE the
+            // image stream so the status bar reflects "just associated,
+            // currently rendering image N" rather than stale values.
+            panel.set_chrome(sleeper.battery_mv(), wifi.rssi_dbm());
             let render_result = stream_image_to_panel(http, panel, &token, image).await;
             let phase = match &render_result {
                 Ok(()) => {
@@ -205,6 +221,7 @@ where
     }
 
     let _ = wifi.disconnect();
+    panel.on_wifi_state_changed(None);
 
     let now = sleeper.unix_now();
     let sleep_for = state

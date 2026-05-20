@@ -1,0 +1,12 @@
+[package]
+name = "paperanywhere-compositor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Layered framebuffer + status-bar compositor that sits between the runtime and the panel driver. Status bar lives at the top of the screen; the runtime owns the main region."
+
+[dependencies]
+paperanywhere-ports = { workspace = true }
+embedded-graphics = { workspace = true }
+heapless = { workspace = true }
+log = { workspace = true }

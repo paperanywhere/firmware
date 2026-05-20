@@ -434,6 +434,22 @@ pub trait EpaperPanel {
     /// Reset + init the controller and reset the write cursor to 0. Called
     /// once before the first wake cycle.
     fn init(&mut self);
+    /// Push current chrome state (battery, wifi association) into whatever
+    /// status-bar layer is sitting between the runtime and the bare panel.
+    /// Default is a no-op; the compositor overrides it. Called by the
+    /// runtime before any [`refresh`] so the bar reflects current state.
+    fn set_chrome(&mut self, _battery_mv: Option<u16>, _wifi_rssi_dbm: Option<i16>) {}
+    /// Fine-grained hook: WiFi association state changed. `None` means
+    /// disconnected; `Some(rssi)` means associated at that signal level.
+    /// Default no-op; compositors override to mark the WiFi icon dirty.
+    /// Doesn't itself trigger a panel refresh — the next [`refresh`] call
+    /// picks it up. Once partial-refresh LUTs land we can flush only the
+    /// status-bar region here without disturbing the main image.
+    fn on_wifi_state_changed(&mut self, _rssi_dbm: Option<i16>) {}
+    /// Fine-grained hook: new battery sample available. Same semantics as
+    /// [`on_wifi_state_changed`]: updates the cached value but doesn't
+    /// trigger a panel refresh until the runtime asks.
+    fn on_battery_sample(&mut self, _mv: Option<u16>) {}
     /// Append `bytes` to the panel's frame RAM at the current cursor. Chunk
     /// boundaries don't need to align to any pixel structure.
     fn write_chunk(&mut self, bytes: &[u8]);

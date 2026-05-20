@@ -12,12 +12,23 @@ use std::process::Command;
 use paperanywhere_boot_screen::{BootScreenSpec, render};
 use paperanywhere_ports::ColorMode;
 
+/// Status-bar height the compositor reserves at the top of the panel.
+/// Must match `paperanywhere_compositor::DEFAULT_STATUS_BAR_HEIGHT` —
+/// duplicated here as a `const` so build.rs doesn't have to depend on
+/// the compositor crate (which has its own `embedded-graphics` build
+/// deps we'd rather not pull into the host build script).
+const STATUS_BAR_HEIGHT_PX: u32 = 32;
+
 fn main() {
     emit_version_stamp();
-    let (width, height, color_mode) = active_board_spec();
+    emit_build_time();
+    let (width, full_height, color_mode) = active_board_spec();
+    // Boot + OTA screens render into the *main region* only — the top
+    // status bar is owned by the compositor and overlays at runtime.
+    let height = full_height.saturating_sub(STATUS_BAR_HEIGHT_PX);
     println!(
-        "cargo:warning=boot-screen: rasterising for {}x{} {:?}",
-        width, height, color_mode
+        "cargo:warning=boot-screen: rasterising for {}x{} (main region of {}x{}) {:?}",
+        width, height, width, full_height, color_mode
     );
 
     let assets = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -29,6 +40,63 @@ fn main() {
 
     rasterise(&assets, "logo.svg", "boot_screen.bin", "PAPERANYWHERE_BOOT_SCREEN", &spec, &out_dir);
     rasterise(&assets, "logo_ota.svg", "ota_screen.bin", "PAPERANYWHERE_OTA_SCREEN", &spec, &out_dir);
+}
+
+/// Bake a UTC build-time stamp like `2026-05-20 22:13 UTC`. Surfaced on
+/// the boot screen so a deployed device can be eyeballed against an
+/// expected release. Pure stdlib; no chrono dep just for this.
+fn emit_build_time() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stamp = format_utc(now);
+    println!("cargo:rustc-env=PAPERANYWHERE_BUILD_TIME={stamp}");
+}
+
+/// Convert a Unix timestamp to `YYYY-MM-DD HH:MM UTC` without any deps.
+/// Good through 2099-12-31. Doesn't handle leap-seconds (nobody does).
+fn format_utc(unix_secs: u64) -> String {
+    let secs = unix_secs % 60;
+    let mins = (unix_secs / 60) % 60;
+    let hours = (unix_secs / 3600) % 24;
+    let mut days = (unix_secs / 86_400) as i64;
+
+    // 1970-01-01 was a Thursday; epoch day = 0.
+    let mut year: i64 = 1970;
+    loop {
+        let days_in_year = if is_leap(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+
+    let months_normal = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let months_leap = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let months = if is_leap(year) { &months_leap } else { &months_normal };
+
+    let mut month = 0;
+    while days >= months[month] {
+        days -= months[month];
+        month += 1;
+    }
+    let day = days + 1;
+
+    let _ = secs; // not displayed; minute precision is enough
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+        year,
+        month + 1,
+        day,
+        hours,
+        mins
+    )
+}
+
+fn is_leap(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 /// Read an SVG from `<assets>/<svg_name>`, run it through the boot-screen

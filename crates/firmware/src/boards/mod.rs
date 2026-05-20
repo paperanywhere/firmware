@@ -17,11 +17,11 @@ use paperanywhere_panel_uc8179::{Pins, Uc8179};
 
 use crate::resources::PanelHardware;
 
-/// Concrete `EpaperPanel` type the rest of the firmware sees. All current
-/// boards use UC8179; when a board needs a different controller (e.g.
-/// UC8159 for Color7 panels, IT8951 for the 10.3" Gray16 panel) this becomes
-/// an enum and `build_panel` switches on the active board feature.
-pub type Panel = Uc8179<
+/// Bare panel driver, before the compositor wraps it. Kept as a type
+/// alias so changes to the panel-driver type signature don't require
+/// chasing through both `Panel` (the public-facing type) and the
+/// concrete `Uc8179<...>` everywhere.
+pub type BarePanel = Uc8179<
     ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, Delay>,
     Output<'static>,
     Output<'static>,
@@ -29,19 +29,33 @@ pub type Panel = Uc8179<
     Delay,
 >;
 
-/// Assemble the SPI device (bus + CS) and instantiate the UC8179 driver
-/// against the runtime-typed pins main.rs gathered for the active board.
-/// `invert_data_plane` is sourced from the board's `BoardConfig` so each
-/// product's panel polarity is declared with its other metadata.
-pub fn build_panel(hw: PanelHardware, invert_data_plane: bool) -> Panel {
+/// Concrete `EpaperPanel` type the rest of the firmware sees. The
+/// compositor wraps the bare panel driver and reserves the top
+/// [`paperanywhere_compositor::DEFAULT_STATUS_BAR_HEIGHT`] rows of the
+/// panel for the status bar (battery / wifi widgets). Runtime renders
+/// land in the main region only.
+pub type Panel = paperanywhere_compositor::Compositor<BarePanel>;
+
+/// Assemble the SPI device (bus + CS), instantiate the UC8179 driver
+/// against the runtime-typed pins main.rs gathered, and wrap it in the
+/// compositor so the runtime sees a layered framebuffer.
+/// `invert_data_plane` is sourced from the board's `BoardConfig`.
+pub fn build_panel(hw: PanelHardware, board: BoardConfig) -> Panel {
     let delay = Delay::new();
     let spi_device = ExclusiveDevice::new(hw.spi_bus, hw.cs, delay)
         .expect("ExclusiveDevice::new (Delay is infallible)");
-    Uc8179::new(
+    let bare = Uc8179::new(
         spi_device,
         Pins { rst: hw.rst, dc: hw.dc, busy: hw.busy },
         delay,
-        invert_data_plane,
+        board.panel_data_inverted,
+    );
+    paperanywhere_compositor::Compositor::new(
+        bare,
+        board.panel_width_px,
+        board.panel_height_px,
+        board.default_color_mode_ports(),
+        paperanywhere_compositor::DEFAULT_STATUS_BAR_HEIGHT,
     )
 }
 
@@ -89,6 +103,24 @@ pub struct BoardConfig {
     /// Display 7.5" V2 BW modules including the one in reTerminal E1001;
     /// some BWR variants flip this.
     pub panel_data_inverted: bool,
+}
+
+impl BoardConfig {
+    /// Bridge the firmware-local [`ColorMode`] enum to the
+    /// [`paperanywhere_ports::ColorMode`] the runtime + compositor
+    /// speak. The two enums are structurally identical — this exists
+    /// because the boards module hasn't been wired through proto yet
+    /// (see the inline note above the enum definitions).
+    pub fn default_color_mode_ports(&self) -> paperanywhere_ports::ColorMode {
+        match self.default_color_mode {
+            ColorMode::Mono1bpp => paperanywhere_ports::ColorMode::Mono1bpp,
+            ColorMode::MonoRed1bpp => paperanywhere_ports::ColorMode::MonoRed1bpp,
+            ColorMode::MonoYellow1bpp => paperanywhere_ports::ColorMode::MonoYellow1bpp,
+            ColorMode::Gray4 => paperanywhere_ports::ColorMode::Gray4,
+            ColorMode::Gray16 => paperanywhere_ports::ColorMode::Gray16,
+            ColorMode::Color7 => paperanywhere_ports::ColorMode::Color7,
+        }
+    }
 }
 
 #[cfg(feature = "board-reterminal-e1001")]

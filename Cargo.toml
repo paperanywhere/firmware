@@ -5,10 +5,14 @@ members = [
     "crates/runtime",
     "crates/panel-uc8179",
     "crates/boot-screen",
+    "crates/compositor",
     "crates/firmware",
-    "crates/sim",
     "crates/provtool",
 ]
+# `crates/sim` lives in its own repo (paperanywhere/simulator) so a sim
+# clone doesn't have to pull the entire firmware tree + esp toolchain
+# expectations. It consumes the shared crates above via git deps.
+exclude = ["crates/sim"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,6 +30,12 @@ paperanywhere-ports = { path = "crates/ports" }
 paperanywhere-runtime = { path = "crates/runtime" }
 paperanywhere-panel-uc8179 = { path = "crates/panel-uc8179" }
 paperanywhere-boot-screen = { path = "crates/boot-screen" }
+paperanywhere-compositor = { path = "crates/compositor" }
+
+# UI drawing primitives for the compositor's status bar (battery icon,
+# wifi icon, version + build text). no_std-friendly; ~30 KB of code in
+# the firmware image once linked.
+embedded-graphics = "0.8"
 
 # Release profile is workspace-wide so the firmware binary inherits LTO + size
 # optimizations no matter which member crate's settings apply. The sim binary

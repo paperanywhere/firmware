@@ -47,6 +47,16 @@ mod wifi;
 /// decide when to offer an OTA update.
 pub const FW_VERSION: &str = env!("PAPERANYWHERE_FW_VERSION");
 
+/// Wall-clock build time stamp, also from `build.rs`. Format:
+/// `2026-05-20 22:13 UTC`. Surfaced on the boot screen so a deployed
+/// device can be cross-checked against the release that built it.
+pub const BUILD_TIME: &str = env!("PAPERANYWHERE_BUILD_TIME");
+
+/// `BuildInfo` the compositor uses to draw the boot-screen overlay.
+/// Cheap to construct from the two `&'static str` consts above.
+pub const BUILD_INFO: paperanywhere_compositor::BuildInfo =
+    paperanywhere_compositor::BuildInfo { fw_version: FW_VERSION, build_time: BUILD_TIME };
+
 #[cfg(not(any(
     feature = "board-reterminal-e1001",
     feature = "board-reterminal-e1002",
