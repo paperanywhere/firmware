@@ -1,14 +1,16 @@
 [build]
 target = "xtensa-esp32s3-none-elf"
+
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor --partition-table flash/partition-table.csv"
 rustflags = [
   "-C", "link-arg=-Tlinkall.x",
   "-C", "link-arg=-nostartfiles",
 ]
 
-[target.xtensa-esp32s3-none-elf]
-runner = "espflash flash --monitor --partition-table flash/partition-table.csv"
-
-# Note: the `esp` rust channel ships prebuilt `core` + `alloc` + `std` for
-# xtensa-esp32s3-none-elf, so we do NOT need `[unstable] build-std`. Enabling
-# it applied to host proc-macro builds too (proc-macro-error-attr2, etc.)
-# and broke them with "can't find crate for std".
+[unstable]
+# Xtensa rust ships without prebuilt std/core for the target — rebuild from
+# rust-src. `panic_immediate_abort` shaves a few KB and avoids pulling in
+# unwinding machinery we'd never use on no_std anyway.
+build-std = ["alloc", "core"]
+build-std-features = ["panic_immediate_abort"]

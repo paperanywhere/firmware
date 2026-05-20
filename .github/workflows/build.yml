@@ -33,11 +33,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # No `version:` pin — the action installs the latest published esp
+      # toolchain. Older esp-rs releases (1.84.x, 1.86.x, etc.) work too, but
+      # there's no `1.94.x` in https://github.com/esp-rs/rust-build/releases.
       - uses: esp-rs/xtensa-toolchain@v1.5
         with:
           default: true
           ldproxy: false
-          version: 1.94.0.0
 
       - uses: Swatinem/rust-cache@v2
         with:
