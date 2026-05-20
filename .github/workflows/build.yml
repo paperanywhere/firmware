@@ -33,22 +33,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No `version:` pin — the action installs the latest published esp
-      # toolchain. Older esp-rs releases (1.84.x, 1.86.x, etc.) work too, but
-      # there's no `1.94.x` in https://github.com/esp-rs/rust-build/releases.
+      # Pin to esp 1.84.0.0 — esp-hal 0.22 uses `asm!` inside naked functions,
+      # which newer rust toolchains (≥1.87) rejected outright. The 1.84 series
+      # still accepts it. When we bump esp-hal to the 1.x line we can move
+      # this pin forward (or drop it).
       - uses: esp-rs/xtensa-toolchain@v1.5
         with:
           default: true
           ldproxy: false
-
-      - name: ensure host stdlib (proc-macros need x86_64-linux-gnu std)
-        run: |
-          rustup show
-          rustup component add rust-std --toolchain esp || true
-          # Fallback: install stable to provide host std for proc-macros if the
-          # esp toolchain didn't ship it. Cargo invokes proc-macros via whatever
-          # rustc the active toolchain provides; the linker is xtensa-target.
-          rustup toolchain install stable --profile minimal --component rust-std
+          version: 1.84.0.0
 
       - uses: Swatinem/rust-cache@v2
         with:
