@@ -1,0 +1,130 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+permissions:
+  contents: write  # needed for Releases
+
+jobs:
+  # Per-board build matrix. Runs on every PR + push, and is the data source
+  # the release job picks up artifacts from.
+  build:
+    name: cargo build (${{ matrix.board }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        board:
+          - reterminal-e1001
+          - reterminal-e1002
+          - reterminal-e1003
+          - reterminal-e1004
+          - inkplate-6
+          - inkplate-10
+          - generic-esp32s3-waveshare-75
+    steps:
+      - uses: actions/checkout@v4
+
+      # paperanywhere-proto lives in the private `paperanywhere/backend` repo.
+      # CI needs read access; configure a fine-grained PAT (or deploy key) and
+      # store it as the `PROTO_REPO_TOKEN` repository secret.
+      - name: configure private-repo access for cargo
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PROTO_REPO_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          default: true
+          ldproxy: false
+          version: 1.94.0.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: firmware-${{ matrix.board }}
+
+      - name: cargo build --release
+        run: |
+          cargo build --release \
+            --no-default-features \
+            --features board-${{ matrix.board }} \
+            --bin paperanywhere-firmware
+
+      - name: extract .bin via espflash
+        run: |
+          cargo install --locked espflash --version "^3"
+          espflash save-image \
+            --chip esp32s3 \
+            target/xtensa-esp32s3-none-elf/release/paperanywhere-firmware \
+            paperanywhere-firmware-${{ matrix.board }}.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.board }}
+          path: paperanywhere-firmware-${{ matrix.board }}.bin
+          if-no-files-found: error
+          retention-days: 30
+
+  # Tagged-release publish. Pulls down every per-board artifact built above,
+  # attaches them to a GitHub Release named after the tag.
+  release:
+    name: github release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download all firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: firmware-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: rename with version
+        run: |
+          set -eux
+          mkdir -p release
+          ver="${GITHUB_REF_NAME}"
+          for f in artifacts/paperanywhere-firmware-*.bin; do
+            base=$(basename "$f" .bin)
+            cp "$f" "release/${base}-${ver}.bin"
+          done
+          ls -la release/
+
+      - name: generate manifest.json (esp-web-tools format)
+        run: |
+          ver="${GITHUB_REF_NAME}"
+          base="https://github.com/paperanywhere/firmware/releases/download/${ver}"
+          for board in reterminal-e1001 reterminal-e1002 reterminal-e1003 reterminal-e1004 inkplate-6 inkplate-10 generic-esp32s3-waveshare-75; do
+            cat > "release/manifest-${board}-${ver}.json" <<JSON
+          {
+            "name": "paperanywhere",
+            "version": "${ver}",
+            "home_assistant_domain": "paperanywhere",
+            "new_install_prompt_erase": true,
+            "builds": [
+              {
+                "chipFamily": "ESP32-S3",
+                "parts": [
+                  { "path": "${base}/paperanywhere-firmware-${board}-${ver}.bin", "offset": 0 }
+                ]
+              }
+            ]
+          }
+          JSON
+          done
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          draft: false
+          generate_release_notes: true
