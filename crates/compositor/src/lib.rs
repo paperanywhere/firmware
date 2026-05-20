@@ -87,10 +87,13 @@ impl<P: EpaperPanel> Compositor<P> {
         status_bar_height: u32,
     ) -> Self {
         let fb_bytes = framebuffer_size(width_px, height_px, color_mode);
-        // Initial framebuffer: all white (`0` in the renderer-friendly
-        // convention; the UC8179 driver's `panel_data_inverted` flag
-        // flips bytes on the way out when needed).
-        let framebuffer = vec![0u8; fb_bytes];
+        // Initial framebuffer: all white. The boot-screen rasterizer's
+        // convention is "bit set = white = ink off" (see the boot-screen
+        // crate's docs), so 0xFF for every byte means "no ink anywhere"
+        // — the panel renders an empty white surface. Zeroing the
+        // buffer (which was the previous default) produced a fully-
+        // inked black panel, which is the opposite of what we want.
+        let framebuffer = vec![0xFFu8; fb_bytes];
         Self {
             panel,
             width_px,
@@ -145,7 +148,10 @@ impl<P: EpaperPanel> Compositor<P> {
 
 impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
     fn set_chrome(&mut self, battery_mv: Option<u16>, wifi_rssi_dbm: Option<i16>) {
-        self.status = StatusInputs { battery_mv, wifi_rssi_dbm };
+        // Preserve everything else (usb, device id, last update) — this
+        // call only refreshes the two right-side widgets.
+        self.status.battery_mv = battery_mv;
+        self.status.wifi_rssi_dbm = wifi_rssi_dbm;
     }
 
     fn on_wifi_state_changed(&mut self, rssi_dbm: Option<i16>) {
@@ -159,13 +165,29 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
         self.status.battery_mv = mv;
     }
 
+    fn on_usb_state_changed(&mut self, connected: Option<bool>) {
+        self.status.usb_connected = connected;
+    }
+
+    fn set_device_id(&mut self, id: &str) {
+        let mut s: heapless::String<24> = heapless::String::new();
+        let _ = s.push_str(id);
+        self.status.device_id = Some(s);
+    }
+
+    fn set_last_update(&mut self, local_time: &str) {
+        let mut s: heapless::String<24> = heapless::String::new();
+        let _ = s.push_str(local_time);
+        self.status.last_update_local = Some(s);
+    }
+
     fn init(&mut self) {
         self.panel.init();
-        // Reset the framebuffer + cursor; do NOT paint the panel here.
-        // The runtime's wake-cycle flow expects to issue `write_chunk`s
-        // first and then a single `refresh` that flushes.
+        // Reset the framebuffer to "all white" (0xFF in the rasterizer's
+        // bit-set = white convention), not 0x00 — see `Compositor::new`
+        // for the polarity rationale.
         for byte in self.framebuffer.iter_mut() {
-            *byte = 0;
+            *byte = 0xFF;
         }
         self.main_cursor =
             main_region_offset(self.width_px, self.status_bar_height, self.color_mode);

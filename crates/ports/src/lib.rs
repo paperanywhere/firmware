@@ -460,6 +460,18 @@ pub trait EpaperPanel {
     /// [`on_wifi_state_changed`]: updates the cached value but doesn't
     /// trigger a panel refresh until the runtime asks.
     fn on_battery_sample(&mut self, _mv: Option<u16>) {}
+    /// USB-CDC enumeration state. `Some(true)` means a serial host is
+    /// attached; `Some(false)` explicitly disconnected; `None` means
+    /// the board has no USB-CDC support / never sets the field.
+    fn on_usb_state_changed(&mut self, _connected: Option<bool>) {}
+    /// Identifier shown on the left side of the status bar — typically
+    /// a short fingerprint derived from the device token (e.g. last
+    /// 4 hex chars). Idempotent; the runtime calls this once at boot.
+    fn set_device_id(&mut self, _id: &str) {}
+    /// Local-time stamp of the most recent successful image render
+    /// (e.g. `10:23`). Runtime updates this after each completed
+    /// render; the compositor shows it in the left-side info text.
+    fn set_last_update(&mut self, _local_time: &str) {}
     /// Append `bytes` to the panel's frame RAM at the current cursor. Chunk
     /// boundaries don't need to align to any pixel structure.
     fn write_chunk(&mut self, bytes: &[u8]);

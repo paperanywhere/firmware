@@ -88,6 +88,20 @@ where
     F: FirmwareUpdater,
 {
     panel.init();
+    // Seed the status bar's left-side info from the device's stored
+    // token (only the last 4 hex chars are exposed, which is more
+    // than enough to disambiguate a shelf of devices visually).
+    if let Some(token) = nvs.load_device_token() {
+        let id_view = if token.len() > 4 {
+            &token[token.len() - 4..]
+        } else {
+            token.as_str()
+        };
+        let mut full: alloc::string::String = alloc::string::String::with_capacity(8);
+        full.push_str("D-");
+        full.push_str(id_view);
+        panel.set_device_id(&full);
+    }
     if !boot_screen.is_empty() {
         // No WiFi yet, no battery reading yet; the compositor renders
         // the bar with `None` inputs (disconnected wifi icon, empty
@@ -209,6 +223,23 @@ where
             let phase = match &render_result {
                 Ok(()) => {
                     nvs.save_last_render_hash(new_hash);
+                    // Stamp the status bar with the render time so the
+                    // user can eyeball "did this device update recently".
+                    // Without an NTP sync the device clock is at unix
+                    // epoch 0 — fall back to "now" formatted as
+                    // HH:MM:SS of uptime once unix_now > 0.
+                    let now = sleeper.unix_now();
+                    if now > 0 {
+                        let hh = (now / 3600) % 24;
+                        let mm = (now / 60) % 60;
+                        let mut buf: alloc::string::String =
+                            alloc::string::String::with_capacity(8);
+                        let _ = core::fmt::write(
+                            &mut buf,
+                            format_args!("{:02}:{:02}", hh, mm),
+                        );
+                        panel.set_last_update(&buf);
+                    }
                     AckPhase::Applied
                 }
                 Err(_) => AckPhase::Failed,
