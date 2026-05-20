@@ -1,0 +1,73 @@
+[package]
+name = "paperanywhere-firmware"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "ESP32-S3 firmware for paperanywhere e-paper devices (reTerminal E-series + bare panels)."
+
+[[bin]]
+name = "paperanywhere-firmware"
+path = "src/main.rs"
+
+# ── Board feature flags — mutually exclusive at compile time ──
+# Pick one when building: `cargo build --features board-reterminal-e1001`
+# CI builds all four to catch breakage.
+[features]
+default = ["board-reterminal-e1001"]
+board-reterminal-e1001 = []
+board-reterminal-e1002 = []
+board-reterminal-e1003 = []
+board-reterminal-e1004 = []
+board-inkplate-6 = []
+board-inkplate-10 = []
+board-generic-esp32s3-waveshare-75 = []
+
+[dependencies]
+# Shared wire types with the backend — same git ref bumped together.
+# Pull from the backend repo via path during local dev:
+#   paperanywhere-proto = { path = "../paperanywhere/crates/proto", default-features = false }
+# In CI / release builds, use a git ref:
+paperanywhere-proto = { git = "https://github.com/paperanywhere/backend", branch = "main", default-features = false }
+
+# ── esp-rs core ──
+esp-hal = { version = "0.22", features = ["esp32s3"] }
+esp-hal-embassy = { version = "0.5", features = ["esp32s3"] }
+esp-backtrace = { version = "0.14", features = ["esp32s3", "panic-handler", "exception-handler", "println"] }
+esp-println = { version = "0.12", features = ["esp32s3", "log"] }
+esp-wifi = { version = "0.10", features = ["esp32s3", "wifi", "tcp", "ipv4", "embassy-net"] }
+esp-storage = { version = "0.3", features = ["esp32s3"] }
+
+# ── Networking ──
+embassy-executor = { version = "0.6", features = ["task-arena-size-32768", "executor-thread"] }
+embassy-time = "0.3"
+embassy-net = { version = "0.4", features = ["proto-ipv4", "tcp", "dhcpv4", "medium-ethernet"] }
+embedded-tls = { version = "0.17", default-features = false }
+embedded-io-async = "0.6"
+embedded-svc = { version = "0.28", default-features = false }
+smoltcp = { version = "0.11", default-features = false }
+
+# ── Serde over the wire ──
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde-json-core = "0.6"
+
+# ── E-paper drivers ──
+embedded-hal = "1"
+embedded-hal-async = "1"
+embedded-graphics = "0.8"
+
+# ── State ──
+heapless = "0.8"
+log = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+debug = false
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1     # ESP32 RAM/flash budgets are tight even in dev.
+panic = "abort"
