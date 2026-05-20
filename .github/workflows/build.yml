@@ -48,6 +48,8 @@ jobs:
       - name: cargo build --release
         run: |
           cargo build --release \
+            -Z build-std=core,alloc \
+            --target xtensa-esp32s3-none-elf \
             --no-default-features \
             --features board-${{ matrix.board }} \
             --bin paperanywhere-firmware

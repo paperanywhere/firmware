@@ -8,9 +8,8 @@ rustflags = [
   "-C", "link-arg=-nostartfiles",
 ]
 
-[unstable]
-# Xtensa rust ships without prebuilt std/core for the target — rebuild from
-# rust-src. The `panic_immediate_abort` build-std-feature was renamed to a
-# real panic strategy in newer rust; we get the same effect via the
-# `panic = "abort"` profile setting in Cargo.toml.
-build-std = ["alloc", "core"]
+# `-Z build-std` is passed on the cargo CLI (`-Z build-std=core,alloc`) rather
+# than configured in [unstable] here, so it applies only to the requested
+# --target. Setting it in [unstable] applied it to host proc-macro builds too,
+# which then failed with "can't find crate for std" because no_std proc-macros
+# don't have a host std.
