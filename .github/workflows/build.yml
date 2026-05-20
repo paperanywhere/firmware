@@ -31,14 +31,31 @@ jobs:
           - inkplate-10
           - generic-esp32s3-waveshare-75
     steps:
+      # 1. Check out the firmware at workspace root.
       - uses: actions/checkout@v4
 
-      # paperanywhere-proto lives in the private `paperanywhere/backend` repo.
-      # CI needs read access; configure a fine-grained PAT (or deploy key) and
-      # store it as the `PROTO_REPO_TOKEN` repository secret.
-      - name: configure private-repo access for cargo
+      # 2. Check out the private backend repo alongside it. The backend hosts
+      #    `paperanywhere-proto`, which the firmware depends on. Using
+      #    actions/checkout authenticates via the standard GitHub token flow
+      #    (PROTO_REPO_TOKEN must have `Contents: read` on paperanywhere/backend)
+      #    so we avoid the cargo-libgit2 auth pitfall entirely.
+      - uses: actions/checkout@v4
+        with:
+          repository: paperanywhere/backend
+          token: ${{ secrets.PROTO_REPO_TOKEN }}
+          path: backend
+          fetch-depth: 1
+
+      # 3. Cargo patch override: redirect the firmware's git dep on
+      #    paperanywhere-proto to the local checkout. Avoids cargo trying to
+      #    re-clone the private repo over HTTPS with credentials it can't reach.
+      - name: configure cargo patch override
         run: |
-          git config --global url."https://x-access-token:${{ secrets.PROTO_REPO_TOKEN }}@github.com/".insteadOf "https://github.com/"
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch."https://github.com/paperanywhere/backend"]
+          paperanywhere-proto = { path = "backend/crates/proto" }
+          EOF
 
       - uses: esp-rs/xtensa-toolchain@v1.5
         with:
