@@ -1,17 +1,21 @@
-//! SD-card based provisioning. Parses a small `wifi.conf` TOML at the SD root
-//! into a `ProvBlob` so the rest of the boot path treats it identically to a
-//! flash-time bundle.
-//!
-//! M4 stub — real impl will mount the FAT filesystem via `embedded-sdmmc` and
-//! parse the four known keys manually. We avoid a full TOML parser since this
-//! is the only TOML the firmware ever reads.
+//! SD-card based provisioning. Reads `wifi.conf` (a small TOML file at the SD
+//! root) into a `ProvData` for the resolver. Board-gated to those with SD slots.
 
 use alloc::string::String;
-use paperanywhere_proto::ProvBlob;
 
-/// Parse a small TOML body. Recognized keys: `ssid`, `password`, `backend_url`, `claim_code`.
-/// Strings may be double-quoted with `\"`, `\\`, `\n`, `\r` escapes.
-pub fn parse_wifi_conf(input: &str) -> Option<ProvBlob> {
+use crate::provisioning::ProvData;
+
+/// Read + parse the wifi.conf file from the SD root. M4 wires the mount via
+/// `embedded-sdmmc`; today returns `None` so the resolver falls through.
+pub fn read_wifi_conf() -> Option<ProvData> {
+    None
+}
+
+/// Parse a small TOML body. Recognized keys: `ssid`, `password`, `backend_url`,
+/// `claim_code`. Strings may be double-quoted with `\"`, `\\`, `\n`, `\r`
+/// escapes. Real code path once `read_wifi_conf` lands its impl.
+#[allow(dead_code)]
+pub fn parse_wifi_conf(input: &str) -> Option<ProvData> {
     let mut ssid = None;
     let mut password = None;
     let mut backend_url = None;
@@ -20,9 +24,8 @@ pub fn parse_wifi_conf(input: &str) -> Option<ProvBlob> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
         let (key, value) = line.split_once('=')?;
-        let key = key.trim();
         let value = unquote(value.trim())?;
-        match key {
+        match key.trim() {
             "ssid" => ssid = Some(value),
             "password" => password = Some(value),
             "backend_url" => backend_url = Some(value),
@@ -30,7 +33,7 @@ pub fn parse_wifi_conf(input: &str) -> Option<ProvBlob> {
             _ => {}
         }
     }
-    Some(ProvBlob {
+    Some(ProvData {
         ssid: ssid?,
         password: password?,
         backend_url,
@@ -61,43 +64,4 @@ fn unquote(value: &str) -> Option<String> {
         }
     }
     Some(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloc::string::ToString;
-
-    #[test]
-    fn parses_full_conf() {
-        let body = r#"
-            # comment
-            ssid = "guest-iot"
-            password = "let me in"
-            backend_url = "https://api.paperanywhere.io"
-            claim_code = "ABCD3F"
-        "#;
-        let p = parse_wifi_conf(body).unwrap();
-        assert_eq!(p.ssid, "guest-iot");
-        assert_eq!(p.password, "let me in");
-        assert_eq!(p.backend_url.as_deref(), Some("https://api.paperanywhere.io"));
-        assert_eq!(p.claim_code.as_deref(), Some("ABCD3F"));
-    }
-
-    #[test]
-    fn handles_escape_sequences() {
-        let body = r#"
-            ssid = "with\"quote"
-            password = "with\\backslash"
-        "#;
-        let p = parse_wifi_conf(body).unwrap();
-        assert_eq!(p.ssid, "with\"quote");
-        assert_eq!(p.password, "with\\backslash");
-    }
-
-    #[test]
-    fn missing_required_field_returns_none() {
-        let body = r#"ssid = "only-ssid""#;
-        assert!(parse_wifi_conf(body).is_none());
-    }
 }

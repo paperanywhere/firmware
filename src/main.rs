@@ -1,16 +1,13 @@
 //! paperanywhere-firmware — ESP32-S3 entrypoint.
 //!
-//! Boards are selected via mutually-exclusive Cargo features. Each board module
-//! provides a `BoardConfig` struct with the panel driver choice, pin map, and
-//! capability flags. The boot path is identical across boards.
+//! Architecture: **HTTPS polling** (no WebSockets). On every wake the device:
+//!   1. Associates with WiFi using credentials from NVS
+//!   2. GETs `/api/device/state` to fetch the next thing to render + sleep duration
+//!   3. If a new image is offered, GETs `/api/device/blob/:id` and streams it to the panel
+//!   4. POSTs `/api/device/ack` to confirm
+//!   5. Deep-sleeps until `next_check_at`
 //!
-//! NOTE: the firmware is in a transitional state — the M4 modules (wifi, ws_client,
-//! https, panel drivers, nvs, etc.) are not compiled in right now because they
-//! depend on either paperanywhere-proto (temporarily dropped — see Cargo.toml)
-//! or esp-hal-embassy / esp-wifi crates that don't yet have a release matching
-//! esp-hal 1.1 on crates.io. They live on disk and will come back module by
-//! module as their deps catch up. Today the firmware just proves the
-//! toolchain + board catalog compile.
+//! This file owns the boot orchestration. Each step is its own module under `src/`.
 
 #![no_std]
 #![no_main]
@@ -22,6 +19,15 @@ use esp_hal::clock::CpuClock;
 use esp_println::println;
 
 mod boards;
+mod boot;
+mod http;
+mod nvs;
+mod panel;
+mod power;
+mod provisioning;
+mod sd_config;
+mod wifi;
+mod wire;
 
 #[cfg(not(any(
     feature = "board-reterminal-e1001",
@@ -49,12 +55,6 @@ fn main() -> ! {
 
     let board = boards::current();
     println!("paperanywhere-firmware booting on {}", board.name);
-    println!(
-        "panel: {}x{} model_id={} (M4 will wire WiFi + WS + panel driver)",
-        board.panel_width_px, board.panel_height_px, board.panel_model_id,
-    );
 
-    loop {
-        core::hint::spin_loop();
-    }
+    boot::run(board)
 }

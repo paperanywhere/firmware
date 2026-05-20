@@ -10,8 +10,6 @@ description = "ESP32-S3 firmware for paperanywhere e-paper devices (reTerminal E
 name = "paperanywhere-firmware"
 path = "src/main.rs"
 
-# Board feature flags — mutually exclusive at compile time.
-# Pick one when building: `cargo build --features board-reterminal-e1001`
 [features]
 default = ["board-reterminal-e1001"]
 board-reterminal-e1001 = []
@@ -23,20 +21,16 @@ board-inkplate-10 = []
 board-generic-esp32s3-waveshare-75 = []
 
 [dependencies]
-# Note on paperanywhere-proto: temporarily dropped from the firmware to avoid
-# a cargo serde-feature-unification trap. esp-hal-procmacros 0.22 pulls
-# serde_yaml (for chip metadata), which forces serde+std on, which then makes
-# proto's serde+no_std unifiable target build fail to find host std. The fix
-# is in esp-rs's tooling, not here; until it lands, the firmware doesn't use
-# proto types directly. Local stubs in src/wire_stub.rs cover the protocol
-# surface; when proto is re-attached they'll be replaced.
-
-# ── esp-rs 1.x matrix (uses naked_asm! — works on modern rust) ──
+# ── esp-rs (minimum verified-on-CI matrix) ──
+# Networking deps (esp-wifi, esp-storage, embassy) live behind a feature flag
+# that's off in CI today because their crates.io versions don't line up
+# against esp-hal 1.1 yet (private __esp_wifi_builtin_scheduler /
+# __esp_hal_embassy features on 1.1 vs 1.0.0). Once esp-rs cuts a matching
+# release the `with-radio` feature wires them back in.
 esp-hal = { version = "1.1", features = ["esp32s3", "unstable"] }
 esp-backtrace = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
 esp-println = { version = "0.17", features = ["esp32s3", "log-04"] }
 esp-alloc = "0.9"
-# Transitive of esp-hal that doesn't auto-propagate the chip feature.
 esp-sync = { version = "0.1", features = ["esp32s3"] }
 
 # ── State / utility ──
