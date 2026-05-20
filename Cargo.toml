@@ -58,6 +58,7 @@ embedded-graphics = "0.8"
 # ── State ──
 heapless = "0.8"
 log = "0.4"
+static_cell = "2"
 
 [profile.release]
 opt-level = 3
