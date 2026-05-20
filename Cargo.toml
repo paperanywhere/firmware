@@ -26,17 +26,14 @@ board-generic-esp32s3-waveshare-75 = []
 paperanywhere-proto = { git = "https://github.com/paperanywhere/proto", branch = "main", default-features = false }
 
 # ── esp-rs 1.x matrix (uses naked_asm! — works on modern rust) ──
-esp-hal = { version = "=1.0.0-rc.1", features = ["esp32s3", "unstable"] }
-esp-hal-embassy = { version = "0.9", features = ["esp32s3"] }
+esp-hal = { version = "1.1", features = ["esp32s3", "unstable"] }
 esp-backtrace = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
 esp-println = { version = "0.17", features = ["esp32s3", "log-04"] }
-esp-wifi = { version = "0.15", default-features = false, features = ["esp32s3", "wifi", "esp-alloc"] }
 esp-storage = { version = "0.9", features = ["esp32s3"] }
 esp-alloc = "0.9"
-
-# ── Embassy runtime ──
-embassy-executor = { version = "0.10" }
-embassy-time = "0.5"
+# esp-wifi + esp-hal-embassy come back in M4 when we wire the radio + async
+# executor. They aren't on crates.io with a matrix that lines up against
+# esp-hal 1.1 yet (esp-hal-embassy 0.9 wants 1.0.0-rc.x's private feature).
 
 # ── State / utility ──
 embedded-hal = "1"
