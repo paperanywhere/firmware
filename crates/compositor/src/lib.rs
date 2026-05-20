@@ -207,11 +207,10 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
         }
     }
 
-    fn refresh(&mut self) {
-        // Paint the status bar into the top region of the framebuffer,
-        // then stream the whole buffer to the panel in one shot. When
-        // partial-refresh LUTs land, we'll split this into "top region
-        // only" vs "full refresh" based on what actually changed.
+    fn compose(&mut self) {
+        // Paint the status bar into the top region of the framebuffer.
+        // After this returns, the framebuffer holds exactly the bytes
+        // that would be sent to the panel — perfect for hashing.
         status_bar::render(
             &self.status,
             &mut self.framebuffer,
@@ -219,6 +218,21 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
             self.status_bar_height,
             self.color_mode,
         );
+    }
+
+    fn pending_hash(&self) -> Option<u64> {
+        // Hash the entire framebuffer post-compose. The runtime
+        // compares this against the last persisted hash to decide
+        // whether to skip the (expensive) refresh.
+        Some(paperanywhere_ports::hash_bytes(&self.framebuffer))
+    }
+
+    fn refresh(&mut self) {
+        // Stream the staged framebuffer to the panel. The runtime is
+        // expected to have called `compose()` (and consulted
+        // `pending_hash()`) immediately before this; calling refresh
+        // without compose is fine too, the framebuffer just won't have
+        // the latest status bar painted.
         self.panel.init();
         self.panel.write_chunk(&self.framebuffer);
         self.panel.refresh();

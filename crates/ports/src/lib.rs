@@ -475,6 +475,24 @@ pub trait EpaperPanel {
     /// Append `bytes` to the panel's frame RAM at the current cursor. Chunk
     /// boundaries don't need to align to any pixel structure.
     fn write_chunk(&mut self, bytes: &[u8]);
+    /// Stage the final composed surface ahead of [`refresh`]. Lets
+    /// layered drivers (the compositor) paint chrome on top of the
+    /// runtime-streamed main-region bytes — so [`pending_hash`] and
+    /// [`refresh`] see the actual bytes that will hit the panel,
+    /// status bar included. Bare drivers are no-ops; their frame RAM
+    /// is whatever `write_chunk` already staged. Idempotent.
+    fn compose(&mut self) {}
+    /// Hash of the bytes that would be flushed if [`refresh`] ran
+    /// right now. Computed AFTER [`compose`] so it includes whatever
+    /// chrome the compositor adds. Returns `None` when the driver
+    /// has no content-hash dedup (bare UC8179, sim virtual panel);
+    /// the runtime then refreshes unconditionally. Done at the driver
+    /// level rather than the runtime so the dedup naturally tracks
+    /// status-bar changes (battery %, wifi state, last-update time)
+    /// the same way it tracks image changes.
+    fn pending_hash(&self) -> Option<u64> {
+        None
+    }
     /// Commit the buffer to the panel surface and reset the cursor to 0 so
     /// the next image starts from the top. On a real panel this is the slow
     /// e-ink refresh; on the sim it triggers an egui repaint.

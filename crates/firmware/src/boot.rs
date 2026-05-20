@@ -121,47 +121,31 @@ pub fn run(resources: FirmwareResources) -> ! {
         crate::boards::PowerPolicy::AlwaysOn => paperanywhere_ports::PowerPolicy::AlwaysOn,
     };
 
-    // Content-hash dedup: only render the boot screen if its hash differs
-    // from whatever the panel last showed. Subsequent RTC-wake cold boots
-    // see the same hash in NVS and skip the 5-cycle full refresh — the
-    // previous content stays visible on the bistable e-paper while WiFi
-    // associates and /state polls in the background. Same mechanism the
-    // runtime uses for image updates, so a real image push and a
-    // boot-screen render are deduplicated by the same path.
-    // Boot-screen content hash factors in the version stamp so an OTA
-    // install (which changes the overlaid version text) re-renders the
-    // splash on first boot of the new firmware. Without the suffix the
-    // version label would be stale through one extra wake.
-    let boot_screen_hash = {
-        let logo = paperanywhere_ports::hash_bytes(BOOT_SCREEN);
-        let version = paperanywhere_ports::hash_bytes(crate::FW_VERSION.as_bytes());
-        logo ^ version
-    };
-    let render_boot_screen =
-        if nvs_ref.load_last_render_hash() == Some(boot_screen_hash) {
-            false
-        } else {
-            // Save the hash *before* spawning the runtime — if the refresh
-            // panics or the device resets mid-flash we accept the lost
-            // splash rather than re-flashing on every retry.
-            nvs_ref.save_last_render_hash(boot_screen_hash);
-            true
-        };
-    if render_boot_screen {
-        // Paint the logo into the main region, overlay version + build
-        // time below it, then flush. Subsequent wake cycles skip this
-        // because of the hash match above.
-        panel_ref.init();
-        // No live state yet at cold-boot (WiFi not associated, no
-        // battery sample). Compositor renders the bar with `None`
-        // inputs: disconnected wifi icon, empty battery outline.
-        panel_ref.set_chrome(sleeper_ref.battery_mv(), None);
-        panel_ref.write_chunk(BOOT_SCREEN);
-        {
-            let mut region = panel_ref.main_region_mut();
-            crate::BUILD_INFO.render_into(&mut region);
-        }
+    // Stage the boot screen: logo into the main region, build-info
+    // overlay on top, status bar composed by the compositor. Then hash
+    // the final composed framebuffer and ask NVS whether we already
+    // displayed this. Hash dedup happens at the driver level (here,
+    // the compositor's pending_hash) so a status-bar widget update
+    // also counts as "new content" — the previous wake's battery %
+    // becoming stale doesn't get skipped just because the boot screen
+    // bytes are identical.
+    panel_ref.init();
+    panel_ref.set_chrome(sleeper_ref.battery_mv(), None);
+    panel_ref.write_chunk(BOOT_SCREEN);
+    {
+        let mut region = panel_ref.main_region_mut();
+        crate::BUILD_INFO.render_into(&mut region);
+    }
+    panel_ref.compose();
+    let pending = panel_ref.pending_hash();
+    let cached = nvs_ref.load_last_render_hash();
+    if pending.is_none() || pending != cached {
         panel_ref.refresh();
+        if let Some(h) = pending {
+            nvs_ref.save_last_render_hash(h);
+        }
+    } else {
+        println!("boot: panel content unchanged — skipping refresh");
     }
 
     let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());

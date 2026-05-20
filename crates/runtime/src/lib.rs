@@ -208,54 +208,52 @@ where
     }
 
     if let Some(image) = state.image.as_ref() {
-        // Content hash from the backend's `sha256_hex` — same hash function
-        // boot.rs uses for the splash. Comparing against `last_render_hash`
-        // catches "same content under a different image_id" and "fresh-
-        // device-but-server-thinks-it's-already-applied" simultaneously.
-        let new_hash = paperanywhere_ports::hash_bytes(image.sha256_hex.as_bytes());
-        if Some(new_hash) != nvs.load_last_render_hash() {
-            info!("wake: new image {} (hash {:#x}), streaming to panel", image.image_id, new_hash);
-            // Push current chrome state into the compositor BEFORE the
-            // image stream so the status bar reflects "just associated,
-            // currently rendering image N" rather than stale values.
-            panel.set_chrome(sleeper.battery_mv(), wifi.rssi_dbm());
-            let render_result = stream_image_to_panel(http, panel, &token, image).await;
-            let phase = match &render_result {
-                Ok(()) => {
-                    nvs.save_last_render_hash(new_hash);
-                    // Stamp the status bar with the render time so the
-                    // user can eyeball "did this device update recently".
-                    // Without an NTP sync the device clock is at unix
-                    // epoch 0 — fall back to "now" formatted as
-                    // HH:MM:SS of uptime once unix_now > 0.
-                    let now = sleeper.unix_now();
-                    if now > 0 {
-                        let hh = (now / 3600) % 24;
-                        let mm = (now / 60) % 60;
-                        let mut buf: alloc::string::String =
-                            alloc::string::String::with_capacity(8);
-                        let _ = core::fmt::write(
-                            &mut buf,
-                            format_args!("{:02}:{:02}", hh, mm),
-                        );
-                        panel.set_last_update(&buf);
+        info!("wake: image {} offered, streaming to panel", image.image_id);
+        // Push current chrome state into the compositor BEFORE the
+        // image stream so the status bar reflects "just associated,
+        // currently rendering image N" rather than stale values.
+        panel.set_chrome(sleeper.battery_mv(), wifi.rssi_dbm());
+        // Stamp the last-update field NOW so it makes it into the
+        // hash dedup — if the time is the only thing that differs
+        // from the previous wake, we still refresh to update the bar.
+        let now = sleeper.unix_now();
+        if now > 0 {
+            let hh = (now / 3600) % 24;
+            let mm = (now / 60) % 60;
+            let mut buf: alloc::string::String = alloc::string::String::with_capacity(8);
+            let _ = core::fmt::write(&mut buf, format_args!("{:02}:{:02}", hh, mm));
+            panel.set_last_update(&buf);
+        }
+        let render_result = stream_image_to_panel(http, panel, &token, image).await;
+        let phase = match &render_result {
+            Ok(()) => {
+                // Driver-level dedup: compose, hash, compare. Skips
+                // the slow e-ink refresh if nothing (image OR status
+                // bar) actually changed since last persisted state.
+                panel.compose();
+                let pending = panel.pending_hash();
+                let cached = nvs.load_last_render_hash();
+                if pending.is_none() || pending != cached {
+                    panel.refresh();
+                    if let Some(h) = pending {
+                        nvs.save_last_render_hash(h);
                     }
-                    AckPhase::Applied
+                } else {
+                    debug!("wake: composed surface matches NVS hash — skipping refresh");
                 }
-                Err(_) => AckPhase::Failed,
-            };
-            let ack = DeviceAck {
-                image_id: image.image_id.clone(),
-                phase,
-                error: render_result.as_ref().err().map(|e| format!("{:?}", e)),
-                battery_mv: sleeper.battery_mv(),
-                rssi_dbm: wifi.rssi_dbm(),
-            };
-            if let Err(e) = http.post_ack(&token, &ack).await {
-                warn!("wake: post_ack: {:?}", e);
+                AckPhase::Applied
             }
-        } else {
-            debug!("wake: image {} already on panel (hash match), skipping", image.image_id);
+            Err(_) => AckPhase::Failed,
+        };
+        let ack = DeviceAck {
+            image_id: image.image_id.clone(),
+            phase,
+            error: render_result.as_ref().err().map(|e| format!("{:?}", e)),
+            battery_mv: sleeper.battery_mv(),
+            rssi_dbm: wifi.rssi_dbm(),
+        };
+        if let Err(e) = http.post_ack(&token, &ack).await {
+            warn!("wake: post_ack: {:?}", e);
         }
     }
 
@@ -296,7 +294,8 @@ where
         warn!("blob stream failed: {:?}", e);
         return Err(WakeError::BlobFetch);
     }
-    panel.refresh();
+    // Note: refresh is the caller's responsibility — the caller runs
+    // compose() + the driver-level hash dedup before deciding to flush.
     let _ = image.byte_len.to_string(); // silence unused-import lint paths
     Ok(())
 }
