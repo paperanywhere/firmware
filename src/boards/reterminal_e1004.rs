@@ -1,7 +1,7 @@
 //! Seeed Studio reTerminal E1004 — ESP32-S3, 13.3" full-color ACeP e-paper,
 //! ~6-month battery life.
 
-use paperanywhere_proto::{ColorMode, PackingKind, PowerPolicy};
+use super::{ColorMode, PackingKind, PowerPolicy};
 
 use super::BoardConfig;
 

@@ -1,6 +1,6 @@
 //! Seeed Studio reTerminal E1002 — ESP32-S3, 7.3" 800×480 full-color ACeP e-paper.
 
-use paperanywhere_proto::{ColorMode, PackingKind, PowerPolicy};
+use super::{ColorMode, PackingKind, PowerPolicy};
 
 use super::BoardConfig;
 

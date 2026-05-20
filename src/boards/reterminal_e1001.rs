@@ -4,7 +4,7 @@
 //! Pin mapping placeholder — confirm against the open-source Seeed schematic before
 //! a real build. (See <https://wiki.seeedstudio.com/getting_started_with_reterminal_e1001/>.)
 
-use paperanywhere_proto::{ColorMode, PackingKind, PowerPolicy};
+use super::{ColorMode, PackingKind, PowerPolicy};
 
 use super::BoardConfig;
 

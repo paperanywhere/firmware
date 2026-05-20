@@ -1,7 +1,7 @@
 //! Seeed Studio reTerminal E1003 — ESP32-S3, 10.3" 1404×1872 monochrome e-paper,
 //! 16-level grayscale, ~6-month battery life.
 
-use paperanywhere_proto::{ColorMode, PackingKind, PowerPolicy};
+use super::{ColorMode, PackingKind, PowerPolicy};
 
 use super::BoardConfig;
 

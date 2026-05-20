@@ -1,6 +1,6 @@
 //! Soldered Inkplate 10 — ESP32, 1200×825 mono e-paper with Gray4 support.
 
-use paperanywhere_proto::{ColorMode, PackingKind, PowerPolicy};
+use super::{ColorMode, PackingKind, PowerPolicy};
 
 use super::BoardConfig;
 

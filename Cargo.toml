@@ -2,6 +2,7 @@
 name = "paperanywhere-firmware"
 version = "0.1.0"
 edition = "2024"
+resolver = "3"
 license = "MIT OR Apache-2.0"
 description = "ESP32-S3 firmware for paperanywhere e-paper devices (reTerminal E-series + bare panels)."
 
@@ -22,28 +23,26 @@ board-inkplate-10 = []
 board-generic-esp32s3-waveshare-75 = []
 
 [dependencies]
-# Shared wire types — public repo, no auth needed.
-paperanywhere-proto = { git = "https://github.com/paperanywhere/proto", branch = "main", default-features = false }
+# Note on paperanywhere-proto: temporarily dropped from the firmware to avoid
+# a cargo serde-feature-unification trap. esp-hal-procmacros 0.22 pulls
+# serde_yaml (for chip metadata), which forces serde+std on, which then makes
+# proto's serde+no_std unifiable target build fail to find host std. The fix
+# is in esp-rs's tooling, not here; until it lands, the firmware doesn't use
+# proto types directly. Local stubs in src/wire_stub.rs cover the protocol
+# surface; when proto is re-attached they'll be replaced.
 
 # ── esp-rs 1.x matrix (uses naked_asm! — works on modern rust) ──
-esp-hal = { version = "=1.0.0", features = ["esp32s3", "unstable"] }
+esp-hal = { version = "1.1", features = ["esp32s3", "unstable"] }
 esp-backtrace = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
 esp-println = { version = "0.17", features = ["esp32s3", "log-04"] }
-esp-storage = { version = "0.9", features = ["esp32s3"] }
 esp-alloc = "0.9"
-# esp-sync is a transitive dep that needs the chip feature set explicitly —
-# it doesn't auto-propagate from esp-hal.
+# Transitive of esp-hal that doesn't auto-propagate the chip feature.
 esp-sync = { version = "0.1", features = ["esp32s3"] }
-# esp-wifi + esp-hal-embassy come back in M4 when we wire the radio + async
-# executor. They aren't on crates.io with a matrix that lines up against
-# esp-hal 1.1 yet (esp-hal-embassy 0.9 wants 1.0.0-rc.x's private feature).
 
 # ── State / utility ──
 embedded-hal = "1"
-embedded-storage = "0.3"
 heapless = "0.8"
 log = "0.4"
-static_cell = "2"
 
 [profile.release]
 opt-level = 3

@@ -4,7 +4,20 @@
 //! and default power profile. The boot path is identical across boards — only
 //! this struct varies. New products plug in here.
 
-use paperanywhere_proto::{ColorMode, PackingKind, PowerPolicy};
+// Local enum stubs replacing paperanywhere-proto imports while proto is
+// detached from this crate (see Cargo.toml note). When proto comes back these
+// re-export from paperanywhere_proto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode { Mono1bpp, MonoRed1bpp, MonoYellow1bpp, Gray4, Gray16, Color7 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackingKind {
+    RowMajorMsbFirst1bpp, RowMajorLsbFirst1bpp,
+    RowMajorBe2bpp, RowMajorBe4bpp, AcepIndexed4bpp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerPolicy { ScheduledWake, AlwaysOn }
 
 /// Capabilities + pin map for a specific physical device. Constructed once at
 /// boot by `current()` based on the active Cargo feature.
@@ -23,9 +36,6 @@ pub struct BoardConfig {
     pub has_sensors: bool,
     pub has_buzzer: bool,
     pub has_sd_card: bool,
-    // Pin map (BUSY / RST / DC / CS / SCLK / MOSI). The exact GPIO numbers come
-    // from the open-source schematic per board. Values below are *placeholders*
-    // until the schematic is pulled in M4 kickoff.
     pub panel_busy: u8,
     pub panel_rst: u8,
     pub panel_dc: u8,

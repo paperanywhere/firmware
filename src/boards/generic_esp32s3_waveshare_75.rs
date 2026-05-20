@@ -1,7 +1,7 @@
 //! Generic ESP32-S3 carrier driving a Waveshare 7.5" BW e-paper panel.
 //! Reference build for users wiring their own hardware (matches `panel_model_id = 7`).
 
-use paperanywhere_proto::{ColorMode, PackingKind, PowerPolicy};
+use super::{ColorMode, PackingKind, PowerPolicy};
 
 use super::BoardConfig;
 
