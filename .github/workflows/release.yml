@@ -1,0 +1,117 @@
+# Release pipeline.
+#
+# Fires on `v*` tag pushes. Builds the firmware for every supported board,
+# computes SHA-256 of each `.bin`, and uploads everything as assets on a
+# GitHub Release. Devices in the field with their dev-flag NOT set will
+# fetch the manifest at api.github.com /repos/paperanywhere/firmware/
+# releases/latest and pull the matching board's binary.
+#
+# Asset naming convention (consumed by the firmware's OTA fetcher):
+#
+#   paperanywhere-firmware-<board-slug>-<tag>.bin
+#   paperanywhere-firmware-<board-slug>-<tag>.bin.sha256
+#
+# e.g. paperanywhere-firmware-reterminal-e1001-v0.2.0.bin.
+#
+# The cargo package version in `crates/firmware/Cargo.toml` must already
+# match the tag minus the leading `v` (so tag `v0.2.0` ↔ version `0.2.0`)
+# before pushing the tag — there's a guard step that fails the build if
+# they disagree.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  # required to attach assets to the release
+  contents: write
+
+jobs:
+  build:
+    name: build firmware (${{ matrix.board }})
+    runs-on: ubuntu-latest
+    container: espressif/idf-rust:esp32s3_latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Boards with a wired firmware target. Mirrors the
+        # `firmware_target` field in paperanywhere/devices' catalog —
+        # add new boards here as they land.
+        board:
+          - reterminal-e1001
+          - reterminal-e1002
+          - reterminal-e1003
+          - reterminal-e1004
+          - inkplate-6
+          - inkplate-10
+          - generic-esp32s3-waveshare-75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history for the git-sha build stamp
+
+      - name: Verify Cargo.toml version matches tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep -m1 '^version' crates/firmware/Cargo.toml | sed -E 's/version[ \t]*=[ \t]*"([^"]+)"/\1/')
+          # crates/firmware uses `version.workspace = true` — fall back
+          # to the workspace root if the crate manifest doesn't pin
+          # explicitly.
+          if [ "$cargo_version" = "true" ] || [ -z "$cargo_version" ]; then
+            cargo_version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version[ \t]*=[ \t]*"([^"]+)"/\1/')
+          fi
+          echo "tag=$tag  cargo=$cargo_version"
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "::error::tag $tag does not match cargo version $cargo_version"
+            exit 1
+          fi
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /home/esp/export-esp.sh
+          # release-dev profile: opt-3 but lto=off, codegen-units=16 so
+          # CI builds finish in ~1 min not ~5. Production-tier builds
+          # can switch to --release if size matters more than CI time.
+          cargo build \
+            -p paperanywhere-firmware \
+            --no-default-features \
+            --features board-${{ matrix.board }} \
+            --profile release-dev \
+            --target xtensa-esp32s3-none-elf \
+            -Z build-std=core,alloc
+
+      - name: Convert ELF to flashable bin
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /home/esp/export-esp.sh
+          mkdir -p artifacts
+          out="artifacts/paperanywhere-firmware-${{ matrix.board }}-${GITHUB_REF_NAME}.bin"
+          espflash save-image \
+            --chip esp32s3 \
+            --merge \
+            --partition-table crates/firmware/flash/partition-table.csv \
+            target/xtensa-esp32s3-none-elf/release-dev/paperanywhere-firmware \
+            "$out"
+          sha256sum "$out" | awk '{print $1}' > "$out.sha256"
+          echo "Built $out ($(stat -c%s "$out") bytes)"
+          echo "SHA-256: $(cat "$out.sha256")"
+
+      - name: Upload as release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.bin
+            artifacts/*.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          # First job in the matrix creates the release; subsequent jobs
+          # attach assets to it. The action is idempotent by tag.
+          tag_name: ${{ github.ref_name }}

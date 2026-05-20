@@ -424,6 +424,16 @@ pub trait NvsStore {
     fn load_backend_url(&self) -> Option<String> {
         None
     }
+    /// Was this device flashed as a dev build? Provtool sets this byte to
+    /// `true` when generating a prov.bin with `--dev`; production flashes
+    /// leave it unset. When `true`, the firmware skips the GitHub-release
+    /// OTA check entirely — useful so a dev rig doesn't get its
+    /// hand-built binary clobbered the moment a real release ships.
+    /// Default impl returns `false` (i.e. "this is a production build,
+    /// OTA is allowed") so existing impls don't have to opt-in.
+    fn load_is_dev_build(&self) -> bool {
+        false
+    }
 }
 
 /// E-paper panel surface. HTTPS chunks arrive at arbitrary byte boundaries —

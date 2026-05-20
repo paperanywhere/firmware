@@ -66,6 +66,11 @@ const TAG_WIFI_SSID: u8 = 2;
 const TAG_WIFI_PASSWORD: u8 = 3;
 const TAG_BACKEND_URL: u8 = 4;
 const TAG_CLAIM_CODE: u8 = 5;
+/// Dev-build marker. 1-byte payload, value 0x01 = dev. Firmware reads
+/// this and suppresses the GitHub-release OTA check so a hand-built
+/// dev binary doesn't get clobbered by the next release. Omitted from
+/// production prov bundles.
+const TAG_IS_DEV_BUILD: u8 = 7;
 
 fn main() -> ExitCode {
     if let Err(e) = run() {
@@ -84,6 +89,7 @@ fn run() -> Result<(), String> {
     let _ = load_dotenv("provision.env");
 
     let mut output: PathBuf = "prov.bin".into();
+    let mut is_dev = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -93,11 +99,23 @@ fn run() -> Result<(), String> {
                     .ok_or_else(|| "--output requires a path".to_string())?
                     .into();
             }
+            "--dev" => {
+                is_dev = true;
+            }
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
             }
             other => return Err(format!("unknown arg: {}", other)),
+        }
+    }
+    // Env-var fallback so CI / shell scripts can set the flag without
+    // remembering to pass --dev. Truthy = "1" / "true" / "yes" (case-
+    // insensitive). Anything else (or unset) leaves the default.
+    if !is_dev {
+        if let Ok(v) = std::env::var("PAPERANYWHERE_PROV_DEV") {
+            let v = v.trim().to_ascii_lowercase();
+            is_dev = matches!(v.as_str(), "1" | "true" | "yes");
         }
     }
 
@@ -106,16 +124,17 @@ fn run() -> Result<(), String> {
     let backend_url = require_env("PAPERANYWHERE_PROV_BACKEND_URL")?;
     let claim_code = std::env::var("PAPERANYWHERE_PROV_CLAIM_CODE").ok();
 
-    let blob = build_blob(&ssid, &password, &backend_url, claim_code.as_deref())?;
+    let blob = build_blob(&ssid, &password, &backend_url, claim_code.as_deref(), is_dev)?;
     let mut padded = vec![0u8; PROV_BLOB_SIZE];
     padded[..blob.len()].copy_from_slice(&blob);
     fs::write(&output, &padded)
         .map_err(|e| format!("write {}: {}", output.display(), e))?;
     println!(
-        "wrote {} ({} bytes of {} blob used, rest zero-padded)",
+        "wrote {} ({} bytes of {} blob used, rest zero-padded){}",
         output.display(),
         blob.len(),
-        PROV_BLOB_SIZE
+        PROV_BLOB_SIZE,
+        if is_dev { " [DEV — OTA disabled]" } else { "" }
     );
     println!();
     println!("Flash to the device with:");
@@ -133,6 +152,7 @@ fn build_blob(
     password: &str,
     backend_url: &str,
     claim_code: Option<&str>,
+    is_dev: bool,
 ) -> Result<Vec<u8>, String> {
     if ssid.is_empty() {
         return Err("ssid is empty".into());
@@ -156,6 +176,13 @@ fn build_blob(
             return Err(format!("claim_code > 16 bytes ({} bytes)", cc.len()));
         }
         push_record(&mut payload, TAG_CLAIM_CODE, cc.as_bytes());
+    }
+    if is_dev {
+        // Single-byte payload, 0x01 = dev. Firmware decodes this in
+        // nvs.rs's parse_prov_tlv and sets cache.is_dev_build = true.
+        // Omitted entirely for production bundles so the wire layout
+        // matches the pre-flag version byte-for-byte.
+        push_record(&mut payload, TAG_IS_DEV_BUILD, &[1u8]);
     }
     payload.push(0); // end terminator
 
@@ -255,9 +282,15 @@ Required:
 Optional:
   PAPERANYWHERE_PROV_CLAIM_CODE   pre-issued claim code, <=16 bytes
   PAPERANYWHERE_PROV_PORT         serial port for the flash hint (default COM6)
+  PAPERANYWHERE_PROV_DEV          set to 1/true/yes for a dev build (same as
+                                  --dev). Suppresses GitHub-release OTA on the
+                                  resulting device so hand-built dev firmware
+                                  doesn't get clobbered.
 
 Args:
   --output, -o <path>   override the output path (default ./prov.bin)
+  --dev                 mark this prov bundle as a DEV build -- device skips
+                        the GitHub-release OTA check after flashing.
   --help, -h            this message
 ",
     );

@@ -24,6 +24,13 @@ board-reterminal-e1004 = []
 board-inkplate-6 = []
 board-inkplate-10 = []
 board-generic-esp32s3-waveshare-75 = []
+# Hard-disable OTA at the compile-time level. With this on, ota.rs is
+# replaced by a no-op stub and the sha2 + esp-bootloader-esp-idf
+# ota_updater paths are excluded from the binary entirely — useful for
+# releases where the OTA code must not exist (security audits, locked-
+# down firmware). For normal dev workflows, prefer the NVS-level dev
+# flag baked in via `provtool --dev` instead.
+dev-no-ota = []
 
 [dependencies]
 # ── shared paperanywhere crates (workspace) ──

@@ -161,27 +161,35 @@ where
     // flash error) the updater logs and we continue with the rest of the
     // wake so the panel still gets refreshed.
     if let Some(update) = state.firmware_update.as_ref() {
-        info!(
-            "wake: backend offered firmware update {} (revoke={}, {} bytes)",
-            update.version, update.revoke, update.byte_len
-        );
-        if !ota_screen.is_empty() {
-            // Render the "Updating firmware..." status frame before the
-            // long flash-write window so the user sees something other
-            // than the previous image while the panel is otherwise idle.
-            // The render-hash is updated so the next post-reset boot's
-            // dedup check correctly decides whether to refresh again.
-            let ota_screen_hash = paperanywhere_ports::hash_bytes(ota_screen);
-            if Some(ota_screen_hash) != nvs.load_last_render_hash() {
-                panel.set_chrome(sleeper.battery_mv(), wifi.rssi_dbm());
-                panel.write_chunk(ota_screen);
-                panel.refresh();
-                nvs.save_last_render_hash(ota_screen_hash);
+        if nvs.load_is_dev_build() {
+            // Dev signal baked in at flash time — skip OTA entirely so a
+            // hand-built dev binary doesn't get overwritten by the next
+            // release. Production devices land here with the flag false
+            // and proceed through the normal install path.
+            info!(
+                "wake: backend offered firmware update {} but device is in DEV mode — skipping",
+                update.version
+            );
+            // Drop through to the image-render path below so the panel
+            // still refreshes this wake.
+        } else {
+            info!(
+                "wake: backend offered firmware update {} (revoke={}, {} bytes)",
+                update.version, update.revoke, update.byte_len
+            );
+            if !ota_screen.is_empty() {
+                let ota_screen_hash = paperanywhere_ports::hash_bytes(ota_screen);
+                if Some(ota_screen_hash) != nvs.load_last_render_hash() {
+                    panel.set_chrome(sleeper.battery_mv(), wifi.rssi_dbm());
+                    panel.write_chunk(ota_screen);
+                    panel.refresh();
+                    nvs.save_last_render_hash(ota_screen_hash);
+                }
             }
-        }
-        if let Err(e) = fw_updater.apply(http, &token, update).await {
-            warn!("wake: firmware update failed: {:?}", e);
-            // fall through — non-fatal; resume the normal render path.
+            if let Err(e) = fw_updater.apply(http, &token, update).await {
+                warn!("wake: firmware update failed: {:?}", e);
+                // fall through — non-fatal; resume the normal render path.
+            }
         }
     }
 

@@ -66,6 +66,12 @@ const TAG_CLAIM_CODE: u8 = 5;
 /// future setup screens) and skips the refresh when this value matches.
 /// Payload is 8 bytes little-endian.
 const TAG_LAST_RENDER_HASH: u8 = 6;
+/// Dev-build marker. `true` (1-byte payload = 0x01) means provtool was
+/// invoked with `--dev` when this device was flashed; the firmware
+/// suppresses the GitHub-release OTA check so a freshly hand-built
+/// binary doesn't get clobbered by the next release. Absent / 0x00 =
+/// production build, OTA path active.
+const TAG_IS_DEV_BUILD: u8 = 7;
 
 #[derive(Default)]
 struct NvsCache {
@@ -77,6 +83,9 @@ struct NvsCache {
     /// Hash of the bytes currently rendered on the panel. `None` means the
     /// panel is in its power-on (blank) state or post-factory-reset.
     last_render_hash: Option<u64>,
+    /// `true` if this device is flashed in dev mode. Defaults to `false`
+    /// (production); set to `true` via the prov blob's `--dev` flag.
+    is_dev_build: bool,
 }
 
 pub struct FwNvs {
@@ -133,6 +142,15 @@ impl FwNvs {
         if let Some(s) = prov.claim_code {
             self.cache.claim_code = into_hstring::<16>(&s);
         }
+        // Dev flag is sticky once migrated — flashing a fresh prov.bin
+        // without --dev resets it back to false on the next migration
+        // (which is what you want when promoting a board from dev to
+        // production: re-flash with a non-dev prov bundle and the next
+        // boot picks up the new flag).
+        self.cache.is_dev_build = prov.is_dev_build;
+        if self.cache.is_dev_build {
+            esp_println::println!("nvs: device flashed as DEV build — OTA suppressed");
+        }
         self.persist();
         if let Err(e) = erase_prov(&mut self.storage) {
             esp_println::println!("nvs: prov erase failed: {:?}", e);
@@ -175,6 +193,10 @@ impl NvsStore for FwNvs {
 
     fn load_backend_url(&self) -> Option<String> {
         self.cache.backend_url.as_ref().map(|h| h.as_str().to_string())
+    }
+
+    fn load_is_dev_build(&self) -> bool {
+        self.cache.is_dev_build
     }
 }
 
@@ -307,6 +329,13 @@ fn encode_tlv(cache: &NvsCache, payload: &mut [u8]) -> Result<usize, NvsError> {
     if let Some(h) = cache.last_render_hash {
         pos = write_record(payload, pos, TAG_LAST_RENDER_HASH, &h.to_le_bytes())?;
     }
+    if cache.is_dev_build {
+        // Single-byte payload; absence (or any non-0x01 value) means
+        // production. Only emit the tag when true so an existing
+        // production NVS record stays byte-identical to the pre-dev-flag
+        // layout (cheap forward-compat for old firmware decoding it).
+        pos = write_record(payload, pos, TAG_IS_DEV_BUILD, &[1u8])?;
+    }
     // tag 0 terminator
     if pos < payload.len() {
         payload[pos] = 0;
@@ -352,6 +381,11 @@ fn parse_tlv(payload: &[u8]) -> Result<NvsCache, NvsError> {
                 buf.copy_from_slice(value);
                 cache.last_render_hash = Some(u64::from_le_bytes(buf));
             }
+            i = val_end;
+            continue;
+        }
+        if tag == TAG_IS_DEV_BUILD {
+            cache.is_dev_build = !value.is_empty() && value[0] != 0;
             i = val_end;
             continue;
         }
@@ -401,6 +435,9 @@ struct ProvData {
     password: Option<String>,
     backend_url: Option<String>,
     claim_code: Option<String>,
+    /// Set by `provtool gen --dev`. When `true`, this device is in dev
+    /// mode and the firmware suppresses the GitHub-release OTA check.
+    is_dev_build: bool,
 }
 
 /// Read the prov partition and parse it. `BadMagic` or `BadCrc` is the
@@ -477,6 +514,13 @@ fn parse_prov_tlv(payload: &[u8]) -> Result<ProvData, NvsError> {
             return Err(NvsError::Truncated);
         }
         let value = &payload[val_start..val_end];
+        // Binary tags decode before UTF-8 — they aren't valid UTF-8 by
+        // construction (single byte 0x01 in dev-flag's case).
+        if tag == TAG_IS_DEV_BUILD {
+            prov.is_dev_build = !value.is_empty() && value[0] != 0;
+            i = val_end;
+            continue;
+        }
         let s = core::str::from_utf8(value)
             .map_err(|_| NvsError::Truncated)?
             .to_string();
