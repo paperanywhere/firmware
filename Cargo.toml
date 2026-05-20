@@ -26,8 +26,8 @@ board-generic-esp32s3-waveshare-75 = []
 paperanywhere-proto = { git = "https://github.com/paperanywhere/proto", branch = "main", default-features = false }
 
 # ── esp-rs 1.x matrix (uses naked_asm! — works on modern rust) ──
-esp-hal = { version = "1.1", features = ["esp32s3", "unstable"] }
-esp-hal-embassy = { version = "0.10", features = ["esp32s3"] }
+esp-hal = { version = "=1.0.0-rc.1", features = ["esp32s3", "unstable"] }
+esp-hal-embassy = { version = "0.9", features = ["esp32s3"] }
 esp-backtrace = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
 esp-println = { version = "0.17", features = ["esp32s3", "log-04"] }
 esp-wifi = { version = "0.15", default-features = false, features = ["esp32s3", "wifi", "esp-alloc"] }
