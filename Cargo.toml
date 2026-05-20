@@ -29,12 +29,17 @@ board-generic-esp32s3-waveshare-75 = []
 paperanywhere-proto = { git = "https://github.com/paperanywhere/proto", branch = "main", default-features = false }
 
 # ── esp-rs core ──
+# The esp-rs crates ship as a matched matrix — esp-hal X.Y locks the compatible
+# esp-wifi / esp-hal-embassy / esp-backtrace / esp-println versions because
+# they all use the same internal `links = "esp-hal"` peripheral lock. Pinning
+# anywhere lossely (e.g. esp-wifi 0.10 with esp-hal 0.22) fails the resolver
+# with a `links = "esp-hal"` conflict. The matrix here is the 0.22 line.
 esp-hal = { version = "0.22", features = ["esp32s3"] }
 esp-hal-embassy = { version = "0.5", features = ["esp32s3"] }
 esp-backtrace = { version = "0.14", features = ["esp32s3", "panic-handler", "exception-handler", "println"] }
 esp-println = { version = "0.12", features = ["esp32s3", "log"] }
-esp-wifi = { version = "0.10", features = ["esp32s3", "wifi", "tcp", "ipv4", "embassy-net"] }
-esp-storage = { version = "0.3", features = ["esp32s3"] }
+esp-wifi = { version = "0.11", features = ["esp32s3", "wifi", "utils"] }
+esp-storage = { version = "0.4", features = ["esp32s3"] }
 
 # ── Networking ──
 embassy-executor = { version = "0.6", features = ["task-arena-size-32768", "executor-thread"] }
