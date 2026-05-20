@@ -41,6 +41,15 @@ jobs:
           default: true
           ldproxy: false
 
+      - name: ensure host stdlib (proc-macros need x86_64-linux-gnu std)
+        run: |
+          rustup show
+          rustup component add rust-std --toolchain esp || true
+          # Fallback: install stable to provide host std for proc-macros if the
+          # esp toolchain didn't ship it. Cargo invokes proc-macros via whatever
+          # rustc the active toolchain provides; the linker is xtensa-target.
+          rustup toolchain install stable --profile minimal --component rust-std
+
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: firmware-${{ matrix.board }}
