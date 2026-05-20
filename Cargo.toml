@@ -9,9 +9,8 @@ description = "ESP32-S3 firmware for paperanywhere e-paper devices (reTerminal E
 name = "paperanywhere-firmware"
 path = "src/main.rs"
 
-# ── Board feature flags — mutually exclusive at compile time ──
+# Board feature flags — mutually exclusive at compile time.
 # Pick one when building: `cargo build --features board-reterminal-e1001`
-# CI builds all four to catch breakage.
 [features]
 default = ["board-reterminal-e1001"]
 board-reterminal-e1001 = []
@@ -24,42 +23,23 @@ board-generic-esp32s3-waveshare-75 = []
 
 [dependencies]
 # Shared wire types — public repo, no auth needed.
-# Sibling-checkout dev: swap to a path dep against a local clone:
-#   paperanywhere-proto = { path = "../paperanywhere-proto", default-features = false }
 paperanywhere-proto = { git = "https://github.com/paperanywhere/proto", branch = "main", default-features = false }
 
-# ── esp-rs core ──
-# The esp-rs crates ship as a matched matrix — esp-hal X.Y locks the compatible
-# esp-wifi / esp-hal-embassy / esp-backtrace / esp-println versions because
-# they all use the same internal `links = "esp-hal"` peripheral lock. Pinning
-# anywhere lossely (e.g. esp-wifi 0.10 with esp-hal 0.22) fails the resolver
-# with a `links = "esp-hal"` conflict. The matrix here is the 0.22 line.
+# ── esp-rs core (matched matrix; bump esp-hal + esp-wifi + esp-storage + esp-hal-embassy together) ──
 esp-hal = { version = "0.22", features = ["esp32s3"] }
 esp-hal-embassy = { version = "0.5", features = ["esp32s3"] }
 esp-backtrace = { version = "0.14", features = ["esp32s3", "panic-handler", "exception-handler", "println"] }
 esp-println = { version = "0.12", features = ["esp32s3", "log"] }
-esp-wifi = { version = "0.11", features = ["esp32s3", "wifi", "utils"] }
+esp-wifi = { version = "0.11", default-features = false, features = ["esp32s3", "wifi"] }
 esp-storage = { version = "0.4", features = ["esp32s3"] }
+esp-alloc = "0.5"
 
-# ── Networking ──
+# ── Embassy runtime (timer + executor only; net stack comes later in M4) ──
 embassy-executor = { version = "0.6", features = ["task-arena-size-32768", "executor-thread"] }
 embassy-time = "0.3"
-embassy-net = { version = "0.4", features = ["proto-ipv4", "tcp", "dhcpv4", "medium-ethernet"] }
-embedded-tls = { version = "0.17", default-features = false }
-embedded-io-async = "0.6"
-embedded-svc = { version = "0.28", default-features = false }
-smoltcp = { version = "0.11", default-features = false }
 
-# ── Serde over the wire ──
-serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
-serde-json-core = "0.6"
-
-# ── E-paper drivers ──
+# ── State / utility ──
 embedded-hal = "1"
-embedded-hal-async = "1"
-embedded-graphics = "0.8"
-
-# ── State ──
 heapless = "0.8"
 log = "0.4"
 static_cell = "2"
@@ -74,5 +54,5 @@ debug = false
 strip = "symbols"
 
 [profile.dev]
-opt-level = 1     # ESP32 RAM/flash budgets are tight even in dev.
+opt-level = 1
 panic = "abort"
