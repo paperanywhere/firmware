@@ -1,10 +1,24 @@
 name: build
 
+# DISABLED on push/PR until esp-hal is bumped from 0.22 → 1.x.
+#
+# Why: esp-hal 0.22 uses `asm!` inside naked functions, which any modern rust
+# toolchain (≥1.86 or so) hard-errors on with E0787. The esp toolchain release
+# matrix doesn't have a version that simultaneously supports edition 2024
+# (needs ≥1.85) AND accepts asm-in-naked. The only escape is to migrate the
+# firmware to the esp-hal 1.x line, which uses `naked_asm!` properly.
+#
+# Tracking work: bump Cargo.toml to esp-hal 1.x, esp-wifi 0.15.x,
+# esp-hal-embassy 0.9.x, esp-backtrace 0.19.x, esp-println 0.17.x,
+# esp-storage 0.9.x, then rewrite src/main.rs around the new
+# `esp_hal::init(config)` entrypoint.
+#
+# Until then the workflow is `workflow_dispatch` only so CI doesn't keep
+# failing on every push.
 on:
+  workflow_dispatch:
   push:
-    branches: [main]
     tags: ['v*']
-  pull_request:
 
 env:
   CARGO_TERM_COLOR: always
