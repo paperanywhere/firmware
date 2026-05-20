@@ -8,5 +8,7 @@ rustflags = [
 [target.xtensa-esp32s3-none-elf]
 runner = "espflash flash --monitor --partition-table flash/partition-table.csv"
 
-[unstable]
-build-std = ["alloc", "core"]
+# Note: the `esp` rust channel ships prebuilt `core` + `alloc` + `std` for
+# xtensa-esp32s3-none-elf, so we do NOT need `[unstable] build-std`. Enabling
+# it applied to host proc-macro builds too (proc-macro-error-attr2, etc.)
+# and broke them with "can't find crate for std".
