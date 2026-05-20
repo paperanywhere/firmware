@@ -70,15 +70,19 @@ jobs:
           fetch-depth: 1
 
       # 3. Cargo patch override: redirect the firmware's git dep on
-      #    paperanywhere-proto to the local checkout. Avoids cargo trying to
-      #    re-clone the private repo over HTTPS with credentials it can't reach.
-      - name: configure cargo patch override
+      #    paperanywhere-proto to the local checkout. `[patch]` sections must
+      #    live in Cargo.toml (not .cargo/config.toml — that file is for cargo
+      #    configuration, not workspace overrides). We append a CI-only patch
+      #    here so the source Cargo.toml stays git-dep-form for normal builds.
+      - name: apply cargo patch override
         run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'EOF'
+          cat >> Cargo.toml <<'EOF'
+
           [patch."https://github.com/paperanywhere/backend"]
           paperanywhere-proto = { path = "backend/crates/proto" }
           EOF
+          echo "── Cargo.toml tail after patch ──"
+          tail -10 Cargo.toml
 
       - uses: esp-rs/xtensa-toolchain@v1.5
         with:
