@@ -37,6 +37,21 @@ pub enum WifiError {
 /// `esp-radio` underneath.
 pub struct FwWifi {
     controller: WifiController<'static>,
+    /// Embassy-net stack handle, set post-construction by
+    /// [`FwWifi::attach_stack`] once the IP layer has been wired up.
+    /// Used by [`WifiLink::local_ip`] to surface the DHCP-assigned
+    /// address into the status bar + the dev HTTP server's /info JSON.
+    /// `None` until attached.
+    stack: Option<&'static embassy_net::Stack<'static>>,
+}
+
+impl FwWifi {
+    /// Latch onto an embassy-net stack so [`WifiLink::local_ip`] can
+    /// query it. Called once from boot.rs after `network::build`
+    /// produces the stack.
+    pub fn attach_stack(&mut self, stack: &'static embassy_net::Stack<'static>) {
+        self.stack = Some(stack);
+    }
 }
 
 impl FwWifi {
@@ -68,7 +83,7 @@ impl FwWifi {
         // Returned: the controller (used for associate/disconnect calls from
         // the runtime) plus the station interface, which the network module
         // hands to embassy-net to build its TCP/IP stack.
-        Ok((Self { controller }, interfaces.station))
+        Ok((Self { controller, stack: None }, interfaces.station))
     }
 }
 
@@ -102,6 +117,12 @@ impl WifiLink for FwWifi {
         // We avoid that for now to keep the dep surface small; the dashboard
         // heartbeat just won't have RSSI until we enable it.
         None
+    }
+
+    fn local_ip(&self) -> Option<[u8; 4]> {
+        let stack = self.stack?;
+        let cfg = stack.config_v4()?;
+        Some(cfg.address.address().octets())
     }
 }
 

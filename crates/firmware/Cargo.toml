@@ -63,6 +63,9 @@ esp-bootloader-esp-idf = { version = "0.5", features = ["esp32s3"] }
 # image matches the backend's advertised hash chunk-by-chunk so we never
 # touch otadata with a bad slot.
 sha2 = { version = "0.10", default-features = false }
+# Compile-time assertion macros — used by the dev_server to lock down
+# the size of header parsing buffers.
+static_assertions = "1"
 
 # ── State / utility ──
 embedded-hal = "1"

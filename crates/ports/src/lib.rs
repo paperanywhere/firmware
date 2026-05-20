@@ -367,6 +367,14 @@ pub trait WifiLink {
     /// Best-effort signal-strength readout for the `/ack` heartbeat payload.
     /// Returns `None` if unsupported on this implementation.
     fn rssi_dbm(&self) -> Option<i16>;
+    /// Current IPv4 address from DHCP, or `None` when not yet
+    /// associated / address pending. Default `None` for impls that
+    /// don't track this (the sim's mock impl). Used by the status
+    /// bar to show the local IP and by the dev HTTP server's /info
+    /// response so the developer doesn't need to ARP-scan their LAN.
+    fn local_ip(&self) -> Option<[u8; 4]> {
+        None
+    }
 }
 
 /// HTTPS calls against the backend. All three are bearer-authenticated with
@@ -472,6 +480,10 @@ pub trait EpaperPanel {
     /// (e.g. `10:23`). Runtime updates this after each completed
     /// render; the compositor shows it in the left-side info text.
     fn set_last_update(&mut self, _local_time: &str) {}
+    /// IPv4 dotted-quad address (e.g. `10.0.1.42`) for the status
+    /// bar's left-side info text. Runtime sets this once DHCP
+    /// resolves, after `WifiLink::associate` succeeds.
+    fn set_ip(&mut self, _ip: &str) {}
     /// Append `bytes` to the panel's frame RAM at the current cursor. Chunk
     /// boundaries don't need to align to any pixel structure.
     fn write_chunk(&mut self, bytes: &[u8]);

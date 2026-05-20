@@ -48,8 +48,12 @@ pub struct StatusInputs {
     /// (e.g. `D-3F2A`). `None` shows a placeholder.
     pub device_id: Option<HString<24>>,
     /// Local-time stamp of the most recent successful render
-    /// (e.g. `10:23`). `None` shows `—`.
+    /// (e.g. `10:23`). `None` shows `--`.
     pub last_update_local: Option<HString<24>>,
+    /// IPv4 dotted-quad string (e.g. `10.0.1.42`). Shown on the
+    /// boot-screen overlay + left side of the status bar so the
+    /// developer can `pa-dev push --device <ip>` without ARP-scanning.
+    pub ip_address: Option<HString<24>>,
 }
 
 /// Render the bar into `framebuffer` (Mono1bpp packed row-major,
@@ -255,13 +259,19 @@ fn draw_left_info(
     let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
     let baseline = (target.height as i32) / 2 + 4;
 
-    // Build "Device ID: XXX  |  Last Update: YYY" without alloc::format.
-    // heapless::String<128> is plenty for the worst case (24 + 24 + the
-    // labels and separator ≈ 70 chars).
-    let mut line: HString<128> = HString::new();
+    // Build "Device ID: XXX  |  IP: 10.0.1.42  |  Last Update: YYY"
+    // without alloc::format. heapless::String<160> is sized for the
+    // worst case (24 + 24 + 24 + labels + separators ≈ 100 chars).
+    let mut line: HString<160> = HString::new();
     let _ = line.push_str("Device ID: ");
     if let Some(id) = status.device_id.as_ref() {
         let _ = line.push_str(id.as_str());
+    } else {
+        let _ = line.push_str("--");
+    }
+    let _ = line.push_str("  |  IP: ");
+    if let Some(ip) = status.ip_address.as_ref() {
+        let _ = line.push_str(ip.as_str());
     } else {
         let _ = line.push_str("--");
     }

@@ -31,6 +31,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 mod boards;
 mod boot;
+mod dev_server;
 mod http;
 mod network;
 mod nvs;

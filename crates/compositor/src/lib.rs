@@ -181,6 +181,12 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
         self.status.last_update_local = Some(s);
     }
 
+    fn set_ip(&mut self, ip: &str) {
+        let mut s: heapless::String<24> = heapless::String::new();
+        let _ = s.push_str(ip);
+        self.status.ip_address = Some(s);
+    }
+
     fn init(&mut self) {
         self.panel.init();
         // Reset the framebuffer to "all white" (0xFF in the rasterizer's

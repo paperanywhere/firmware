@@ -158,9 +158,20 @@ where
         panel.on_wifi_state_changed(None);
         WakeError::WifiAssociate
     })?;
-    // Association succeeded — push the new RSSI into the status bar.
+    // Association succeeded — push the new RSSI + IP into the status
+    // bar. The IP comes from DHCP via the embassy-net stack; on the
+    // sim path it'll be the host's loopback (or whatever the impl
+    // chooses).
     panel.on_wifi_state_changed(wifi.rssi_dbm());
     panel.on_battery_sample(sleeper.battery_mv());
+    if let Some(ip) = wifi.local_ip() {
+        let mut buf: alloc::string::String = alloc::string::String::with_capacity(16);
+        let _ = core::fmt::write(
+            &mut buf,
+            format_args!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
+        );
+        panel.set_ip(&buf);
+    }
 
     let token = nvs.load_device_token().ok_or(WakeError::NoDeviceToken)?;
 

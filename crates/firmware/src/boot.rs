@@ -45,6 +45,7 @@ static SLEEPER: StaticCell<FwSleeper> = StaticCell::new();
 static OTA: StaticCell<FwOta> = StaticCell::new();
 static STACK_HANDLE: StaticCell<Stack<'static>> = StaticCell::new();
 static EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
+static DEV_SERVER_CTX: StaticCell<crate::dev_server::DevServerCtx> = StaticCell::new();
 
 pub fn run(resources: FirmwareResources) -> ! {
     let FirmwareResources {
@@ -100,6 +101,9 @@ pub fn run(resources: FirmwareResources) -> ! {
     let backend_url = nvs.load_backend_url();
 
     let wifi_ref = WIFI.init(wifi);
+    // Let FwWifi see the embassy-net stack so `WifiLink::local_ip` can
+    // pull the DHCP-assigned address for the status bar + dev /info.
+    wifi_ref.attach_stack(stack_ref);
     let http_ref = HTTP.init(FwHttp::new(stack_ref, backend_url.as_deref()));
     let nvs_ref = NVS.init(nvs);
     let panel_ref = PANEL.init(boards::build_panel(panel, board));
@@ -162,10 +166,37 @@ pub fn run(resources: FirmwareResources) -> ! {
         println!("boot: panel content unchanged — skipping refresh");
     }
 
+    // Cache board metadata for the dev HTTP server before we move
+    // `board` into the runtime task. Only constructed/spawned when
+    // the device is in dev mode — production firmware never opens a
+    // listening socket.
+    let dev_server_ctx: Option<&'static crate::dev_server::DevServerCtx> =
+        if nvs_ref.load_is_dev_build() {
+            let (board_mac_bytes, _) = (mac_bytes, ());
+            let mut mac6 = [0u8; 6];
+            if board_mac_bytes.len() >= 6 {
+                mac6.copy_from_slice(&board_mac_bytes[..6]);
+            }
+            Some(DEV_SERVER_CTX.init(crate::dev_server::DevServerCtx {
+                fw_version: crate::FW_VERSION,
+                build_time: crate::BUILD_TIME,
+                board_slug: board.name,
+                panel_width_px: board.panel_width_px,
+                panel_height_px: board.panel_height_px,
+                mac: mac6,
+            }))
+        } else {
+            None
+        };
+
     let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
     executor.run(|spawner| {
         let net_token = crate::network::net_task(runner).expect("net_task pool");
         spawner.spawn(net_token);
+        if let Some(ctx) = dev_server_ctx {
+            let dev_token = crate::dev_server::run(stack_ref, ctx).expect("dev_server pool");
+            spawner.spawn(dev_token);
+        }
         // Boot screen is already on the panel by this point (paint
         // above), so the runtime doesn't need to render it again. Pass
         // an empty slice to short-circuit its boot-screen path.
