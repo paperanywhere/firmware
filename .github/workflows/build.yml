@@ -14,11 +14,34 @@ permissions:
   contents: write  # needed for Releases
 
 jobs:
+  # Preflight: fail fast with an actionable message if PROTO_REPO_TOKEN isn't
+  # set on the repo. Without it, the matrix build can't clone the private
+  # paperanywhere/backend repo for the proto crate. The token must be a
+  # fine-grained PAT with `Contents: Read` on paperanywhere/backend.
+  preflight:
+    name: preflight (check secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - name: verify PROTO_REPO_TOKEN is set
+        env:
+          HAS_TOKEN: ${{ secrets.PROTO_REPO_TOKEN != '' }}
+        run: |
+          if [ "${HAS_TOKEN}" != "true" ]; then
+            echo "::error::PROTO_REPO_TOKEN repo secret is not set."
+            echo ""
+            echo "Create a fine-grained PAT with Contents: Read on paperanywhere/backend,"
+            echo "then add it as a repo secret named PROTO_REPO_TOKEN under"
+            echo "Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "PROTO_REPO_TOKEN is set; matrix build can proceed."
+
   # Per-board build matrix. Runs on every PR + push, and is the data source
   # the release job picks up artifacts from.
   build:
     name: cargo build (${{ matrix.board }})
     runs-on: ubuntu-latest
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
