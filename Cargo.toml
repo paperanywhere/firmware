@@ -8,6 +8,7 @@ members = [
     "crates/compositor",
     "crates/firmware",
     "crates/provtool",
+    "crates/dev-cli",
 ]
 # `crates/sim` lives in its own repo (paperanywhere/simulator) so a sim
 # clone doesn't have to pull the entire firmware tree + esp toolchain

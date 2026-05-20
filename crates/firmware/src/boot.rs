@@ -106,6 +106,20 @@ pub fn run(resources: FirmwareResources) -> ! {
     let sleeper_ref = SLEEPER.init(FwSleeper::new(lpwr));
     let ota_ref = OTA.init(FwOta::new());
 
+    // Device-id fallback: if NVS has no claim token yet, derive an
+    // identifier from the chip's base MAC address (last two octets).
+    // The runtime's set_device_id call later may override this if a
+    // real token shows up. With or without claim, the status bar then
+    // shows something useful instead of "--".
+    let mac = esp_hal::efuse::base_mac_address();
+    let mac_bytes: &[u8] = mac.as_bytes();
+    let mac_id = if mac_bytes.len() >= 6 {
+        alloc::format!("D-{:02X}{:02X}", mac_bytes[4], mac_bytes[5])
+    } else {
+        alloc::string::String::from("D-????")
+    };
+    panel_ref.set_device_id(&mac_id);
+
     // If this boot is the first one after an OTA install, the slot is
     // still marked `New`/`PendingVerify`. Graduate it to `Valid` so the
     // bootloader doesn't auto-roll-back. Cheap no-op on normal boots.
