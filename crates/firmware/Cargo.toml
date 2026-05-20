@@ -1,0 +1,92 @@
+[package]
+name = "paperanywhere-firmware"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ESP32-S3 firmware for paperanywhere e-paper devices (reTerminal E-series + bare panels)."
+
+[[bin]]
+name = "paperanywhere-firmware"
+path = "src/main.rs"
+
+# Host build script that rasterises `assets/logo.svg` into panel-native bytes
+# for the active board feature. Emits a binary the firmware `include_bytes!`s.
+[build-dependencies]
+paperanywhere-boot-screen.workspace = true
+paperanywhere-ports.workspace = true
+
+[features]
+default = ["board-reterminal-e1001"]
+board-reterminal-e1001 = []
+board-reterminal-e1002 = []
+board-reterminal-e1003 = []
+board-reterminal-e1004 = []
+board-inkplate-6 = []
+board-inkplate-10 = []
+board-generic-esp32s3-waveshare-75 = []
+
+[dependencies]
+# ── shared paperanywhere crates (workspace) ──
+paperanywhere-ports.workspace = true
+paperanywhere-runtime.workspace = true
+paperanywhere-panel-uc8179.workspace = true
+
+# ── esp-rs (current matrix) ──
+# `esp-wifi` was renamed to `esp-radio` for the 1.x line. `esp-radio` 0.18 uses
+# the new `esp-rtos` scheduler crate instead of the private feature on esp-hal
+# that the old `esp-wifi` 0.15 required. That fixes the resolver.
+esp-hal = { version = "1.1", features = ["esp32s3", "unstable"] }
+esp-radio = { version = "0.18", features = ["esp32s3", "wifi"] }
+# `esp-radio` feature gates the module inside esp-rtos that registers the
+# `esp_rtos_*` scheduler/queue/semaphore/timer ABI symbols esp-radio's wifi
+# driver expects. Without it, link fails with "undefined reference to
+# esp_rtos_initialized" et al.
+esp-rtos = { version = "0.3", features = ["esp32s3", "esp-radio", "embassy"] }
+esp-storage = { version = "0.9", features = ["esp32s3", "critical-section"] }
+esp-backtrace = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
+esp-println = { version = "0.17", features = ["esp32s3", "log-04"] }
+esp-alloc = "0.10"
+esp-sync = { version = "0.1", features = ["esp32s3"] }
+# Embeds the ESP-IDF app descriptor in the image so espflash + the second-stage
+# bootloader can validate and run it. Also exposes `ota_updater::OtaUpdater`
+# for swapping app slots during firmware updates.
+esp-bootloader-esp-idf = { version = "0.5", features = ["esp32s3"] }
+# Streaming SHA-256 for the OTA download path — verifies the downloaded
+# image matches the backend's advertised hash chunk-by-chunk so we never
+# touch otadata with a bad slot.
+sha2 = { version = "0.10", default-features = false }
+
+# ── State / utility ──
+embedded-hal = "1"
+# `ExclusiveDevice` glues an `embedded-hal::spi::SpiBus` (what esp-hal's
+# `Spi` exposes) + a CS `OutputPin` into the `SpiDevice` interface the
+# UC8179 driver wants. Single-bus pattern; we don't share the SPI with any
+# other peripheral.
+embedded-hal-bus = "0.2"
+embedded-storage = "0.3"
+heapless.workspace = true
+log.workspace = true
+# `embassy-futures::block_on` drives esp-radio's async connect/disconnect
+# from inside the sync `WifiLink` impl — that part stays sync.
+embassy-futures = "0.1"
+# Full embassy stack: the runtime is now async, the executor runs our
+# runtime task and the embassy-net runner as siblings on core 0.
+embassy-executor = "0.10"
+embassy-net = { version = "0.7", default-features = false, features = ["proto-ipv4", "medium-ethernet", "tcp", "dhcpv4", "dns"] }
+embassy-net-driver = "0.2"
+embassy-sync = "0.7"
+embassy-time = "0.5"
+# Dual-versioned because the ecosystem split mid-2024: embassy-net (and other
+# embassy-* crates) still expose `embedded-io-async 0.6` (and `embedded-io
+# 0.6`) traits, while embedded-tls 0.18 adopted 0.7. A tiny adapter in
+# `http.rs` bridges them.
+embedded-io = "0.6"
+embedded-io-async = "0.6"
+embedded-io-07 = { package = "embedded-io", version = "0.7" }
+embedded-io-async-07 = { package = "embedded-io-async", version = "0.7" }
+# Pure-Rust TLS 1.3 (no_std, async). Wrapped around `embassy_net::tcp::
+# TcpSocket` for `https://` backend URLs. The handshake needs a CryptoRng;
+# we pass `esp_hal::rng::Rng` via a thin rand_core adapter (see http.rs).
+embedded-tls = { version = "0.18", default-features = false }
+rand_core = "0.6"
+static_cell = "2"

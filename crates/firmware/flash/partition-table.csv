@@ -1,0 +1,16 @@
+# ESP32-S3 partition table for paperanywhere.
+# Default layout for boards with 32 MB flash (reTerminal E-series).
+# Two app slots (app0 / app1) for OTA + an `nvs` partition for device id /
+# token / WiFi creds. A separate `prov` partition (subtype `undefined` so it
+# doesn't collide with the `nvs` subtype's uniqueness check) holds the
+# optional first-boot provisioning blob: WiFi creds + backend URL + optional
+# claim code. On first successful boot the firmware migrates the contents
+# into `nvs` and erases `prov`. `storage` is the device-side cache.
+# Name,    Type, SubType,    Offset,   Size, Flags
+nvs,       data, nvs,        0x9000,   24K,
+otadata,   data, ota,        0xf000,   8K,
+phy_init,  data, phy,        0x11000,  4K,
+prov,      data, undefined,  0x12000,  16K,
+app0,      app,  ota_0,      0x20000,  2M,
+app1,      app,  ota_1,      ,         2M,
+storage,   data, fat,        ,         512K,

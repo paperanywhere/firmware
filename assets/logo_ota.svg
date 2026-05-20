@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 470.08 252" width="470.08" height="252">
+  <rect width="470.08" height="252" fill="#FFFFFF"/>
+  <!-- Stylised download-arrow glyph, same horizontal-bar treatment as the boot logo -->
+  <g transform="translate(193.04, 22)">
+    <rect x="32"  y="0"  width="20" height="11.82" fill="#000000"/>
+    <rect x="16"  y="18" width="52" height="11.82" fill="#000000"/>
+    <rect x="0"   y="36" width="84" height="11.82" fill="#000000"/>
+    <rect x="20"  y="60" width="44" height="11.82" fill="#000000"/>
+    <rect x="20"  y="78" width="44" height="11.82" fill="#000000"/>
+  </g>
+  <text x="235.04" y="180" text-anchor="middle"
+        font-family="Inter, system-ui, sans-serif" font-weight="600" font-size="32"
+        fill="#000000" letter-spacing="-1">Updating firmware</text>
+  <text x="235.04" y="216" text-anchor="middle"
+        font-family="Inter, system-ui, sans-serif" font-weight="400" font-size="18"
+        fill="#000000">Please wait. Do not power off.</text>
+</svg>

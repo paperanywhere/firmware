@@ -1,54 +1,61 @@
-[package]
-name = "paperanywhere-firmware"
+[workspace]
+resolver = "3"
+members = [
+    "crates/ports",
+    "crates/runtime",
+    "crates/panel-uc8179",
+    "crates/boot-screen",
+    "crates/firmware",
+    "crates/sim",
+    "crates/provtool",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-resolver = "3"
 license = "MIT OR Apache-2.0"
-description = "ESP32-S3 firmware for paperanywhere e-paper devices (reTerminal E-series + bare panels)."
 
-[[bin]]
-name = "paperanywhere-firmware"
-path = "src/main.rs"
-
-[features]
-default = ["board-reterminal-e1001"]
-board-reterminal-e1001 = []
-board-reterminal-e1002 = []
-board-reterminal-e1003 = []
-board-reterminal-e1004 = []
-board-inkplate-6 = []
-board-inkplate-10 = []
-board-generic-esp32s3-waveshare-75 = []
-
-[dependencies]
-# ── esp-rs (current matrix) ──
-# `esp-wifi` was renamed to `esp-radio` for the 1.x line. `esp-radio` 0.18 uses
-# the new `esp-rtos` scheduler crate instead of the private feature on esp-hal
-# that the old `esp-wifi` 0.15 required. That fixes the resolver.
-esp-hal = { version = "1.1", features = ["esp32s3", "unstable"] }
-esp-radio = { version = "0.18", features = ["esp32s3", "wifi"] }
-esp-rtos = { version = "0.2", features = ["esp32s3"] }
-esp-storage = { version = "0.9", features = ["esp32s3"] }
-esp-backtrace = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
-esp-println = { version = "0.17", features = ["esp32s3", "log-04"] }
-esp-alloc = "0.9"
-esp-sync = { version = "0.1", features = ["esp32s3"] }
-
-# ── State / utility ──
-embedded-hal = "1"
-embedded-storage = "0.3"
+[workspace.dependencies]
+# Shared no_std utilities used by both the firmware bin and the runtime crate.
 heapless = "0.8"
 log = "0.4"
 
+# Internal crates — referenced by paperanywhere-firmware and paperanywhere-sim
+# via the workspace; never published.
+paperanywhere-ports = { path = "crates/ports" }
+paperanywhere-runtime = { path = "crates/runtime" }
+paperanywhere-panel-uc8179 = { path = "crates/panel-uc8179" }
+paperanywhere-boot-screen = { path = "crates/boot-screen" }
+
+# Release profile is workspace-wide so the firmware binary inherits LTO + size
+# optimizations no matter which member crate's settings apply. The sim binary
+# benefits from these too (smaller, faster), and the firmware needs them for
+# flash budget.
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
 overflow-checks = false
-debug = false
-strip = "symbols"
+# Debug info kept for now while we're chasing the 0-byte alloc panic — set
+# back to `false` + `strip = "symbols"` once the path is stable. The flash
+# image size grows by ~hundreds of KB with debug on but it stays in the
+# 2 MB app slot.
+debug = true
+strip = "none"
 
 [profile.dev]
 opt-level = 1
 panic = "abort"
+
+# Fast-flash dev profile: opt-3 (so esp-radio/embassy panics don't fire on
+# size-zero patterns the way they do in unoptimized builds) but no LTO. Cuts
+# firmware compile time from ~60s to ~10s vs `release`. Use during iteration:
+# `cargo build --profile release-dev ...`. Hand-off builds still use full LTO
+# via `--release`.
+[profile.release-dev]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+debug = true
+strip = "none"

@@ -1,15 +1,18 @@
-[build]
-target = "xtensa-esp32s3-none-elf"
+# Workspace-level cargo config. We deliberately do *not* set a default
+# `[build] target` here — that would force the host-side `paperanywhere-sim`
+# binary to also build for xtensa, which fails. Instead, callers pass
+# `--target xtensa-esp32s3-none-elf -Z build-std=core,alloc` explicitly when
+# building the firmware bin. The settings below only apply when that target
+# is selected.
+#
+# `-Z build-std` is intentionally on the CLI rather than in `[unstable]` —
+# putting it here applies it to host proc-macro builds too, which then fail
+# with "can't find crate for std" because no_std proc-macros don't have a
+# host std.
 
 [target.xtensa-esp32s3-none-elf]
-runner = "espflash flash --monitor --partition-table flash/partition-table.csv"
+runner = "espflash flash --monitor --partition-table crates/firmware/flash/partition-table.csv"
 rustflags = [
   "-C", "link-arg=-Tlinkall.x",
   "-C", "link-arg=-nostartfiles",
 ]
-
-# `-Z build-std` is passed on the cargo CLI (`-Z build-std=core,alloc`) rather
-# than configured in [unstable] here, so it applies only to the requested
-# --target. Setting it in [unstable] applied it to host proc-macro builds too,
-# which then failed with "can't find crate for std" because no_std proc-macros
-# don't have a host std.

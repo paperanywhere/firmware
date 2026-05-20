@@ -1,0 +1,13 @@
+[package]
+name = "paperanywhere-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Device-runtime polling loop shared between paperanywhere firmware and the desktop simulator."
+
+# no_std crate. Pulls in only `paperanywhere-ports` (also no_std) and the
+# generic `log` facade so the loop can record progress via whatever logger the
+# host hooks up (`esp-println` on firmware, `env_logger` on sim).
+[dependencies]
+paperanywhere-ports.workspace = true
+log.workspace = true

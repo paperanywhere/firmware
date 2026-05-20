@@ -1,0 +1,16 @@
+[package]
+name = "paperanywhere-panel-uc8179"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UC8179 e-paper controller driver. Generic over embedded-hal SPI + GPIO so it runs on real ESP32 hardware in the firmware crate and against in-memory fakes in the desktop simulator."
+
+# no_std crate. Depends only on the embedded-hal trait surface plus the
+# paperanywhere ports (for the EpaperPanel trait we implement) and the `log`
+# facade for diagnostics. Same crate is consumed by both the firmware (esp-hal
+# wires real SPI/GPIO) and the sim (fake transports that record bytes into
+# the virtual framebuffer).
+[dependencies]
+paperanywhere-ports.workspace = true
+embedded-hal = "1"
+log.workspace = true

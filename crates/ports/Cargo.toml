@@ -1,0 +1,13 @@
+[package]
+name = "paperanywhere-ports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Port traits + wire types shared by the device firmware and the desktop simulator."
+
+# no_std crate. Both consumers (firmware: xtensa-esp32s3-none-elf, sim: host)
+# need the same surface, so we only depend on `alloc`. heapless is reused for
+# fixed-size string buffers in credentials so it survives at the firmware
+# boundary without forcing every consumer to drag in a String.
+[dependencies]
+heapless.workspace = true

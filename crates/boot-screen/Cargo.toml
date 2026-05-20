@@ -1,0 +1,27 @@
+[package]
+name = "paperanywhere-boot-screen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host-only helper that rasterizes the paperanywhere logo SVG into panel-native bytes (dithered + packed for the active color mode). Used at build time by the firmware crate and at runtime by the desktop simulator."
+
+# Plain std crate — not no_std. Consumed by `paperanywhere-firmware`'s
+# `build.rs` via [build-dependencies] (the build script runs on the host)
+# and by `paperanywhere-sim` directly via [dependencies] (it lives on the
+# host too). Never linked into the firmware target.
+[dependencies]
+# Re-use the same ColorMode enum the firmware/sim already speak so callers
+# don't have to translate between dialects.
+paperanywhere-ports.workspace = true
+
+# resvg + tiny-skia handle SVG parsing + path rendering. usvg is the parse
+# half, tiny-skia is the rasterizer. Headless — no fonts loaded by default,
+# which is fine for the current logo (text falls back to bounding boxes
+# the way resvg handles missing glyphs).
+# Default features enable the text-rendering path through fontdb. We load
+# system fonts at runtime so the SVG's specified font family ("Inter, system-ui,
+# sans-serif") can resolve — without it, `<text>` elements vanish and only the
+# rect-art portion of the boot screen renders.
+resvg = "0.43"
+usvg = "0.43"
+tiny-skia = "0.11"

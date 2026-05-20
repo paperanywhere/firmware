@@ -1,0 +1,10 @@
+[package]
+name = "paperanywhere-provtool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host-side CLI that emits a paperanywhere `prov.bin` provisioning blob (WiFi creds + backend URL) for flashing into the `prov` partition at 0x12000. Dev path only — production firmware uses the captive portal."
+
+[[bin]]
+name = "paperanywhere-provtool"
+path = "src/main.rs"

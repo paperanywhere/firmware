@@ -1,3 +1,15 @@
 /target
 .idea/
 .vscode/
+# Scratch dir for spelunking through crate-cache sources while debugging
+# upstream API surfaces. Never committed.
+_inspect/
+# Per-developer dev provisioning. Holds WiFi creds + backend URL for
+# `paperanywhere-provtool` to bake into prov.bin. NEVER COMMIT.
+provision.env
+.env
+# Built prov blob — derived from provision.env, regenerated freely.
+prov.bin
+# Standalone espflash binary the user dropped in (Windows .exe).
+espflash.exe
+espflash-x86_64-pc-windows-msvc.zip
