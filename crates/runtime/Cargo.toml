@@ -11,3 +11,7 @@ description = "Device-runtime polling loop shared between paperanywhere firmware
 [dependencies]
 paperanywhere-ports.workspace = true
 log.workspace = true
+# Used for polling `WifiLink::local_ip()` after associate with a small
+# back-off. `generic-queue-8` matches the firmware crate's feature so
+# Timer works regardless of which task drives the executor.
+embassy-time = { version = "0.5", features = ["generic-queue-8"] }

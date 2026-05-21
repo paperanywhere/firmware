@@ -86,7 +86,13 @@ embassy-executor = "0.10"
 embassy-net = { version = "0.7", default-features = false, features = ["proto-ipv4", "medium-ethernet", "tcp", "dhcpv4", "dns"] }
 embassy-net-driver = "0.2"
 embassy-sync = "0.7"
-embassy-time = "0.5"
+# `generic-queue-8` enables a software timer queue that doesn't require
+# the calling task's waker to come from `embassy_executor`. We need it
+# because the WifiLink::associate path uses `embassy_futures::block_on`
+# (the WifiLink trait is sync) and tries to race the connect future
+# against a `Timer::after(...)`. Without this feature, embassy_time
+# panics with "Found waker not created by the Embassy executor".
+embassy-time = { version = "0.5", features = ["generic-queue-8"] }
 # Dual-versioned because the ecosystem split mid-2024: embassy-net (and other
 # embassy-* crates) still expose `embedded-io-async 0.6` (and `embedded-io
 # 0.6`) traits, while embedded-tls 0.18 adopted 0.7. A tiny adapter in

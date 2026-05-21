@@ -362,7 +362,8 @@ impl WifiCreds {
 /// disconnect before sleep — IP-stack setup is the [`HttpTransport`]'s problem.
 pub trait WifiLink {
     type Error: core::fmt::Debug;
-    fn associate(&mut self, creds: &WifiCreds) -> Result<(), Self::Error>;
+    #[allow(async_fn_in_trait)]
+    async fn associate(&mut self, creds: &WifiCreds) -> Result<(), Self::Error>;
     fn disconnect(&mut self) -> Result<(), Self::Error>;
     /// Best-effort signal-strength readout for the `/ack` heartbeat payload.
     /// Returns `None` if unsupported on this implementation.

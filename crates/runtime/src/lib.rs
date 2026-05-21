@@ -151,7 +151,7 @@ where
 {
     let creds = nvs.load_wifi_creds().ok_or(WakeError::NoWifiCreds)?;
     info!("wake: associating to SSID \"{}\"", creds.ssid.as_str());
-    wifi.associate(&creds).map_err(|e| {
+    wifi.associate(&creds).await.map_err(|e| {
         error!("wake: wifi.associate FAILED: {:?}", e);
         // Tell the compositor we're disconnected before bailing so any
         // subsequent forced refresh (e.g. boot screen on a retry) shows
@@ -163,18 +163,12 @@ where
     panel.on_wifi_state_changed(wifi.rssi_dbm());
     panel.on_battery_sample(sleeper.battery_mv());
 
-    let token = nvs.load_device_token().ok_or(WakeError::NoDeviceToken)?;
-
-    let state = http.get_state(&token).await.map_err(|e| {
-        error!("wake: get_state: {:?}", e);
-        WakeError::StateFetch
-    })?;
-    // DHCP has definitely completed by now — http.get_state opened a TCP
-    // connection, which can't happen without an IP. Query + push to the
-    // compositor (status bar + boot-screen overlay both consume it),
-    // then ask the panel to re-paint its cached boot template so the
-    // IP line lands under the version on the splash.
-    if let Some(ip) = wifi.local_ip() {
+    // Poll the wifi stack briefly for the DHCP-assigned IP, then push
+    // it into the compositor + redraw the boot screen. We do this
+    // BEFORE the token check so an unclaimed dev device still shows
+    // its IP on the panel (so the user can `pa-dev push` to it).
+    let ip = wait_for_local_ip(wifi).await;
+    if let Some(ip) = ip {
         let mut buf: alloc::string::String = alloc::string::String::with_capacity(16);
         let _ = core::fmt::write(
             &mut buf,
@@ -182,9 +176,6 @@ where
         );
         info!("wake: local IP = {}", buf);
         panel.set_ip(&buf);
-        // Stage a fresh boot-screen render with the IP overlaid; the
-        // compose + hash dedup below decides whether to actually flush
-        // (it will on the first wake of each boot since the IP is new).
         panel.redraw_boot_screen();
         panel.compose();
         let pending = panel.pending_hash();
@@ -197,8 +188,31 @@ where
             }
         }
     } else {
-        warn!("wake: /state succeeded but wifi.local_ip() returned None — stack config seam?");
+        warn!("wake: DHCP didn't complete within wait window — boot screen won't show IP");
     }
+
+    // Now check for a device token. Without one we can't hit /state, but
+    // the panel is up + the dev_server is reachable, which is enough
+    // for a dev rig waiting to be claimed (or for `pa-dev push` to
+    // flash a new build). Return Ok so the caller doesn't trigger the
+    // failure-retry path and we sleep our normal interval.
+    let token = match nvs.load_device_token() {
+        Some(t) => t,
+        None => {
+            warn!(
+                "wake: no device token in NVS (not yet claimed) — skipping /state, panel + dev_server stay up"
+            );
+            // DO NOT disconnect — the dev_server task is still bound to
+            // the same embassy-net stack and the user might `pa-dev push`
+            // at any moment. We want the IP to stick around.
+            return Ok((FAILURE_RETRY_SEC, PowerPolicy::AlwaysOn));
+        }
+    };
+
+    let state = http.get_state(&token).await.map_err(|e| {
+        error!("wake: get_state: {:?}", e);
+        WakeError::StateFetch
+    })?;
 
     // Firmware update offered? Apply it BEFORE rendering anything else —
     // if the install succeeds the device reboots and we never reach the
@@ -275,8 +289,10 @@ where
         }
     }
 
-    let _ = wifi.disconnect();
-    panel.on_wifi_state_changed(None);
+    // Keep wifi associated between wakes. On a ScheduledWake device the
+    // chip will deep-sleep and lose state anyway; on AlwaysOn (dev),
+    // dropping the link only to re-WPA-handshake next wake is what was
+    // making associate intermittent.
 
     let now = sleeper.unix_now();
     let sleep_for = state
@@ -316,6 +332,24 @@ where
     // compose() + the driver-level hash dedup before deciding to flush.
     let _ = image.byte_len.to_string(); // silence unused-import lint paths
     Ok(())
+}
+
+/// Poll `wifi.local_ip()` with a small back-off until it returns Some
+/// or the cumulative wait exceeds the timeout. embassy_time::Timer is
+/// safe here because we're inside an embassy_executor task —
+/// `embassy-time/generic-queue-8` means it doesn't even need the
+/// executor's waker.
+async fn wait_for_local_ip<W: WifiLink>(wifi: &W) -> Option<[u8; 4]> {
+    // 150 × 100 ms = 15 s. DHCP usually completes inside ~3 s, but a
+    // first-time association after boot can be slower — esp-radio + the
+    // embassy-net DHCP client need to settle.
+    for _ in 0..150 {
+        if let Some(ip) = wifi.local_ip() {
+            return Some(ip);
+        }
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
+    }
+    wifi.local_ip()
 }
 
 /// HH:MM stamp of the current wall-clock, or `None` when the device

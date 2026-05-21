@@ -132,11 +132,20 @@ pub fn run(resources: FirmwareResources) -> ! {
     // Translate the board's local PowerPolicy enum to the ports enum. They're
     // structurally identical; the board crate stays self-contained so its
     // module table doesn't have to import ports just for one enum.
-    let policy = match board.default_power_policy {
-        crate::boards::PowerPolicy::ScheduledWake => {
-            paperanywhere_ports::PowerPolicy::ScheduledWake
+    //
+    // Dev devices force AlwaysOn — the dev_server task only listens while
+    // the chip is awake, and deep-sleeping between wakes would mean the
+    // `pa-dev push` user has a 30-second window every 6 hours to hit the
+    // /firmware endpoint. AlwaysOn keeps it reachable continuously.
+    let policy = if nvs_ref.load_is_dev_build() {
+        paperanywhere_ports::PowerPolicy::AlwaysOn
+    } else {
+        match board.default_power_policy {
+            crate::boards::PowerPolicy::ScheduledWake => {
+                paperanywhere_ports::PowerPolicy::ScheduledWake
+            }
+            crate::boards::PowerPolicy::AlwaysOn => paperanywhere_ports::PowerPolicy::AlwaysOn,
         }
-        crate::boards::PowerPolicy::AlwaysOn => paperanywhere_ports::PowerPolicy::AlwaysOn,
     };
 
     // Stage the boot screen: logo into the main region, build-info

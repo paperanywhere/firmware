@@ -31,8 +31,14 @@ impl Sleeper for FwSleeper {
             // view this looks like sleep_for returned normally; in reality
             // we'll never reach the next instruction here.
             PowerPolicy::ScheduledWake => {
-                let timer = TimerWakeupSource::new(Duration::from_secs(seconds as u64));
                 esp_println::println!("power: deep_sleep_for({seconds}s)");
+                // Let the UART FIFO drain before the deep_sleep
+                // transition. Without this delay, the last ~10 chars
+                // of the most recent log line (often a `warn!`/`error!`
+                // explaining WHY we're sleeping) get truncated, which
+                // makes serial-monitoring failures genuinely confusing.
+                esp_hal::delay::Delay::new().delay_millis(200);
+                let timer = TimerWakeupSource::new(Duration::from_secs(seconds as u64));
                 self.rtc.sleep_deep(&[&timer]);
             }
             // AlwaysOn: a busy yield. The radio stays up, the polling cycle

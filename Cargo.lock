@@ -827,6 +827,7 @@ dependencies = [
  "critical-section",
  "document-features",
  "embassy-time-driver",
+ "embassy-time-queue-utils",
  "embedded-hal 0.2.7",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
@@ -2499,6 +2500,7 @@ version = "0.1.0"
 name = "paperanywhere-runtime"
 version = "0.1.0"
 dependencies = [
+ "embassy-time",
  "log",
  "paperanywhere-ports",
 ]

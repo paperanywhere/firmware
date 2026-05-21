@@ -13,7 +13,6 @@
 
 use alloc::string::String;
 
-use embassy_futures::block_on;
 use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Timer};
 use esp_hal::interrupt::software::SoftwareInterrupt;
@@ -50,6 +49,13 @@ pub struct FwWifi {
     /// address into the status bar + the dev HTTP server's /info JSON.
     /// `None` until attached.
     stack: Option<&'static embassy_net::Stack<'static>>,
+    /// Local "we already associated successfully" cache. Lets
+    /// subsequent `associate` calls short-circuit so we don't tear
+    /// down a working WPA session by calling `set_config` again.
+    /// `is_connected` would be the canonical signal but it's behind
+    /// esp-radio's `unstable` feature; tracking it ourselves keeps
+    /// the dep surface minimal.
+    associated: bool,
 }
 
 impl FwWifi {
@@ -90,14 +96,23 @@ impl FwWifi {
         // Returned: the controller (used for associate/disconnect calls from
         // the runtime) plus the station interface, which the network module
         // hands to embassy-net to build its TCP/IP stack.
-        Ok((Self { controller, stack: None }, interfaces.station))
+        Ok((Self { controller, stack: None, associated: false }, interfaces.station))
     }
 }
 
 impl WifiLink for FwWifi {
     type Error = WifiError;
 
-    fn associate(&mut self, creds: &WifiCreds) -> Result<(), Self::Error> {
+    async fn associate(&mut self, creds: &WifiCreds) -> Result<(), Self::Error> {
+        // Already-connected short-circuit. Avoids the `set_config +
+        // connect_async` dance on every wake cycle — that was what
+        // turned the first cycle's working association into Timeout
+        // errors on cycles 2+ (the second set_config tore down the
+        // existing STA state).
+        if self.associated {
+            return Ok(());
+        }
+
         let mut pw = String::new();
         pw.push_str(creds.password.as_str());
 
@@ -109,19 +124,20 @@ impl WifiLink for FwWifi {
         // `set_config` performs an implicit `esp_wifi_start` when mode goes
         // NULL → STA, so there's no separate `start` to call.
         self.controller.set_config(&cfg).map_err(|_| WifiError::SetConfig)?;
-        // Race the connect future against a 25 s timeout so we never
-        // hang the wake cycle on a stalled WPA handshake or stale AP.
-        // Caller logs the failure + falls back to the FAILURE_RETRY_SEC
-        // sleep, which gives us another shot on the next wake.
-        let result = block_on(async {
-            select(
-                self.controller.connect_async(),
-                Timer::after(Duration::from_secs(25)),
-            )
-            .await
-        });
+        // Race the connect future against a 25 s timeout. Now that
+        // associate is async (no `block_on`), the embassy executor
+        // can schedule the time driver between connect polls, so the
+        // Timer actually fires.
+        let result = select(
+            self.controller.connect_async(),
+            Timer::after(Duration::from_secs(25)),
+        )
+        .await;
         match result {
-            Either::First(Ok(_info)) => Ok(()),
+            Either::First(Ok(_info)) => {
+                self.associated = true;
+                Ok(())
+            }
             Either::First(Err(_)) => Err(WifiError::ConnectFailed),
             Either::Second(_) => Err(WifiError::Timeout),
         }
@@ -129,7 +145,8 @@ impl WifiLink for FwWifi {
 
     fn disconnect(&mut self) -> Result<(), Self::Error> {
         // Idempotent — esp-radio returns NotConnected if we're already down.
-        let _ = block_on(self.controller.disconnect_async());
+        let _ = embassy_futures::block_on(self.controller.disconnect_async());
+        self.associated = false;
         Ok(())
     }
 
