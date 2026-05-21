@@ -231,6 +231,35 @@ where
         // high so this returns immediately there.
         let _ = self.wait_idle();
     }
+
+    fn refresh_fast(&mut self) {
+        // Partial-update sequence: PIN → PTL(whole panel) → DRF → POUT.
+        // The panel's internal partial-LUT runs a shorter waveform
+        // than the OTP full LUT, completing in ~750 ms instead of ~3 s.
+        //
+        // PTL coordinates: x must be aligned to 8 px (low 3 bits = 0)
+        // because the panel addresses sources in 8-pixel groups. We
+        // refresh the entire panel here (0 to WIDTH-1, 0 to HEIGHT-1),
+        // so alignment is naturally satisfied.
+        let _ = self.cmd(CMD_PIN);
+        let _ = self.cmd(CMD_PTL);
+        let x_end = (WIDTH - 1) as u16;
+        let y_end = (HEIGHT - 1) as u16;
+        let _ = self.data(&[
+            0x00,
+            0x00, // x_start = 0 (high byte, low byte)
+            (x_end >> 8) as u8,
+            (x_end & 0xFF) as u8, // x_end
+            0x00,
+            0x00, // y_start = 0
+            (y_end >> 8) as u8,
+            (y_end & 0xFF) as u8, // y_end
+            0x01, // PT_SCAN = 1 (keep scan direction as configured by PSR)
+        ]);
+        let _ = self.cmd(CMD_DISPLAY_REFRESH);
+        let _ = self.wait_idle();
+        let _ = self.cmd(CMD_POUT);
+    }
 }
 
 // ── UC8179 command opcodes (subset; full set in the datasheet) ──
@@ -256,6 +285,19 @@ pub const CMD_CDI: u8 = 0x50;
 pub const CMD_TCON: u8 = 0x60;
 /// Resolution setting.
 pub const CMD_TRES: u8 = 0x61;
+/// Partial window — followed by 7 data bytes specifying x_start
+/// (2 bytes), x_end (2 bytes), y_start (2 bytes), y_end (2 bytes),
+/// then a single byte for the scan direction (0x00 = same as
+/// global). Note: x_start/x_end's low bit must be 0, low nibble 0;
+/// the panel addresses pixels in 8-pixel groups.
+pub const CMD_PTL: u8 = 0x90;
+/// Partial in — switches the controller to partial-update mode so
+/// subsequent CMD_DTM2 + CMD_DISPLAY_REFRESH use the partial LUT
+/// (faster than the full waveform, with the trade-off of slight
+/// ghosting accumulating over many partial refreshes).
+pub const CMD_PIN: u8 = 0x91;
+/// Partial out — returns the controller to full-refresh mode.
+pub const CMD_POUT: u8 = 0x92;
 /// VCOM DC setting (unused now — Waveshare's reference for the 7.5" V2
 /// panel omits this; the panel's OTP default is fine).
 #[allow(dead_code)]

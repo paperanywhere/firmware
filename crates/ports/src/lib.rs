@@ -592,6 +592,15 @@ pub trait EpaperPanel {
     /// the next image starts from the top. On a real panel this is the slow
     /// e-ink refresh; on the sim it triggers an egui repaint.
     fn refresh(&mut self);
+    /// Fast refresh using the panel's partial-LUT mode where available.
+    /// Typically ~750 ms on UC8179 boards versus ~3 s for a full refresh,
+    /// with the trade-off of slight ghosting that accumulates over
+    /// successive partial refreshes (callers usually intersperse a full
+    /// refresh every N updates to clear the residual). Default falls
+    /// back to [`refresh`] for panels without a partial-LUT path.
+    fn refresh_fast(&mut self) {
+        self.refresh();
+    }
 }
 
 /// Apply a firmware update offered by the backend in the /state response.

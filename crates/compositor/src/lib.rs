@@ -80,6 +80,9 @@ pub struct Compositor<P: EpaperPanel> {
     /// repaint the splash after DHCP comes up (so the IP can land on
     /// the boot-screen overlay, not just the status bar).
     boot_template: Option<BootTemplate>,
+    /// Number of refreshes since the last full-LUT refresh. Used to
+    /// promote every Nth refresh to full (clears partial-LUT ghosting).
+    refresh_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +90,13 @@ struct BootTemplate {
     bytes: &'static [u8],
     info: BuildInfo,
 }
+
+/// Refreshes per full-LUT cycle. Partial refreshes are fast (~750 ms
+/// on UC8179) but ghost slightly; one full refresh every
+/// `FULL_REFRESH_EVERY` partials clears the residual back to a clean
+/// surface. 8 is a conservative ratio — Waveshare's reference driver
+/// recommends 5-ish for visually demanding content.
+const FULL_REFRESH_EVERY: u32 = 8;
 
 impl<P: EpaperPanel> Compositor<P> {
     /// Build a compositor wrapping `panel`. `width_px` × `height_px`
@@ -118,6 +128,7 @@ impl<P: EpaperPanel> Compositor<P> {
             main_cursor: main_region_offset(width_px, status_bar_height, color_mode),
             status: StatusInputs::default(),
             boot_template: None,
+            refresh_count: 0,
         }
     }
 
@@ -359,10 +370,31 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
         // `pending_hash()`) immediately before this; calling refresh
         // without compose is fine too, the framebuffer just won't have
         // the latest status bar painted.
+        //
+        // Promote every Nth refresh to a full-LUT cycle to clear
+        // partial-LUT ghosting; the rest run the partial path. On
+        // panels without partial-LUT support `refresh_fast` is a
+        // default that falls through to `refresh`, so the per-N
+        // alternation is a no-op there.
         self.panel.init();
         self.panel.write_chunk(&self.framebuffer);
-        self.panel.refresh();
-        // Reset the main cursor so the next render starts fresh.
+        self.refresh_count = self.refresh_count.wrapping_add(1);
+        if self.refresh_count.is_multiple_of(FULL_REFRESH_EVERY) {
+            self.panel.refresh();
+        } else {
+            self.panel.refresh_fast();
+        }
+        self.main_cursor =
+            main_region_offset(self.width_px, self.status_bar_height, self.color_mode);
+    }
+
+    fn refresh_fast(&mut self) {
+        // Caller explicitly asked for the fast path — honour it. Don't
+        // touch refresh_count here; full-refresh cadence is driven by
+        // the unconditional refresh() entry above.
+        self.panel.init();
+        self.panel.write_chunk(&self.framebuffer);
+        self.panel.refresh_fast();
         self.main_cursor =
             main_region_offset(self.width_px, self.status_bar_height, self.color_mode);
     }
