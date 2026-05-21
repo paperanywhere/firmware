@@ -39,6 +39,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use paperanywhere_ports::{ColorMode, EpaperPanel};
 
+pub mod icons;
 pub mod status_bar;
 
 pub use status_bar::StatusInputs;

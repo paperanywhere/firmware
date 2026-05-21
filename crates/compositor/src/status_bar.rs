@@ -131,39 +131,47 @@ fn draw_vertical_divider(target: &mut Mono1bppTarget<'_>, x: i32, height_px: u32
 // ── Right-side widgets ───────────────────────────────────────────────────────
 
 fn draw_wifi_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32, connected: bool) -> i32 {
-    const ICON_W: i32 = 18;
-    const ICON_H: i32 = 14;
+    let icon_size = crate::icons::ICON_PX as i32;
     const PADDING: i32 = 6;
-    let top = ((target.height as i32) - ICON_H) / 2;
-    let left = right_edge - ICON_W;
+    let top = ((target.height as i32) - icon_size) / 2;
+    let left = right_edge - icon_size;
+    let bitmap = if connected {
+        crate::icons::WIFI
+    } else {
+        crate::icons::WIFI_SLASH
+    };
+    blit_mono_icon(target, bitmap, crate::icons::ICON_PX, crate::icons::ICON_PX, left, top);
+    icon_size + PADDING
+}
 
-    // Three horizontal bars, bottom-up, increasing in width — a
-    // simplified "signal bars" glyph. Solid black; the cell border
-    // already gives the bar enough separation visually.
-    for (i, bar_w) in [6_i32, 12, 18].iter().enumerate() {
-        let bar_h: i32 = 3;
-        let y = top + ICON_H - (i as i32 + 1) * (bar_h + 1);
-        let bar_x = left + (ICON_W - bar_w) / 2;
-        target.fill_rect_signed(bar_x, y, *bar_w as u32, bar_h as u32, true);
+/// Stamp a build-time-rasterised Mono1bpp icon onto the framebuffer.
+/// Source convention matches the boot-screen rasteriser (bit set =
+/// no ink, bit clear = ink). Only the "ink" pixels are painted; white
+/// pixels leave the existing framebuffer underneath intact, so the
+/// icon overlays cleanly without a knock-out background.
+fn blit_mono_icon(
+    target: &mut Mono1bppTarget<'_>,
+    bitmap: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_x: i32,
+    dst_y: i32,
+) {
+    let stride = ((src_w + 7) / 8) as usize;
+    for sy in 0..src_h {
+        let row_offset = (sy as usize) * stride;
+        for sx in 0..src_w {
+            let byte_idx = row_offset + (sx / 8) as usize;
+            if byte_idx >= bitmap.len() {
+                break;
+            }
+            let bit_mask = 1u8 << (7 - (sx % 8));
+            // bit clear = ink; only then paint a pixel.
+            if bitmap[byte_idx] & bit_mask == 0 {
+                target.set_pixel(dst_x + sx as i32, dst_y + sy as i32, true);
+            }
+        }
     }
-
-    if !connected {
-        // Diagonal slash with a 1 px white outline so it reads as a cut
-        // rather than another bar.
-        let style = PrimitiveStyle::with_stroke(BinaryColor::On, 2);
-        let _ = Line::new(Point::new(left, top + ICON_H), Point::new(left + ICON_W, top))
-            .into_styled(style)
-            .draw(target);
-        let knockout = PrimitiveStyle::with_stroke(BinaryColor::Off, 1);
-        let _ = Line::new(
-            Point::new(left - 1, top + ICON_H),
-            Point::new(left + ICON_W - 1, top),
-        )
-        .into_styled(knockout)
-        .draw(target);
-    }
-
-    ICON_W + PADDING
 }
 
 fn draw_battery_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32, mv: Option<u16>) -> i32 {
@@ -261,22 +269,11 @@ fn draw_left_info(
     let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
     let baseline = (target.height as i32) / 2 + 4;
 
-    // Build "IP: <state>  |  Last Update: YYY" without alloc::format.
-    // The IP field is always present — its content is whatever string
-    // the runtime last pushed (e.g. "10.0.1.42", "connecting...",
-    // "not connected", "failed"). Device ID is intentionally not here
-    // — that lives on the boot screen.
-    let mut line: HString<128> = HString::new();
-    let _ = line.push_str("IP: ");
-    match status.ip_address.as_ref() {
-        Some(s) => {
-            let _ = line.push_str(s.as_str());
-        }
-        None => {
-            let _ = line.push_str("connecting...");
-        }
-    }
-    let _ = line.push_str("  |  Last Update: ");
+    // "Last Update: HH:MM" — the only text on the bar's left side.
+    // IP and Device UUID live on the boot screen; the status bar is
+    // intentionally compact so the chrome icons dominate.
+    let mut line: HString<48> = HString::new();
+    let _ = line.push_str("Last Update: ");
     match status.last_update_local.as_ref() {
         Some(t) => {
             let _ = line.push_str(t.as_str());

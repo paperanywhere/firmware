@@ -151,10 +151,17 @@ impl WifiLink for FwWifi {
     }
 
     fn rssi_dbm(&self) -> Option<i16> {
-        // Public RSSI access lives behind esp-radio's `unstable` feature.
-        // We avoid that for now to keep the dep surface small; the dashboard
-        // heartbeat just won't have RSSI until we enable it.
-        None
+        // Public RSSI access lives behind esp-radio's `unstable` feature
+        // (the dashboard heartbeat would want a real value when we
+        // wire that up). For the status-bar wifi icon's connected /
+        // disconnected indicator the boolean is what matters, so we
+        // synthesise a placeholder dBm when we know we associated.
+        // `None` ⇒ slashed icon; `Some(_)` ⇒ signal-bars icon.
+        if self.associated {
+            Some(-50)
+        } else {
+            None
+        }
     }
 
     fn local_ip(&self) -> Option<[u8; 4]> {
