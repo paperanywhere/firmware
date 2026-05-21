@@ -707,8 +707,6 @@ dependencies = [
 [[package]]
 name = "embassy-net"
 version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0558a231a47e7d4a06a28b5278c92e860f1200f24821d2f365a2f40fe3f3c7b2"
 dependencies = [
  "document-features",
  "embassy-net-driver",

@@ -70,3 +70,16 @@ lto = "off"
 codegen-units = 16
 debug = true
 strip = "none"
+
+# Cross-core fork of embassy-net (task #101). The vendored copy is
+# embassy-net 0.7.1 with `Stack`'s internal `RefCell<Inner>` wrapped
+# in `embassy_sync::blocking_mutex::Mutex<CSRawMutex, _>` so `&Stack`
+# is `Sync` and can be borrowed from tasks on different cores. See
+# `vendored/embassy-net/src/lib.rs` for the patch site.
+#
+# The http_proxy + wifi_proxy infrastructure (task #100) stays in
+# place for now — once we've validated the fork on-device for a
+# couple cycles, we can move FwHttp / FwWifi back onto core 1
+# alongside the runtime and delete the proxies.
+[patch.crates-io]
+embassy-net = { path = "vendored/embassy-net" }
