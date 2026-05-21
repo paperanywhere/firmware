@@ -381,6 +381,9 @@ pub enum DeviceStatus {
     WaitingForAdoption,
     /// Idle, between wakes / serving the dev_server.
     Ready,
+    /// Terminal error — the halt screen is on the main region and the
+    /// runtime is busy-looping. Power-cycle or re-provision to clear.
+    Halted,
 }
 
 impl Default for DeviceStatus {
@@ -400,6 +403,7 @@ impl DeviceStatus {
             Self::Stalled => "stalled",
             Self::WaitingForAdoption => "waiting for adoption",
             Self::Ready => "ready",
+            Self::Halted => "halted",
         }
     }
 }
@@ -567,6 +571,12 @@ pub trait EpaperPanel {
         _adopt_url: &str,
     ) {
     }
+    /// Paint the halt screen ("blue screen of death") into the main
+    /// region. Caller (runtime) renders this then halts the device
+    /// — no further wake cycles, no deep sleep. The screen explains
+    /// why; `code` is a stable short identifier the user can look up
+    /// at `paperanywhere.io/errors/<code>`.
+    fn render_halt_screen(&mut self, _headline: &str, _detail: &str, _code: &str) {}
     /// Append `bytes` to the panel's frame RAM at the current cursor. Chunk
     /// boundaries don't need to align to any pixel structure.
     fn write_chunk(&mut self, bytes: &[u8]);

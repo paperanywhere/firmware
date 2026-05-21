@@ -40,6 +40,7 @@ use alloc::vec::Vec;
 use paperanywhere_ports::{ColorMode, EpaperPanel};
 
 pub mod adoption_screen;
+pub mod halt_screen;
 pub mod icons;
 pub mod status_bar;
 
@@ -224,6 +225,25 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
 
     fn set_status(&mut self, status: paperanywhere_ports::DeviceStatus) {
         self.status.device_status = status;
+    }
+
+    fn render_halt_screen(&mut self, headline: &str, detail: &str, code: &str) {
+        for b in self.framebuffer.iter_mut() {
+            *b = 0xFF;
+        }
+        self.main_cursor =
+            main_region_offset(self.width_px, self.status_bar_height, self.color_mode);
+        let width_px = self.width_px;
+        let height_px = self.main_height_px();
+        let color_mode = self.color_mode;
+        let offset = main_region_offset(width_px, self.status_bar_height, color_mode);
+        let mut region = MainRegion {
+            bytes: &mut self.framebuffer[offset..],
+            width_px,
+            height_px,
+            color_mode,
+        };
+        crate::halt_screen::draw_halt_screen(&mut region, headline, detail, code);
     }
 
     fn render_adoption_screen(

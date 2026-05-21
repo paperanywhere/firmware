@@ -243,9 +243,13 @@ where
     let state = match http.get_state(&token).await {
         Ok(s) => s,
         Err(e) => {
-            error!("wake: get_state: {:?}", e);
-            panel.set_status(DeviceStatus::Stalled);
-            return Err(WakeError::StateFetch);
+            error!("wake: get_state failed: {:?}", e);
+            halt_with_screen(
+                panel,
+                "Your device ran into a problem.",
+                "Could not reach the configured backend.",
+                "PA-NET-001",
+            );
         }
     };
 
@@ -367,6 +371,36 @@ where
     // compose() + the driver-level hash dedup before deciding to flush.
     let _ = image.byte_len.to_string(); // silence unused-import lint paths
     Ok(())
+}
+
+/// Paint the halt screen (BSOD-style) onto the panel, refresh once
+/// with the full LUT for clarity, then busy-loop forever. Never
+/// returns — power-cycle / re-provision is the only recovery.
+///
+/// Marked `-> !`. Callers use `halt_with_screen(...)` like a panic in
+/// terms of control flow: anything after the call is unreachable.
+fn halt_with_screen<P: EpaperPanel>(
+    panel: &mut P,
+    headline: &'static str,
+    detail: &'static str,
+    code: &'static str,
+) -> ! {
+    error!(
+        "halt: {} — {} (code {}). device will not auto-recover; reset to retry.",
+        headline, detail, code
+    );
+    panel.set_status(DeviceStatus::Halted);
+    panel.render_halt_screen(headline, detail, code);
+    panel.compose();
+    // Full-LUT refresh so the BSOD is crisp without ghosting.
+    panel.refresh();
+    // Halt: tight loop, no async progression, no deep sleep. The
+    // dev_server task (if any) keeps running on the other embassy
+    // task — useful for `pa-dev push` to recover a misbehaving device
+    // without a serial cable.
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// Paint the adoption screen onto the panel. Called when the device
