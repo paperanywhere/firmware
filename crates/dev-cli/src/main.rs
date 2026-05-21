@@ -1,25 +1,24 @@
 //! paperanywhere-dev (binary name: `pa-dev`) — developer CLI.
 //!
-//! Wraps the existing flashing / provisioning tools and adds an HTTP
-//! client for the device-side firmware-PUT endpoint (task #79 once
-//! that lands). Goal: one tool the developer runs from a checkout to
-//! do every iteration step without remembering espflash flags or
-//! provtool environment variables.
+//! Wraps the existing flashing / provisioning tools so the developer
+//! runs one tool from a checkout instead of remembering espflash flags
+//! or provtool environment variables.
 //!
 //! ```text
 //! pa-dev provision --ssid mynet --pass secret --backend http://10.0.1.5:8080 [--dev]
 //! pa-dev flash                # cargo build --profile release-dev + espflash
 //! pa-dev monitor              # espflash monitor on the connected device
-//! pa-dev push --device 10.0.1.42 path/to/firmware.bin
-//! pa-dev info --device 10.0.1.42
 //! ```
+//!
+//! `pa-dev push` (wireless firmware iteration via a backend-instructed
+//! OTA — see task #93) is not yet wired. Until that lands, use
+//! `pa-dev flash` over USB for every iteration.
 
 use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
-use sha2::{Digest, Sha256};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -41,13 +40,6 @@ enum Cmd {
     Flash(FlashArgs),
     /// Tail serial output from the connected device.
     Monitor(MonitorArgs),
-    /// PUT a firmware .bin to a dev device over HTTP — no cable
-    /// required. Only works against firmware flashed with `--dev`
-    /// (because only dev builds run the receiver). See task #79.
-    Push(PushArgs),
-    /// GET the dev device's /info endpoint and pretty-print the JSON
-    /// (firmware version, board, channel, IP, etc.).
-    Info(InfoArgs),
     /// Erase the NVS partition over serial so the next boot migrates
     /// fresh credentials from the prov partition. Use when WiFi creds
     /// were updated but the device's NVS cache still has the old ones.
@@ -66,7 +58,8 @@ struct ProvisionArgs {
     #[arg(long, env = "PAPERANYWHERE_PROV_BACKEND_URL")]
     backend: String,
     /// Mark this bundle as a dev build — device skips production OTA
-    /// and runs the dev-only firmware PUT receiver (when #79 lands).
+    /// scheduling and stays AlwaysOn so backend-instructed OTA pushes
+    /// (task #93) can reach it without waiting for the next wake.
     #[arg(long)]
     dev: bool,
     /// Where to write the prov.bin.
@@ -108,31 +101,6 @@ struct MonitorArgs {
 }
 
 #[derive(Args, Debug)]
-struct PushArgs {
-    /// Device address — IP or hostname. Read from the boot-screen
-    /// status bar or `pa-dev info` discovery.
-    #[arg(long)]
-    device: String,
-    /// HTTP port the device's firmware-PUT receiver listens on.
-    #[arg(long, default_value_t = 80)]
-    port: u16,
-    /// Path to the firmware .bin to upload.
-    bin: PathBuf,
-    /// Skip the sha256 check (device default rejects unverified
-    /// pushes; opt-out for local debugging only).
-    #[arg(long)]
-    skip_verify: bool,
-}
-
-#[derive(Args, Debug)]
-struct InfoArgs {
-    #[arg(long)]
-    device: String,
-    #[arg(long, default_value_t = 80)]
-    port: u16,
-}
-
-#[derive(Args, Debug)]
 struct FactoryResetArgs {
     /// Serial port the device is attached to.
     #[arg(long, default_value = "COM6")]
@@ -146,8 +114,6 @@ fn main() -> Result<()> {
         Cmd::Provision(a) => run_provision(a),
         Cmd::Flash(a) => run_flash(a),
         Cmd::Monitor(a) => run_monitor(a),
-        Cmd::Push(a) => run_push(a),
-        Cmd::Info(a) => run_info(a),
         Cmd::FactoryReset(a) => run_factory_reset(a),
     }
 }
@@ -309,61 +275,6 @@ fn run_monitor(args: MonitorArgs) -> Result<()> {
     Ok(())
 }
 
-// ── Push (HTTP) ─────────────────────────────────────────────────────────────
-
-fn run_push(args: PushArgs) -> Result<()> {
-    let bytes = std::fs::read(&args.bin)
-        .with_context(|| format!("read {}", args.bin.display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let sha = hex_encode(&hasher.finalize());
-
-    let url = format!("http://{}:{}/firmware", args.device, args.port);
-    println!(
-        "pa-dev: PUT {} ({} bytes, sha256 {})",
-        url,
-        bytes.len(),
-        &sha[..16]
-    );
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()?;
-    let mut req = client
-        .put(&url)
-        .body(bytes)
-        .header("Content-Type", "application/octet-stream");
-    if !args.skip_verify {
-        req = req.header("X-PA-Sha256", &sha);
-    }
-    let resp = req.send().context("PUT request failed (is the device on the dev channel and reachable?)")?;
-    let status = resp.status();
-    let body = resp.text().unwrap_or_default();
-    println!("pa-dev: {} {}", status, body);
-    if !status.is_success() {
-        bail!("device rejected the upload");
-    }
-    Ok(())
-}
-
-// ── Info ────────────────────────────────────────────────────────────────────
-
-fn run_info(args: InfoArgs) -> Result<()> {
-    let url = format!("http://{}:{}/info", args.device, args.port);
-    let resp = reqwest::blocking::get(&url).context("GET /info failed")?;
-    let status = resp.status();
-    let body = resp.text().unwrap_or_default();
-    if !status.is_success() {
-        bail!("device returned {}: {}", status, body);
-    }
-    // Pretty-print if it's JSON; passthrough otherwise.
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
-        Err(_) => println!("{}", body),
-    }
-    Ok(())
-}
-
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn espflash_bin() -> String {
@@ -378,21 +289,4 @@ fn espflash_bin() -> String {
         }
     }
     "espflash".to_string()
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(nibble(b >> 4));
-        s.push(nibble(b & 0xF));
-    }
-    s
-}
-
-fn nibble(n: u8) -> char {
-    if n < 10 {
-        (b'0' + n) as char
-    } else {
-        (b'a' + n - 10) as char
-    }
 }

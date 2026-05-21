@@ -14,6 +14,8 @@
 //!
 //!     Visit <adopt_url> and enter the code above
 //!
+//!     ⚠ Backend unreachable — retrying…   <- optional retry notice
+//!
 //! Once a no_std QR encoder lands the left half of the screen gets a
 //! scannable QR pointing at `<adopt_url>?code=…&dev=…`.
 
@@ -42,6 +44,7 @@ pub fn draw_adoption_screen(
     device_id: &str,
     ip: &str,
     adopt_url: &str,
+    retry_notice: Option<&str>,
 ) {
     if !matches!(region.color_mode, ColorMode::Mono1bpp) {
         return;
@@ -151,4 +154,27 @@ pub fn draw_adoption_screen(
         centered,
     )
     .draw(&mut target);
+
+    // Optional retry notice — rendered just above the footer hint with
+    // a small attention marker. Caller sets this when the device can
+    // see the network but can't reach the backend (or DHCP hasn't
+    // landed yet, etc.). Truncates at 80 chars to keep one line on
+    // even the smallest supported panel.
+    if let Some(msg) = retry_notice {
+        let mut line: HString<96> = HString::new();
+        // Leading "!" inside a small box stands in for a triangle —
+        // we don't have a glyph for ⚠ in FONT_6X10, and dragging in
+        // an icon raster just for this would be overkill.
+        let _ = line.push_str("[!] ");
+        for c in msg.chars().take(80) {
+            let _ = line.push(c);
+        }
+        let _ = Text::with_text_style(
+            line.as_str(),
+            Point::new(cx, region_h - 60),
+            small,
+            centered,
+        )
+        .draw(&mut target);
+    }
 }

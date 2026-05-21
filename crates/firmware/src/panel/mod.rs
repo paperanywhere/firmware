@@ -18,13 +18,13 @@ pub use paperanywhere_panel_uc8179 as uc8179;
 pub struct NoopPanel;
 
 impl EpaperPanel for NoopPanel {
-    fn init(&mut self) {
+    async fn init(&mut self) {
         esp_println::println!("panel(noop): init");
     }
-    fn write_chunk(&mut self, bytes: &[u8]) {
+    async fn write_chunk(&mut self, bytes: &[u8]) {
         esp_println::println!("panel(noop): write_chunk {} bytes", bytes.len());
     }
-    fn refresh(&mut self) {
+    async fn refresh(&mut self) {
         esp_println::println!("panel(noop): refresh");
     }
 }

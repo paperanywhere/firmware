@@ -10,6 +10,8 @@ use super::BoardConfig;
 
 pub const CONFIG: BoardConfig = BoardConfig {
     name: "Seeed Studio reTerminal E1001",
+    manufacturer: "Seeed Studio",
+    model: "reTerminal E1001",
     panel_model_id: 1,
     panel_width_px: 800,
     panel_height_px: 480,

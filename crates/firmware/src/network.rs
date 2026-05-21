@@ -13,10 +13,14 @@ use esp_radio::wifi::Interface as RadioInterface;
 use static_cell::StaticCell;
 
 /// How many simultaneously-open sockets the stack supports. DHCP + DNS each
-/// claim one of these, so the budget for user TCP connections is `N - 2`.
-/// 4 leaves us 2 TCP slots — enough for one /state + one /blob streaming
-/// at a time without contention.
-pub const SOCKETS: usize = 4;
+/// claim one of these (verified via embassy-net 0.7.1 source — `embassy_net::new`
+/// adds a DNS socket via `i.sockets.add(...)` when the `dns` feature is on
+/// + a DHCPv4 socket when `Config::dhcpv4` is used). So the budget for
+/// user TCP connections is `N - 2`. With the runtime's HTTP client
+/// + image-blob streaming + a future OTA download possibly overlapping,
+/// 8 leaves comfortable headroom (smoltcp's `SocketSet::add` panics on
+/// full — not what we want as a debug-friendly failure mode).
+pub const SOCKETS: usize = 8;
 
 static STACK_RESOURCES: StaticCell<StackResources<SOCKETS>> = StaticCell::new();
 

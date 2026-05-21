@@ -56,6 +56,15 @@ pub struct FwWifi {
     /// esp-radio's `unstable` feature; tracking it ourselves keeps
     /// the dep surface minimal.
     associated: bool,
+    /// Latches the first time DHCP gives us an IP. We only treat a
+    /// subsequent "stack has no IP" observation as a real drop (and
+    /// force a re-associate) AFTER this flag is set. Without it, the
+    /// first few wake cycles — when DHCP hasn't yet completed —
+    /// would look like a "broken" association and we'd tear down the
+    /// freshly-established WPA session before DHCP got a chance to
+    /// finish, leaving the device stuck in a connect / disconnect /
+    /// reconnect loop that never makes progress past the boot screen.
+    had_ip_in_session: bool,
 }
 
 impl FwWifi {
@@ -90,13 +99,32 @@ impl FwWifi {
         // reads from the hardware RNG through its own driver path.
         let _keep_rng = rng;
 
-        let (controller, interfaces) = esp_radio::wifi::new(wifi, ControllerConfig::default())
-            .map_err(|_| WifiError::ConnectFailed)?;
+        let (controller, interfaces) =
+            esp_radio::wifi::new(wifi, ControllerConfig::default())
+                .map_err(|_| WifiError::ConnectFailed)?;
+
+        // NOTE on WiFi power-save: esp-radio 0.18 defaults to
+        // PowerSaveMode::None (no modem sleep), which is what we want
+        // here. We'd pin it explicitly but `Controller::set_power_saving`
+        // is gated behind esp-radio's `unstable` feature; turning that
+        // on pulls in the wider unstable surface so we leave it on
+        // the documented default instead. If a future version flips
+        // the default, the symptom (router timing us out during long
+        // refreshes despite yield_now in the panel driver) would
+        // recur — re-pin via the unstable API at that point.
 
         // Returned: the controller (used for associate/disconnect calls from
         // the runtime) plus the station interface, which the network module
         // hands to embassy-net to build its TCP/IP stack.
-        Ok((Self { controller, stack: None, associated: false }, interfaces.station))
+        Ok((
+            Self {
+                controller,
+                stack: None,
+                associated: false,
+                had_ip_in_session: false,
+            },
+            interfaces.station,
+        ))
     }
 }
 
@@ -104,12 +132,42 @@ impl WifiLink for FwWifi {
     type Error = WifiError;
 
     async fn associate(&mut self, creds: &WifiCreds) -> Result<(), Self::Error> {
-        // Already-connected short-circuit. Avoids the `set_config +
-        // connect_async` dance on every wake cycle — that was what
-        // turned the first cycle's working association into Timeout
-        // errors on cycles 2+ (the second set_config tore down the
-        // existing STA state).
+        // Already-connected short-circuit BUT only when we can prove
+        // we're still actually on the network. The bug we fixed here:
+        // a one-way `associated = true` flag is sticky across radio
+        // dropouts — if the AP momentarily disappears, or a brown-out
+        // during an OTA push trips the WiFi stack, this function used
+        // to short-circuit forever thinking we were still connected
+        // and the device went permanently dead to the network until a
+        // physical reset. Cross-checking against `embassy-net`'s
+        // config_v4 (which tracks the live DHCP lease) means a stale
+        // `associated` flag triggers a real re-associate — but ONLY
+        // once we've actually had an IP this session, so we don't
+        // tear down a freshly-established WPA session while DHCP is
+        // still running in the background.
+        let stack_has_ip = self.stack.and_then(|s| s.config_v4()).is_some();
+        if stack_has_ip {
+            self.had_ip_in_session = true;
+        }
+        if self.associated && stack_has_ip {
+            return Ok(());
+        }
+        if self.associated && !stack_has_ip && self.had_ip_in_session {
+            log::warn!(
+                "wifi: lost DHCP lease after previously having one — forcing re-associate"
+            );
+            self.associated = false;
+            // esp-radio gets confused if we set_config without an
+            // explicit disconnect first; this is idempotent.
+            let _ = self.controller.disconnect_async().await;
+        }
         if self.associated {
+            // associated && !stack_has_ip && !had_ip_in_session:
+            // we joined the AP successfully but DHCP hasn't completed
+            // yet on this session. Don't disconnect — let DHCP keep
+            // trying. The wake-cycle's wait_for_local_ip will keep
+            // polling for the IP; if it never arrives, DhcpTimeout
+            // flows through to the outer-loop retry counter.
             return Ok(());
         }
 
@@ -168,6 +226,14 @@ impl WifiLink for FwWifi {
         let stack = self.stack?;
         let cfg = stack.config_v4()?;
         Some(cfg.address.address().octets())
+    }
+
+    fn gateway_v4(&self) -> Option<[u8; 4]> {
+        let stack = self.stack?;
+        let cfg = stack.config_v4()?;
+        // embassy-net 0.7 returns the gateway as Option<Ipv4Address>
+        // — None when DHCP didn't include one. Forward as-is.
+        cfg.gateway.map(|g| g.octets())
     }
 }
 

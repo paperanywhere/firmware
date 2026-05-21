@@ -3,7 +3,7 @@ name = "paperanywhere-dev"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Developer CLI for paperanywhere — wraps espflash + provtool, pushes firmware to dev devices over HTTP, tails logs."
+description = "Developer CLI for paperanywhere — wraps espflash + provtool, tails logs."
 
 [[bin]]
 name = "pa-dev"
@@ -12,11 +12,5 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "stream"] }
-sha2 = "0.10"
-indicatif = "0.17"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util"] }
 log = { workspace = true }
 env_logger = "0.11"

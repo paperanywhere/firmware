@@ -23,12 +23,24 @@ fn main() {
     emit_version_stamp();
     emit_build_time();
     let (width, full_height, color_mode) = active_board_spec();
-    // Boot + OTA screens render into the *main region* only — the top
-    // status bar is owned by the compositor and overlays at runtime.
-    let height = full_height.saturating_sub(STATUS_BAR_HEIGHT_PX);
+    // Boot + OTA screens render into the TOP portion of the main
+    // region only — the bottom portion is reserved for the compositor's
+    // 3-column build-info block (Firmware / Network / Device + a
+    // countdown row). Without this height-cap the logo's bottom half
+    // would overlap the text and the fast-LUT refresh would smear
+    // the previous logo pixels into the value-column text.
+    //
+    // Sizing: ~55% of the main-region height leaves enough vertical
+    // space at the bottom for the 6-row build-info block (5 data rows
+    // + 1 countdown row at 12 px each + ~24 px of breathing room
+    // above and below = ~96 px). For an 800x448 main region that's
+    // 800×246 for the logo and 800×202 for the info block.
+    let main_height = full_height.saturating_sub(STATUS_BAR_HEIGHT_PX);
+    const BOOT_LOGO_HEIGHT_FRACTION: f32 = 0.55;
+    let height = ((main_height as f32) * BOOT_LOGO_HEIGHT_FRACTION) as u32;
     println!(
-        "cargo:warning=boot-screen: rasterising for {}x{} (main region of {}x{}) {:?}",
-        width, height, width, full_height, color_mode
+        "cargo:warning=boot-screen: rasterising for {}x{} (main region of {}x{}, info block reserved at bottom) {:?}",
+        width, height, width, main_height, color_mode
     );
 
     let assets = Path::new(env!("CARGO_MANIFEST_DIR"))

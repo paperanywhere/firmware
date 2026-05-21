@@ -15,3 +15,11 @@ log.workspace = true
 # back-off. `generic-queue-8` matches the firmware crate's feature so
 # Timer works regardless of which task drives the executor.
 embassy-time = { version = "0.5", features = ["generic-queue-8"] }
+# Used for racing the wake-cycle sleep against the OTA progress signal:
+# when the OTA install path fires a new OtaPhase, runtime breaks out
+# of sleep and renders the live progress view instead of waiting the
+# full interval. The signal type itself lives in the firmware crate
+# as a static; runtime receives a `&'static Signal<...>` from `run()`.
+embassy-sync = "0.7"
+embassy-futures = "0.1"
+heapless = "0.8"

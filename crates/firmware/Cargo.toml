@@ -52,7 +52,26 @@ esp-radio = { version = "0.18", features = ["esp32s3", "wifi"] }
 esp-rtos = { version = "0.3", features = ["esp32s3", "esp-radio", "embassy"] }
 esp-storage = { version = "0.9", features = ["esp32s3", "critical-section"] }
 esp-backtrace = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
-esp-println = { version = "0.17", features = ["esp32s3", "log-04"] }
+# `jtag-serial` routes println output to the ESP32-S3's native
+# USB-Serial-JTAG endpoint instead of UART0. On the reTerminal E1001
+# the single USB-C port IS the USB-Serial-JTAG — UART0 GPIO pins are
+# not wired to a bridge chip, so without this feature every println
+# silently lands on unrouted pins and the serial monitor sees nothing.
+#
+# `default-features = false` is required because the default `auto`
+# feature counts as an output-channel selection — esp-println rejects
+# the build with "exactly one of jtag-serial/uart/auto/no-op" if both
+# `auto` (from defaults) and `jtag-serial` are enabled.
+# TEMP: routed to UART0 (via CH340 → COM6) instead of jtag-serial so
+# we can actually read device logs on this workstation — Windows
+# doesn't expose the ESP32-S3's native USB-Serial-JTAG endpoint as a
+# COM port, only the CH340 bridge that's wired to UART0. Flip back to
+# `jtag-serial` once the OTA-driven-from-backend flow (task #93) is
+# stable enough that we don't need continuous serial diagnostics
+# (memory note `project_reterminal_usb_serial_jtag` originally
+# specified jtag-serial because that's how the production device
+# config should be — but right now diagnostics > production-fidelity).
+esp-println = { version = "0.17", default-features = false, features = ["esp32s3", "log-04", "uart", "critical-section"] }
 esp-alloc = "0.10"
 esp-sync = { version = "0.1", features = ["esp32s3"] }
 # Embeds the ESP-IDF app descriptor in the image so espflash + the second-stage
@@ -63,9 +82,6 @@ esp-bootloader-esp-idf = { version = "0.5", features = ["esp32s3"] }
 # image matches the backend's advertised hash chunk-by-chunk so we never
 # touch otadata with a bad slot.
 sha2 = { version = "0.10", default-features = false }
-# Compile-time assertion macros — used by the dev_server to lock down
-# the size of header parsing buffers.
-static_assertions = "1"
 
 # ── State / utility ──
 embedded-hal = "1"
@@ -73,7 +89,11 @@ embedded-hal = "1"
 # `Spi` exposes) + a CS `OutputPin` into the `SpiDevice` interface the
 # UC8179 driver wants. Single-bus pattern; we don't share the SPI with any
 # other peripheral.
-embedded-hal-bus = "0.2"
+# `async` feature wires `AsyncSpiDevice` for `ExclusiveDevice`, which the
+# UC8179 driver requires now that its SpiDevice bound is async (the SPI
+# transfer awaits on each FIFO refill instead of busy-polling, giving
+# embassy-net scheduling windows during the framebuffer flush).
+embedded-hal-bus = { version = "0.2", features = ["async"] }
 embedded-storage = "0.3"
 heapless.workspace = true
 log.workspace = true

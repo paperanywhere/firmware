@@ -24,7 +24,7 @@ impl FwSleeper {
 }
 
 impl Sleeper for FwSleeper {
-    fn sleep_for(&mut self, seconds: u32, policy: PowerPolicy) {
+    async fn sleep_for(&mut self, seconds: u32, policy: PowerPolicy) {
         match policy {
             // `sleep_deep` is `-> !` — when the RTC wakes, the chip resets
             // and `main()` runs again from cold. From the runtime's point of
@@ -41,15 +41,16 @@ impl Sleeper for FwSleeper {
                 let timer = TimerWakeupSource::new(Duration::from_secs(seconds as u64));
                 self.rtc.sleep_deep(&[&timer]);
             }
-            // AlwaysOn: a busy yield. The radio stays up, the polling cycle
-            // resumes when the loop checks `next_check_at`. Real modem-sleep
-            // (lower-current idle) requires embassy-time + esp-rtos's idle
-            // hook; deferred to a follow-up.
+            // AlwaysOn: await an embassy timer so the executor can run
+            // other tasks (embassy-net's background polling, panel
+            // actor, etc.) during the wake-cycle gap. A sync busy-spin
+            // here used to be THE bug that made the device unreachable
+            // — the runtime_task held the CPU for the full wake
+            // interval, starving every other task.
             PowerPolicy::AlwaysOn => {
-                esp_println::println!("power: busy_wait_for({seconds}s) (AlwaysOn)");
-                for _ in 0..(seconds.saturating_mul(2_000_000)) {
-                    core::hint::spin_loop();
-                }
+                esp_println::println!("power: async sleep_for({seconds}s) (AlwaysOn)");
+                embassy_time::Timer::after(embassy_time::Duration::from_secs(seconds as u64))
+                    .await;
             }
         }
     }

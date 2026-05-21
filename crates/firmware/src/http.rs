@@ -39,7 +39,9 @@ use embassy_net::tcp::TcpSocket;
 use embedded_io_07::{Error as EioError07, ErrorKind as EioErrorKind07, ErrorType as EioErrorType07};
 use embedded_io_async_07::{Read, Write};
 use embedded_tls::{Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext, UnsecureProvider};
-use paperanywhere_ports::{DeviceAck, DeviceState, HttpTransport, parse_device_state};
+use paperanywhere_ports::{
+    DeviceAck, DeviceIdentity, DeviceRegistration, DeviceState, HttpTransport, parse_device_state,
+};
 
 const TCP_RX_BUF: usize = 4 * 1024;
 const TCP_TX_BUF: usize = 1 * 1024;
@@ -127,8 +129,39 @@ fn parse_backend_url(url: &str) -> Option<(Scheme, String, u16)> {
 impl HttpTransport for FwHttp {
     type Error = HttpError;
 
+    async fn register(
+        &mut self,
+        identity: &DeviceIdentity,
+    ) -> Result<DeviceRegistration, Self::Error> {
+        // Hand-roll the JSON. serde_json is heavy in no_std and the
+        // payload is tiny + flat. Escape only `"` and `\` in the mac /
+        // fw_version since these strings are firmware-controlled (the
+        // mac comes from efuse, fw_version from a build-time env! — no
+        // user input — so the conservative escape is plenty).
+        let body = format!(
+            "{{\"mac\":\"{}\",\"panel_model_id\":{},\"fw_version\":\"{}\"}}",
+            json_escape(&identity.mac),
+            identity.panel_model_id,
+            json_escape(&identity.fw_version),
+        );
+        let mut response = Vec::with_capacity(512);
+        request_with_full_body(
+            self,
+            "POST",
+            "", // unauth — see write_request_head
+            Some(body.as_bytes()),
+            "application/json",
+            "/api/device/register",
+            &mut response,
+        )
+        .await?;
+        let body_str =
+            core::str::from_utf8(&response).map_err(|_| HttpError::BodyDecode)?;
+        parse_register_response(body_str).ok_or(HttpError::BodyDecode)
+    }
+
     async fn get_state(&mut self, token: &str) -> Result<DeviceState, Self::Error> {
-        let mut response = Vec::with_capacity(2048);
+        let mut response: Vec<u8> = Vec::with_capacity(2048);
         request_with_full_body(
             self,
             "GET",
@@ -139,8 +172,8 @@ impl HttpTransport for FwHttp {
             &mut response,
         )
         .await?;
-        parse_device_state(core::str::from_utf8(&response).map_err(|_| HttpError::BodyDecode)?)
-            .ok_or(HttpError::BodyDecode)
+        let body = core::str::from_utf8(&response).map_err(|_| HttpError::BodyDecode)?;
+        parse_device_state(body).ok_or(HttpError::BodyDecode)
     }
 
     async fn stream_blob(
@@ -379,10 +412,19 @@ where
     // duplicates it for log/metrics consumers that don't read custom
     // headers.
     let fw_version = crate::FW_VERSION;
+    // Pre-registration calls (POST /api/device/register) have no bearer
+    // yet — that's literally the endpoint that mints one. Pass `token=""`
+    // to skip the Authorization header rather than send `Bearer ` which
+    // most servers would 400 on.
+    let auth_header = if token.is_empty() {
+        alloc::string::String::new()
+    } else {
+        format!("Authorization: Bearer {token}\r\n")
+    };
     let head = format!(
         "{method} {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
-         Authorization: Bearer {token}\r\n\
+         {auth_header}\
          User-Agent: paperanywhere-firmware/{fw_version}\r\n\
          X-PA-FW-Version: {fw_version}\r\n\
          Accept: application/json\r\n\
@@ -560,3 +602,89 @@ impl rand_core::RngCore for EspRng {
 }
 
 impl rand_core::CryptoRng for EspRng {}
+
+// ── /api/device/register response parser ────────────────────────────────────
+//
+// Minimal hand-rolled JSON extractor — three string fields out of a flat
+// object. Pulls in no extra deps; the shape is locked to the backend's
+// `RegisterResponse` struct (device_uuid / device_token / claim_code).
+// We deliberately don't enforce field order — the backend currently emits
+// in insertion order but a future serde rename / reorder shouldn't break
+// us.
+
+fn parse_register_response(json: &str) -> Option<DeviceRegistration> {
+    let device_uuid = extract_str_field(json, "device_uuid")?;
+    let device_token = extract_str_field(json, "device_token")?;
+    let claim_code = extract_str_field(json, "claim_code")?;
+    Some(DeviceRegistration {
+        device_uuid,
+        device_token,
+        claim_code,
+    })
+}
+
+/// Find `"name":"<value>"` in a flat JSON object and return the value
+/// with `\"` and `\\` un-escaped. Returns `None` if the field isn't
+/// present or the string literal isn't well-formed.
+fn extract_str_field(json: &str, name: &str) -> Option<alloc::string::String> {
+    let pat_owned = format!("\"{name}\"");
+    let key_idx = json.find(&pat_owned)?;
+    let after_key = &json[key_idx + pat_owned.len()..];
+    // Skip whitespace + ':' + whitespace
+    let bytes = after_key.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b':' {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'"' {
+        return None;
+    }
+    i += 1;
+    // Walk to the closing quote, un-escaping along the way.
+    let mut out = alloc::string::String::new();
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            if i + 1 >= bytes.len() {
+                return None;
+            }
+            match bytes[i + 1] {
+                b'"' => out.push('"'),
+                b'\\' => out.push('\\'),
+                b'n' => out.push('\n'),
+                b't' => out.push('\t'),
+                b'/' => out.push('/'),
+                // Unicode escapes etc. aren't expected in any of the
+                // three fields (uuid, hex token, base32 claim code) —
+                // bail rather than guess.
+                _ => return None,
+            }
+            i += 2;
+        } else if b == b'"' {
+            return Some(out);
+        } else {
+            out.push(b as char);
+            i += 1;
+        }
+    }
+    None
+}
+
+fn json_escape(s: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out
+}

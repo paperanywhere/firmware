@@ -9,7 +9,7 @@
 //! GPIO/SPI handles main.rs gathered into `FirmwareResources`.
 
 use embedded_hal_bus::spi::ExclusiveDevice;
-use esp_hal::Blocking;
+use esp_hal::Async;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Input, Output};
 use esp_hal::spi::master::Spi;
@@ -17,12 +17,21 @@ use paperanywhere_panel_uc8179::{Pins, Uc8179};
 
 use crate::resources::PanelHardware;
 
-/// Bare panel driver, before the compositor wraps it. Kept as a type
-/// alias so changes to the panel-driver type signature don't require
-/// chasing through both `Panel` (the public-facing type) and the
-/// concrete `Uc8179<...>` everywhere.
+/// Bare panel driver, before the compositor wraps it. The SPI bus
+/// runs in **async** mode (`Spi<'static, Async>`) so each transfer
+/// yields to the embassy executor while the FIFO drains, instead of
+/// busy-polling. Without this, the 48 KB framebuffer flush blocked
+/// embassy-net's WiFi-RX poll for ~38 ms straight — long enough for
+/// the gateway to ARP-evict the device's DHCP lease. Task #90.
+///
+/// `embassy_time::Delay` (rather than `esp_hal::delay::Delay`) satisfies
+/// `ExclusiveDevice`'s `D: AsyncDelayNs` bound that comes with the
+/// `embedded-hal-bus` "async" feature. The UC8179 driver doesn't
+/// invoke its DelayNs slot, so this is effectively unused — but the
+/// trait bound has to be satisfied for `AsyncSpiDevice` to be in
+/// scope on the ExclusiveDevice wrapper.
 pub type BarePanel = Uc8179<
-    ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, Delay>,
+    ExclusiveDevice<Spi<'static, Async>, Output<'static>, embassy_time::Delay>,
     Output<'static>,
     Output<'static>,
     Input<'static>,
@@ -42,8 +51,8 @@ pub type Panel = paperanywhere_compositor::Compositor<BarePanel>;
 /// `invert_data_plane` is sourced from the board's `BoardConfig`.
 pub fn build_panel(hw: PanelHardware, board: BoardConfig) -> Panel {
     let delay = Delay::new();
-    let spi_device = ExclusiveDevice::new(hw.spi_bus, hw.cs, delay)
-        .expect("ExclusiveDevice::new (Delay is infallible)");
+    let spi_device = ExclusiveDevice::new(hw.spi_bus, hw.cs, embassy_time::Delay)
+        .expect("ExclusiveDevice::new (embassy_time::Delay is infallible)");
     let bare = Uc8179::new(
         spi_device,
         Pins { rst: hw.rst, dc: hw.dc, busy: hw.busy },
@@ -78,7 +87,17 @@ pub enum PowerPolicy { ScheduledWake, AlwaysOn }
 /// boot by `current()` based on the active Cargo feature.
 #[derive(Debug, Clone, Copy)]
 pub struct BoardConfig {
+    /// Combined "Manufacturer Model" string. Kept for legacy code
+    /// paths (logs, future telemetry payloads) that surface a single
+    /// display name. New code should prefer `manufacturer` + `model`
+    /// separately so the boot screen can render them in distinct
+    /// columns.
     pub name: &'static str,
+    /// Hardware manufacturer (e.g. "Seeed Studio", "M5Stack").
+    pub manufacturer: &'static str,
+    /// Specific model identifier (e.g. "reTerminal E1001",
+    /// "Inkplate 6"). Together with `manufacturer` reproduces `name`.
+    pub model: &'static str,
     pub panel_model_id: i32,
     pub panel_width_px: u32,
     pub panel_height_px: u32,

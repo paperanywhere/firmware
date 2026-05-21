@@ -11,3 +11,7 @@ description = "Port traits + wire types shared by the device firmware and the de
 # boundary without forcing every consumer to drag in a String.
 [dependencies]
 heapless.workspace = true
+# Mutex wrapping the global chrome state. CriticalSectionRawMutex works
+# both on the firmware (cross-core safe via critical-section's esp-hal
+# impl) and the sim (no-op CS on host).
+embassy-sync = "0.7"

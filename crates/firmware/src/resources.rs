@@ -10,7 +10,7 @@
 //! subsystem needs at least one field from it (pin numbers, capability
 //! flags, default policy).
 
-use esp_hal::Blocking;
+use esp_hal::Async;
 use esp_hal::gpio::{Input, Output};
 use esp_hal::interrupt::software::SoftwareInterrupt;
 use esp_hal::peripherals::{CPU_CTRL, FLASH, LPWR, RNG, TIMG0, WIFI};
@@ -27,7 +27,7 @@ use crate::boards::BoardConfig;
 /// gray panels) would expand this into an enum or pick a different bundle
 /// type per-board. For now there's only one bundle shape.
 pub struct PanelHardware {
-    pub spi_bus: Spi<'static, Blocking>,
+    pub spi_bus: Spi<'static, Async>,
     pub cs: Output<'static>,
     pub dc: Output<'static>,
     pub rst: Output<'static>,

@@ -28,6 +28,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use heapless::String as HString;
 
+pub mod chrome;
+
 // ── Wire types (formerly firmware/src/wire.rs) ────────────────────────────────
 //
 // Sharing these here means the sim talks to the backend with exactly the same
@@ -46,6 +48,18 @@ pub struct DeviceState {
     /// latest release for its board model + channel. `None` means no
     /// update — most polls.
     pub firmware_update: Option<FirmwareUpdate>,
+    /// Friendly name set by the user during adoption (or later via the
+    /// dashboard). `None` for unclaimed devices — backend still returns
+    /// the auto-generated `device-XXXX` name in that case so the
+    /// device has *something* to show. The runtime persists this to
+    /// NVS for the next boot screen.
+    pub name: Option<String>,
+    /// Backend-assigned UUID echoed back on every state poll. Same
+    /// value the device originally received from register; included
+    /// here so firmware that lost / never persisted the UUID can
+    /// recover it via /state alone. The runtime saves this to NVS on
+    /// every successful poll.
+    pub device_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,11 +241,16 @@ pub fn parse_device_state(body: &str) -> Option<DeviceState> {
     // an OTA install.
     let firmware_update = parse_firmware_update(body);
 
+    let name = extract_str(body, "name");
+    let device_uuid = extract_str(body, "device_uuid");
+
     Some(DeviceState {
         image,
         config: DeviceConfig { sleep_interval_sec, power_policy },
         next_check_at,
         firmware_update,
+        name,
+        device_uuid,
     })
 }
 
@@ -379,7 +398,7 @@ pub enum DeviceStatus {
     /// — waiting to be adopted to a user account. The adoption screen
     /// is on the main region.
     WaitingForAdoption,
-    /// Idle, between wakes / serving the dev_server.
+    /// Idle, between wakes.
     Ready,
     /// Terminal error — the halt screen is on the main region and the
     /// runtime is busy-looping. Power-cycle or re-provision to clear.
@@ -426,10 +445,51 @@ pub trait WifiLink {
     fn local_ip(&self) -> Option<[u8; 4]> {
         None
     }
+    /// Current IPv4 gateway address from the DHCP lease, or `None`
+    /// when the lease hasn't yet established / no gateway is in the
+    /// network's offer. Surfaced on the boot screen's Network column.
+    /// Default `None` for impls that don't track it.
+    fn gateway_v4(&self) -> Option<[u8; 4]> {
+        None
+    }
 }
 
-/// HTTPS calls against the backend. All three are bearer-authenticated with
-/// the device token from [`NvsStore::load_device_token`].
+/// Identity an unclaimed device sends to `POST /api/device/register` so the
+/// backend can create an anonymous device row keyed by MAC and surface the
+/// device's hardware shape (panel model) to the dashboard before the user
+/// adopts it. After the user enters the returned `claim_code` in the
+/// dashboard, the backend already knows the panel model + firmware version
+/// — the adoption form is just `claim_code + optional name`.
+#[derive(Debug, Clone)]
+pub struct DeviceIdentity {
+    /// `aa:bb:cc:dd:ee:ff` — backend normalises so any common formatting works.
+    pub mac: alloc::string::String,
+    /// Catalog row in the backend's `panel_models` table. Comes from the
+    /// firmware's `BoardConfig::panel_model_id` constant — every board crate
+    /// declares its own.
+    pub panel_model_id: i32,
+    /// Firmware build stamp (e.g. `0.1.0+a1b2c3d4`). Sent so the dashboard
+    /// can decide whether to offer an OTA update on the adopt-success page.
+    pub fw_version: alloc::string::String,
+}
+
+/// What the backend hands back after a successful registration. The
+/// firmware persists all three to NVS:
+///   * `device_token` becomes the bearer for `/api/device/state` + `/ack`,
+///   * `claim_code` is what the adoption screen renders for the user,
+///   * `device_uuid` is the identifier the backend uses internally — useful
+///     for any future device-initiated lookup but not user-visible.
+#[derive(Debug, Clone)]
+pub struct DeviceRegistration {
+    pub device_uuid: alloc::string::String,
+    pub device_token: alloc::string::String,
+    pub claim_code: alloc::string::String,
+}
+
+/// HTTPS calls against the backend. Most are bearer-authenticated with the
+/// device token from [`NvsStore::load_device_token`]; [`register`] is the
+/// exception — it's how a fresh device acquires that token in the first
+/// place, so it sends no `Authorization` header.
 ///
 /// Methods are `async` because the firmware impl drives an `embassy-net`
 /// stack on top of `esp-radio`'s WiFi station — the same executor that runs
@@ -446,6 +506,17 @@ pub trait WifiLink {
 #[allow(async_fn_in_trait)]
 pub trait HttpTransport {
     type Error: core::fmt::Debug;
+    /// Identify this device to the backend so the dashboard's adoption
+    /// flow can match a claim code back to the right hardware. Called
+    /// once per unclaimed device on first cold boot after WiFi + DHCP
+    /// come up. The backend returns a fresh `device_token`, a 6-char
+    /// `claim_code`, and the device's allocated UUID. Subsequent
+    /// re-registers (same MAC) return the same UUID — the backend's
+    /// `register_anonymous_device` is idempotent on MAC.
+    async fn register(
+        &mut self,
+        identity: &DeviceIdentity,
+    ) -> Result<DeviceRegistration, Self::Error>;
     async fn get_state(&mut self, token: &str) -> Result<DeviceState, Self::Error>;
     /// Streams the processed-blob bytes through `on_chunk`. Lets the firmware
     /// pipe chunks straight into the panel SPI without ever holding the full
@@ -494,12 +565,69 @@ pub trait NvsStore {
         false
     }
     /// Device-side claim code (e.g. `1234-5678`) that the user types
-    /// into the frontend to adopt this device. Generated once from
-    /// the chip MAC at boot time and persisted by the firmware so
-    /// it's stable across reboots. `None` on impls (sim) that don't
-    /// support a claim flow.
+    /// into the frontend to adopt this device. Issued by the backend
+    /// on first registration and persisted to NVS so it survives reboots.
+    /// `None` on impls (sim) that don't support a claim flow.
     fn load_claim_code(&self) -> Option<alloc::string::String> {
         None
+    }
+    /// Backend-assigned UUID. Returned by `POST /api/device/register`
+    /// and persisted to NVS; remains the device's identity across
+    /// reboots (and matches the row in the backend's `devices`
+    /// table). Surfaced on the boot screen.
+    fn load_device_uuid(&self) -> Option<alloc::string::String> {
+        None
+    }
+    /// User-supplied friendly name. Returned on `GET /api/device/state`
+    /// once the device has been adopted; persisted to NVS so reboots
+    /// show the name before /state can be reached. Surfaced on the
+    /// boot screen alongside the UUID.
+    fn load_device_name(&self) -> Option<alloc::string::String> {
+        None
+    }
+    /// Persist the bearer token returned by the backend's
+    /// `POST /api/device/register`. Default no-op so impls that don't
+    /// participate in the adoption flow (e.g. sim with a hardcoded
+    /// token) don't have to override.
+    fn save_device_token(&mut self, _token: &str) {}
+    /// Persist the claim code returned by the backend's
+    /// `POST /api/device/register`. Default no-op for impls without
+    /// a claim flow.
+    fn save_claim_code(&mut self, _code: &str) {}
+    /// Persist the device UUID returned by register. Default no-op.
+    fn save_device_uuid(&mut self, _uuid: &str) {}
+    /// Persist the friendly name returned by /state. Default no-op.
+    fn save_device_name(&mut self, _name: &str) {}
+}
+
+/// Three-state WiFi link status as surfaced on the boot screen's
+/// Network column.
+///
+/// Distinct from `WifiLink::rssi_dbm`'s Option signal — the boot
+/// screen wants to distinguish "we're in the middle of associating"
+/// from "we're truly disconnected", whereas the status-bar widgets
+/// only care about the binary "have signal / no signal" state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WifiLinkState {
+    /// No association attempt active (cold boot, factory reset, or
+    /// post-disconnect before retry kicks in).
+    #[default]
+    Disconnected,
+    /// `WifiLink::associate` is in flight — WPA handshake + DHCP not
+    /// yet complete.
+    Connecting,
+    /// Associated with a live DHCP lease.
+    Connected,
+}
+
+impl WifiLinkState {
+    /// Display label for the boot-screen Network column.
+    pub fn label(self) -> &'static str {
+        match self {
+            WifiLinkState::Disconnected => "Disconnected",
+            WifiLinkState::Connecting => "Connecting",
+            WifiLinkState::Connected => "Connected",
+        }
     }
 }
 
@@ -509,8 +637,11 @@ pub trait NvsStore {
 /// resets it on `init` / `refresh`.
 pub trait EpaperPanel {
     /// Reset + init the controller and reset the write cursor to 0. Called
-    /// once before the first wake cycle.
-    fn init(&mut self);
+    /// once before the first wake cycle. Async because the underlying SPI
+    /// device is async — the boot sequence sends a series of init commands
+    /// that each yield to the executor while the SPI FIFO drains, instead
+    /// of busy-polling like the previous sync-SPI driver did.
+    fn init(&mut self) -> impl core::future::Future<Output = ()>;
     /// Push current chrome state (battery, wifi association) into whatever
     /// status-bar layer is sitting between the runtime and the bare panel.
     /// Default is a no-op; the compositor overrides it. Called by the
@@ -557,10 +688,61 @@ pub trait EpaperPanel {
     /// (or → Updating / Stalled depending on what happens). The
     /// compositor renders the human-readable label.
     fn set_status(&mut self, _status: DeviceStatus) {}
+    /// Set the boot-screen hold countdown. `Some(n)` displays
+    /// "Transitioning in N..." at the bottom of the build-info block
+    /// on the next refresh; `None` blanks the countdown line. Doesn't
+    /// itself trigger a refresh — caller follows up with
+    /// `redraw_boot_screen` to apply. Default no-op for bare panels
+    /// that don't render a boot template.
+    fn set_boot_countdown(&mut self, _seconds: Option<u8>) {}
+    /// IPv4 gateway address from the current DHCP lease (e.g.
+    /// `10.0.1.1`). Surfaced on the boot-screen's Network column.
+    /// Doesn't trigger a refresh on its own; takes effect on the
+    /// next view-render. Default no-op for bare panels.
+    fn set_gateway(&mut self, _ip: Option<&str>) {}
+    /// Backend URL the device polls/posts to (e.g.
+    /// `https://api.paperanywhere.io`). Surfaced on the boot-screen's
+    /// Firmware column so the user can verify the device is pointed
+    /// at the right environment. Default no-op for bare panels.
+    fn set_backend_url(&mut self, _url: Option<&str>) {}
+    /// WiFi link-state for the Network column on the boot screen.
+    /// Distinct from `on_wifi_state_changed`'s RSSI signal because
+    /// the boot screen wants a 3-state label (Disconnected /
+    /// Connecting / Connected) rather than a binary associated /
+    /// not-associated flag. Default no-op.
+    fn set_wifi_link_state(&mut self, _state: WifiLinkState) {}
+    /// SSID currently being attempted / associated with. `None`
+    /// clears the field (e.g. on factory reset / no creds yet).
+    /// Default no-op.
+    fn set_ssid(&mut self, _ssid: Option<&str>) {}
+    /// Backend-assigned device UUID. Surfaced on the boot screen as
+    /// a full-width line below the column block — the full 36-char
+    /// UUID4 doesn't fit in the column's per-row value budget.
+    /// Default no-op.
+    fn set_device_uuid(&mut self, _uuid: Option<&str>) {}
+    /// User-supplied friendly name (e.g. "Kitchen calendar"). Shown
+    /// on the boot screen's DEVICE column once `/state` has reported
+    /// it. Default no-op.
+    fn set_device_name(&mut self, _name: Option<&str>) {}
+    /// Mark the next [`refresh`] / [`refresh_fast`] as a full-LUT
+    /// pass even if the compositor would otherwise pick fast. Used
+    /// at view boundaries where the user expects a clear, unmistakable
+    /// visual transition (e.g. "we just connected to WiFi — show
+    /// the populated boot screen") that the partial waveform might
+    /// be too subtle to convey on small text changes. Default no-op
+    /// for bare panels.
+    fn force_full_next_refresh(&mut self) {}
     /// Paint the adoption screen into the main region (QR code + big
     /// claim code + device id + IP + adopt URL). Called by the
     /// runtime when the device has no `device_token` in NVS, i.e.
     /// the device hasn't been claimed to a user account yet.
+    ///
+    /// `retry_notice` is `Some(msg)` when the runtime wants to surface
+    /// a transient warning at the bottom of the screen — typically
+    /// "Backend unreachable — retrying…" or "Waiting for network…".
+    /// `None` when the registration round-trip completed cleanly and
+    /// the displayed claim code is fresh.
+    ///
     /// Default no-op for bare panels; compositors that know their
     /// framebuffer layout override and rasterise the screen.
     fn render_adoption_screen(
@@ -569,6 +751,7 @@ pub trait EpaperPanel {
         _device_id: &str,
         _ip: &str,
         _adopt_url: &str,
+        _retry_notice: Option<&str>,
     ) {
     }
     /// Paint the halt screen ("blue screen of death") into the main
@@ -577,9 +760,43 @@ pub trait EpaperPanel {
     /// why; `code` is a stable short identifier the user can look up
     /// at `paperanywhere.io/errors/<code>`.
     fn render_halt_screen(&mut self, _headline: &str, _detail: &str, _code: &str) {}
-    /// Append `bytes` to the panel's frame RAM at the current cursor. Chunk
-    /// boundaries don't need to align to any pixel structure.
-    fn write_chunk(&mut self, bytes: &[u8]);
+
+    /// Paint the OTA-progress view (live "Updating firmware..." screen
+    /// with a progress bar + status line). Called by the runtime
+    /// whenever the shared OTA progress signal changes. Implementors
+    /// should mark the next refresh as a full-LUT pass on the first
+    /// non-Idle phase so the view replaces the prior content cleanly,
+    /// and use fast-refresh on subsequent updates (progress-bar ticks)
+    /// to keep iteration cost low. Default no-op for bare panels.
+    fn render_ota_progress(&mut self, _phase: OtaPhase) {}
+    /// Reset the panel's frame-write cursor back to position 0 so the
+    /// next [`write_chunk`] sequence overwrites the previous frame
+    /// instead of appending past it. Default no-op for panels that
+    /// don't have a separate write cursor; UC8179 implementations
+    /// re-issue CMD_DTM2 here so the next write starts at the top of
+    /// the panel's frame RAM.
+    ///
+    /// MUST be called before every full frame write (typically once
+    /// per refresh). The compositor calls it from its own refresh path
+    /// so callers using a bare panel don't need to remember.
+    ///
+    /// Async — the UC8179 impl issues a 1-byte SPI command (CMD_DTM2)
+    /// whose write yields to the executor. Default returns a ready
+    /// future so bare panels that don't need a cursor reset cost
+    /// nothing.
+    fn begin_frame(&mut self) -> impl core::future::Future<Output = ()> {
+        core::future::ready(())
+    }
+    /// Append `bytes` to the panel's frame RAM at the current cursor.
+    /// Chunk boundaries don't need to align to any pixel structure.
+    ///
+    /// Async — yields to the embassy executor during each SPI burst so
+    /// embassy-net's WiFi-RX poll keeps running. The previous sync
+    /// signature meant a 48 KB framebuffer flush held the CPU for
+    /// ~38 ms with no yields, long enough for the gateway to ARP-evict
+    /// our DHCP lease (the "panel render → 'Destination host
+    /// unreachable' stream" symptom). Task #90.
+    fn write_chunk(&mut self, bytes: &[u8]) -> impl core::future::Future<Output = ()>;
     /// Stage the final composed surface ahead of [`refresh`]. Lets
     /// layered drivers (the compositor) paint chrome on top of the
     /// runtime-streamed main-region bytes — so [`pending_hash`] and
@@ -601,15 +818,30 @@ pub trait EpaperPanel {
     /// Commit the buffer to the panel surface and reset the cursor to 0 so
     /// the next image starts from the top. On a real panel this is the slow
     /// e-ink refresh; on the sim it triggers an egui repaint.
-    fn refresh(&mut self);
+    ///
+    /// MUST be async — the UC8179 driver polls a BUSY pin for ~3 s during
+    /// the full-LUT refresh, and a sync implementation that hard-spins on
+    /// that pin starves the embassy executor (no embassy-net polling, no
+    /// ICMP — everything else on the chip freezes for the full refresh
+    /// window). The impl yields between polls so other tasks keep
+    /// getting scheduled.
+    ///
+    /// Future does NOT need to be `Send` — embassy's single-threaded
+    /// executor on the chip never moves a future between threads, and
+    /// the sim is also single-task. Adding `+ Send` would force every
+    /// compositor field to be `Send` for no real benefit.
+    fn refresh(&mut self) -> impl core::future::Future<Output = ()>;
     /// Fast refresh using the panel's partial-LUT mode where available.
     /// Typically ~750 ms on UC8179 boards versus ~3 s for a full refresh,
     /// with the trade-off of slight ghosting that accumulates over
     /// successive partial refreshes (callers usually intersperse a full
     /// refresh every N updates to clear the residual). Default falls
     /// back to [`refresh`] for panels without a partial-LUT path.
-    fn refresh_fast(&mut self) {
-        self.refresh();
+    ///
+    /// Same async contract as [`refresh`] — the BUSY-pin wait must yield
+    /// to the executor between polls.
+    fn refresh_fast(&mut self) -> impl core::future::Future<Output = ()> {
+        self.refresh()
     }
 }
 
@@ -638,12 +870,105 @@ pub trait FirmwareUpdater {
 /// resets the chip — `sleep_for` "returns" because the function body type-
 /// checks via the `-> !` `deep_sleep_for` call, but in practice control never
 /// reaches the caller). The sim impl just `thread::sleep`s.
+/// Status of an in-progress OTA firmware update. Surfaced from the
+/// OTA install path (backend-driven update or future GitHub-releases
+/// fetcher) to the runtime, which renders the matching panel view.
+///
+/// Variants are ordered chronologically — `Idle → Receiving →
+/// Verifying → Applying → (chip resets)`. `Failed` is terminal for
+/// the current attempt; the device stays on the failed-view until the
+/// next reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtaPhase {
+    /// No OTA in progress. Runtime renders normal views (boot / image / adoption).
+    Idle,
+    /// Bytes streaming in. Bar fills proportionally.
+    Receiving { bytes_received: u32, total_bytes: u32 },
+    /// All bytes received; verifying the sha256 hash.
+    Verifying,
+    /// Hash matched; swapping OTA slots + marking the new image active.
+    Applying,
+    /// Terminal error during the attempt. `code` is the short PA-OTA-NNN
+    /// identifier that maps to a user-readable description on the docs site;
+    /// `message` is a short one-liner shown directly on the panel.
+    Failed { code: &'static str, message: &'static str },
+}
+
+impl OtaPhase {
+    /// Convenience for the compositor: returns a 0..=100 progress percent.
+    /// Receiving uses real progress; Verifying = 95, Applying = 99,
+    /// other terminal states = 100. Avoids the panel rendering a
+    /// 100%-full bar while the chip is still verifying.
+    pub fn percent(&self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Receiving { bytes_received, total_bytes } => {
+                if *total_bytes == 0 {
+                    0
+                } else {
+                    let scaled =
+                        (u64::from(*bytes_received) * 90 / u64::from(*total_bytes)) as u8;
+                    scaled.min(90)
+                }
+            }
+            Self::Verifying => 95,
+            Self::Applying => 99,
+            Self::Failed { .. } => 100,
+        }
+    }
+
+    /// Short status line shown under the progress bar. Caller-supplied
+    /// buffer because we're no_std + want stack-only formatting; pass a
+    /// 64-byte `heapless::String<64>` and the function fills it.
+    ///
+    /// Numeric values are zero-padded to a fixed width so the panel
+    /// doesn't reflow text between updates — e.g. "Receiving   42
+    /// /  938 KB" → "Receiving  421 /  938 KB" → "Receiving  938 /
+    /// 938 KB". Without this, every tick visibly shifts the line
+    /// (centered alignment + changing string length).
+    pub fn write_status(self, dst: &mut HString<64>) {
+        dst.clear();
+        match self {
+            Self::Idle => {
+                let _ = dst.push_str("Idle");
+            }
+            Self::Receiving { bytes_received, total_bytes } => {
+                let kb_recv = bytes_received / 1024;
+                let kb_total = total_bytes / 1024;
+                let _ = core::fmt::write(
+                    dst,
+                    format_args!("Receiving {:>5} / {:>5} KB", kb_recv, kb_total),
+                );
+            }
+            Self::Verifying => {
+                let _ = dst.push_str("Verifying sha256...");
+            }
+            Self::Applying => {
+                let _ = dst.push_str("Applying — swapping slots...");
+            }
+            Self::Failed { code, message } => {
+                let _ = core::fmt::write(dst, format_args!("Failed [{}]: {}", code, message));
+            }
+        }
+    }
+}
+
 pub trait Sleeper {
     /// Sleep `seconds` honoring `policy`. For [`PowerPolicy::ScheduledWake`]
     /// this is the chip's deep-sleep + RTC wake on real hardware; for
-    /// [`PowerPolicy::AlwaysOn`] it's a light modem sleep that keeps the radio
-    /// reachable. The sim is the same `thread::sleep` for both.
-    fn sleep_for(&mut self, seconds: u32, policy: PowerPolicy);
+    /// [`PowerPolicy::AlwaysOn`] it's an `embassy_time::Timer` that yields
+    /// to the executor (so other tasks like the network stack and panel
+    /// actor keep getting polled while the wake loop is between
+    /// iterations). The sim awaits a `tokio::time::sleep`.
+    ///
+    /// MUST be async — a busy-spin sync implementation would starve every
+    /// other embassy task on the chip (embassy-net polling, panel actor,
+    /// etc.) for the entire sleep window.
+    fn sleep_for(
+        &mut self,
+        seconds: u32,
+        policy: PowerPolicy,
+    ) -> impl core::future::Future<Output = ()>;
     fn unix_now(&self) -> u64;
     fn battery_mv(&self) -> Option<u16>;
 }

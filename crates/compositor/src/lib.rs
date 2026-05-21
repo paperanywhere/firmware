@@ -22,6 +22,29 @@
 //! (Color7) scale by 4× since they pack 2 pixels per byte at most.
 //! On ESP32-S3 with 8 MB PSRAM this is comfortably below the budget.
 //!
+//! ## Full-LUT vs fast-LUT refresh policy
+//!
+//! `force_full_next_refresh = true` must ONLY be set when the panel's
+//! view *context* changes — boot → adoption, adoption → image, *
+//! → halt, Idle → OTA-progress, etc. Updates *within* a view (e.g.
+//! refreshing the boot-screen IP overlay once DHCP completes, ticking
+//! the OTA progress bar mid-upload, updating a status-bar widget) use
+//! the default fast LUT. Periodic `FULL_REFRESH_EVERY` (= 8) cycles
+//! in [`Compositor::refresh`] clear accumulated ghosting from the
+//! fast-LUT runs.
+//!
+//! Rationale: full LUT is ~3 s and visibly flashes the panel; fast
+//! LUT is ~750 ms and incremental. Using full for every render is
+//! wasteful AND visually ugly. The full-LUT-only-on-view-change
+//! discipline keeps the user experience clean while letting the fast
+//! path service the high-frequency in-view updates cheaply.
+//!
+//! Per-renderer policy is documented in memory (see
+//! `project_compositor_full_lut_rule`). If you add a new view, follow
+//! the same pattern: force full inside the `render_*` method, set the
+//! state field that mirrors `last_ota_phase` for the OtaProgress
+//! within-view case if applicable.
+//!
 //! ## Status-bar overdraw vs partial refresh
 //!
 //! Today we re-flush the whole panel on every refresh — even a battery-
@@ -37,14 +60,15 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use paperanywhere_ports::{ColorMode, EpaperPanel};
+use paperanywhere_ports::{ColorMode, EpaperPanel, OtaPhase};
 
 pub mod adoption_screen;
+pub mod ota_progress;
 pub mod halt_screen;
 pub mod icons;
 pub mod status_bar;
 
-pub use status_bar::StatusInputs;
+// StatusInputs is gone — state lives in paperanywhere_ports::chrome.
 
 /// Default reserved height for the status bar in pixels. 32 rows is
 /// enough for a 16 px monospace font + 4 px top/bottom padding, and
@@ -71,10 +95,10 @@ pub struct Compositor<P: EpaperPanel> {
     /// `write_chunk` calls. Reset on `refresh()` so the next image
     /// stream starts at the top of the main region.
     main_cursor: usize,
-    /// Current status-bar inputs. Set by the runtime via
-    /// [`Compositor::update_status`]; rendered into the top region
-    /// during `refresh()`.
-    status: StatusInputs,
+    // Status-bar state has moved to the global
+    // `paperanywhere_ports::chrome` KV. Renderers snapshot it during
+    // refresh; setter trait methods on this struct forward to the
+    // global. No per-field plumbing through the compositor anymore.
     /// Cached boot screen + build info. Set once at boot.rs time via
     /// [`Compositor::cache_boot_template`]; consumed by
     /// [`EpaperPanel::redraw_boot_screen`] when the runtime wants to
@@ -84,6 +108,18 @@ pub struct Compositor<P: EpaperPanel> {
     /// Number of refreshes since the last full-LUT refresh. Used to
     /// promote every Nth refresh to full (clears partial-LUT ghosting).
     refresh_count: u32,
+    /// Set when the framebuffer has been repainted with a whole new
+    /// "view" (boot screen, adoption screen, halt screen) — the next
+    /// refresh must use the full LUT to clear ghosting from whatever
+    /// the panel was previously showing. Cleared by [`Self::refresh`].
+    force_full_next_refresh: bool,
+    /// Tracks the most recent OTA phase so we only force a full
+    /// refresh on the transition INTO the OTA view, not on every
+    /// progress-bar tick. Without this, the compositor would burn a
+    /// 3 s full-LUT refresh on each progress update (~10× per push
+    /// at 64 KB granularity), making the view feel choppy and the
+    /// total push wall-clock balloon.
+    last_ota_phase: OtaPhase,
 }
 
 #[derive(Debug, Clone)]
@@ -95,9 +131,21 @@ struct BootTemplate {
 /// Refreshes per full-LUT cycle. Partial refreshes are fast (~750 ms
 /// on UC8179) but ghost slightly; one full refresh every
 /// `FULL_REFRESH_EVERY` partials clears the residual back to a clean
-/// surface. 8 is a conservative ratio — Waveshare's reference driver
-/// recommends 5-ish for visually demanding content.
-const FULL_REFRESH_EVERY: u32 = 8;
+/// surface.
+///
+/// Was 8 originally — Waveshare's reference recommends 5-ish for
+/// visually demanding content. Bumped to 32 because at 8 the scheduled
+/// full refresh consistently landed mid-boot-countdown (refresh #8 =
+/// countdown tick "6" on a 10-second hold), producing a ~3 s stall
+/// that backed up the paint channel and made the remaining ticks
+/// appear to "fly through" once the actor caught up. 32 places the
+/// next forced full pass well past any sequence we issue back-to-back
+/// during boot — the user-perceptible ghosting accumulation over
+/// 32 fast refreshes is acceptable for the boot path, which clears
+/// to a fresh adoption / image view shortly after anyway (and those
+/// views force-full on entry per the view-transition rule, also
+/// clearing accumulated ghost).
+const FULL_REFRESH_EVERY: u32 = 32;
 
 impl<P: EpaperPanel> Compositor<P> {
     /// Build a compositor wrapping `panel`. `width_px` × `height_px`
@@ -127,9 +175,15 @@ impl<P: EpaperPanel> Compositor<P> {
             color_mode,
             framebuffer,
             main_cursor: main_region_offset(width_px, status_bar_height, color_mode),
-            status: StatusInputs::default(),
             boot_template: None,
             refresh_count: 0,
+            // First refresh after construction is always full — the
+            // panel was either freshly powered on (random ghost from
+            // factory) or just left over from the previous boot in an
+            // unknown state. A fast refresh on top of that would smear
+            // the previous content into the boot screen.
+            force_full_next_refresh: true,
+            last_ota_phase: OtaPhase::Idle,
         }
     }
 
@@ -156,12 +210,6 @@ impl<P: EpaperPanel> Compositor<P> {
         self.height_px.saturating_sub(self.status_bar_height)
     }
 
-    /// Replace the in-memory status-bar state. Doesn't paint the panel —
-    /// the next [`EpaperPanel::refresh`] call rasterises and flushes.
-    pub fn update_status(&mut self, status: StatusInputs) {
-        self.status = status;
-    }
-
     /// Direct access to the main-region byte range, used by code paths
     /// that want to draw with embedded-graphics on top of the streamed
     /// image (e.g. the firmware-version overlay on the boot screen).
@@ -183,51 +231,66 @@ impl<P: EpaperPanel> Compositor<P> {
 }
 
 impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
+    // All chrome-state setters forward to the global KV in
+    // `paperanywhere_ports::chrome`. The compositor no longer owns a
+    // copy of the state — renderers snapshot the global directly at
+    // refresh time. Producers can either keep calling these trait
+    // methods (legacy path) or call `chrome::set_*(...)` directly to
+    // skip the panel-actor channel entirely.
     fn set_chrome(&mut self, battery_mv: Option<u16>, wifi_rssi_dbm: Option<i16>) {
-        // Preserve everything else (usb, device id, last update) — this
-        // call only refreshes the two right-side widgets.
-        self.status.battery_mv = battery_mv;
-        self.status.wifi_rssi_dbm = wifi_rssi_dbm;
+        paperanywhere_ports::chrome::set_battery_mv(battery_mv);
+        paperanywhere_ports::chrome::set_rssi_dbm(wifi_rssi_dbm);
     }
-
     fn on_wifi_state_changed(&mut self, rssi_dbm: Option<i16>) {
-        self.status.wifi_rssi_dbm = rssi_dbm;
-        // Note: doesn't itself flush. When fast-refresh LUTs (firmware
-        // repo task #57) land we can call into a "status-bar-only"
-        // partial-refresh path here.
+        paperanywhere_ports::chrome::set_rssi_dbm(rssi_dbm);
     }
-
     fn on_battery_sample(&mut self, mv: Option<u16>) {
-        self.status.battery_mv = mv;
+        paperanywhere_ports::chrome::set_battery_mv(mv);
     }
-
     fn on_usb_state_changed(&mut self, connected: Option<bool>) {
-        self.status.usb_connected = connected;
+        paperanywhere_ports::chrome::set_usb_connected(connected);
     }
-
     fn set_device_id(&mut self, id: &str) {
-        let mut s: heapless::String<24> = heapless::String::new();
-        let _ = s.push_str(id);
-        self.status.device_id = Some(s);
+        paperanywhere_ports::chrome::set_device_id(Some(id));
     }
-
     fn set_last_update(&mut self, local_time: &str) {
-        let mut s: heapless::String<24> = heapless::String::new();
-        let _ = s.push_str(local_time);
-        self.status.last_update_local = Some(s);
+        paperanywhere_ports::chrome::set_last_update(Some(local_time));
     }
-
     fn set_ip(&mut self, ip: &str) {
-        let mut s: heapless::String<24> = heapless::String::new();
-        let _ = s.push_str(ip);
-        self.status.ip_address = Some(s);
+        paperanywhere_ports::chrome::set_ip(Some(ip));
+    }
+    fn set_status(&mut self, status: paperanywhere_ports::DeviceStatus) {
+        paperanywhere_ports::chrome::set_device_status(status);
+    }
+    fn set_boot_countdown(&mut self, seconds: Option<u8>) {
+        paperanywhere_ports::chrome::set_boot_countdown_secs(seconds);
+    }
+    fn set_gateway(&mut self, ip: Option<&str>) {
+        paperanywhere_ports::chrome::set_gateway(ip);
+    }
+    fn set_backend_url(&mut self, url: Option<&str>) {
+        paperanywhere_ports::chrome::set_backend_url(url);
+    }
+    fn set_wifi_link_state(&mut self, state: paperanywhere_ports::WifiLinkState) {
+        paperanywhere_ports::chrome::set_wifi_link_state(state);
+    }
+    fn set_ssid(&mut self, ssid: Option<&str>) {
+        paperanywhere_ports::chrome::set_ssid(ssid);
+    }
+    fn set_device_uuid(&mut self, uuid: Option<&str>) {
+        paperanywhere_ports::chrome::set_device_uuid(uuid);
+    }
+    fn set_device_name(&mut self, name: Option<&str>) {
+        paperanywhere_ports::chrome::set_device_name(name);
     }
 
-    fn set_status(&mut self, status: paperanywhere_ports::DeviceStatus) {
-        self.status.device_status = status;
+    fn force_full_next_refresh(&mut self) {
+        self.force_full_next_refresh = true;
     }
 
     fn render_halt_screen(&mut self, headline: &str, detail: &str, code: &str) {
+        // View transition — clear ghosting with a full refresh.
+        self.force_full_next_refresh = true;
         for b in self.framebuffer.iter_mut() {
             *b = 0xFF;
         }
@@ -252,7 +315,23 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
         device_id: &str,
         ip: &str,
         adopt_url: &str,
+        retry_notice: Option<&str>,
     ) {
+        // NOTE: empirically the full-LUT here (~3 s of wait_idle_async
+        // polling) still pushes the AP past its STA inactivity threshold
+        // on some networks even with the task #90 yield_now in
+        // write_chunk — the cumulative refresh time across boot →
+        // countdown → adoption (1 full + 10 fast + 1 full ≈ 13 LUT
+        // cycles) drops the device off the network and `wifi.associate`'s
+        // short-circuit then refuses to re-handshake. Keeping adoption
+        // at fast LUT (~750 ms) until we have a more robust mitigation
+        // (e.g. periodic gratuitous ARP, or recoverable re-associate
+        // when ICMP unreachable bursts arrive). Per the style guide
+        // this is a violation of the "view-transition = full LUT" rule;
+        // accepted as a temporary trade-off — see TODO above re. fix.
+        // Some ghosting from the prior boot screen may bleed through
+        // the first adoption render; the periodic FULL_REFRESH_EVERY
+        // cycle in compositor::refresh clears it eventually.
         // Reset the framebuffer to all-white before painting the
         // adoption screen. The status-bar region gets re-rendered in
         // the usual compose() / refresh() flow afterward.
@@ -278,13 +357,64 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
             device_id,
             ip,
             adopt_url,
+            retry_notice,
         );
+    }
+
+    fn render_ota_progress(&mut self, phase: OtaPhase) {
+        // First non-Idle phase after Idle (or after another view) is a
+        // view transition — force a full LUT so the prior content is
+        // properly cleared. Subsequent ticks (progress bar updates
+        // mid-upload) use the fast LUT so the bar can tick frequently
+        // without burning ~3 s per update on a full refresh. The
+        // earlier "bar leftmost portion doesn't fill" bug that drove
+        // us to always-full is now fixed by `begin_frame()` resetting
+        // the DTM2 cursor — the partial LUT can correctly drive the
+        // diff from one frame to the next.
+        let was_idle = matches!(self.last_ota_phase, OtaPhase::Idle);
+        let transitioning = was_idle && !matches!(phase, OtaPhase::Idle);
+        if transitioning {
+            self.force_full_next_refresh = true;
+        }
+        self.last_ota_phase = phase;
+
+        // Reset framebuffer to white. The status-bar region gets
+        // recomposed on top in compose() / refresh().
+        for b in self.framebuffer.iter_mut() {
+            *b = 0xFF;
+        }
+        self.main_cursor =
+            main_region_offset(self.width_px, self.status_bar_height, self.color_mode);
+
+        let width_px = self.width_px;
+        let height_px = self.main_height_px();
+        let color_mode = self.color_mode;
+        let offset = main_region_offset(width_px, self.status_bar_height, color_mode);
+        let mut region = MainRegion {
+            bytes: &mut self.framebuffer[offset..],
+            width_px,
+            height_px,
+            color_mode,
+        };
+        crate::ota_progress::draw_ota_progress(&mut region, phase);
     }
 
     fn redraw_boot_screen(&mut self) {
         let Some(tpl) = self.boot_template.clone() else {
             return;
         };
+        // NOT a view transition — same boot template, just updated
+        // build-info overlay (IP went from "connecting..." to the
+        // real DHCP-assigned address, eventually wall-clock time
+        // once NTP lands per task #78). Let the next refresh take
+        // the fast-LUT path: most pixels are identical to what's
+        // already on the panel, so the partial waveform handles the
+        // delta cheaply. The scheduled FULL_REFRESH_EVERY cycle in
+        // `refresh()` still clears accumulated ghosting on a regular
+        // cadence. If a future caller uses redraw_boot_screen for an
+        // actual view change (e.g. image → boot splash transition),
+        // they should set `force_full_next_refresh = true` themselves
+        // before triggering the refresh.
         // Reset framebuffer to white, then blit the cached boot screen
         // into the main region.
         for b in self.framebuffer.iter_mut() {
@@ -299,27 +429,15 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
 
         // Paint the build-info overlay onto the main region. The
         // values need to outlive the mutable borrow on `framebuffer`,
-        // so snapshot them by clone first. IP state defaults to
-        // "connecting..." when nothing has been pushed yet — runtime
-        // overrides via `set_ip` once DHCP completes (or fails).
-        let ip_copy: heapless::String<24> = self
-            .status
-            .ip_address
-            .clone()
-            .unwrap_or_else(|| {
-                let mut s: heapless::String<24> = heapless::String::new();
-                let _ = s.push_str("connecting...");
-                s
-            });
-        let device_id_copy: heapless::String<24> = self
-            .status
-            .device_id
-            .clone()
-            .unwrap_or_else(|| {
-                let mut s: heapless::String<24> = heapless::String::new();
-                let _ = s.push_str("unassigned");
-                s
-            });
+        // so snapshot them by clone first. IP is now an Option —
+        // draw_build_info renders "--" when None rather than the old
+        // "connecting..." placeholder, since the IP field is strictly
+        // an *address* readout (the WiFi field carries the link-state
+        // signalling instead).
+        // All chrome values come from the global state via
+        // draw_build_info's internal snapshot. No more per-field
+        // copying from self.status — that's gone, single source of
+        // truth lives in `paperanywhere_ports::chrome`.
         let width_px = self.width_px;
         let height_px = self.main_height_px();
         let color_mode = self.color_mode;
@@ -330,27 +448,31 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
             height_px,
             color_mode,
         };
-        crate::status_bar::draw_build_info(
-            &mut region,
-            &tpl.info,
-            device_id_copy.as_str(),
-            ip_copy.as_str(),
-        );
+        crate::status_bar::draw_build_info(&mut region, &tpl.info);
     }
 
-    fn init(&mut self) {
-        self.panel.init();
-        // Reset the framebuffer to "all white" (0xFF in the rasterizer's
-        // bit-set = white convention), not 0x00 — see `Compositor::new`
-        // for the polarity rationale.
-        for byte in self.framebuffer.iter_mut() {
-            *byte = 0xFF;
-        }
-        self.main_cursor =
-            main_region_offset(self.width_px, self.status_bar_height, self.color_mode);
+    async fn init(&mut self) {
+        // Delegate to the bare panel's controller init (UC8179 boot
+        // sequence). DO NOT clear the framebuffer here — callers may
+        // have already staged content into it (e.g. boot.rs writes
+        // the boot-screen bytes + build-info overlay into the
+        // compositor framebuffer *before* the executor starts, then
+        // the panel-actor task's init runs once the executor is
+        // alive). Clearing on init would erase that pre-staged
+        // content. Compositor::new already initialises the
+        // framebuffer to 0xFF (all white) at construction, so init()
+        // doesn't need to do it again — a second call to init()
+        // would now leave the previous frame intact, which is also
+        // the desired behaviour for any future "soft reinit" path.
+        self.panel.init().await;
     }
 
-    fn write_chunk(&mut self, bytes: &[u8]) {
+    // Compositor's `write_chunk` just stages bytes into its own
+    // framebuffer (no SPI; that happens at refresh time). The trait
+    // signature is now async to match the bare panel impl, but
+    // there's nothing to await here — we use `core::future::ready`
+    // so the call resolves on first poll without scheduling overhead.
+    fn write_chunk(&mut self, bytes: &[u8]) -> impl core::future::Future<Output = ()> {
         let cap = self.framebuffer.len();
         let end = (self.main_cursor + bytes.len()).min(cap);
         let take = end - self.main_cursor;
@@ -362,14 +484,14 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
                 bytes.len() - take
             );
         }
+        core::future::ready(())
     }
 
     fn compose(&mut self) {
         // Paint the status bar into the top region of the framebuffer.
-        // After this returns, the framebuffer holds exactly the bytes
-        // that would be sent to the panel — perfect for hashing.
+        // status_bar::render snapshots chrome state internally — single
+        // source of truth, no per-field plumbing through self.
         status_bar::render(
-            &self.status,
             &mut self.framebuffer,
             self.width_px,
             self.status_bar_height,
@@ -384,38 +506,59 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
         Some(paperanywhere_ports::hash_bytes(&self.framebuffer))
     }
 
-    fn refresh(&mut self) {
+    async fn refresh(&mut self) {
         self.refresh_count = self.refresh_count.wrapping_add(1);
-        let full = self.refresh_count.is_multiple_of(FULL_REFRESH_EVERY);
+        let scheduled_full = self.refresh_count.is_multiple_of(FULL_REFRESH_EVERY);
+        let forced_full = self.force_full_next_refresh;
+        let full = scheduled_full || forced_full;
         log::info!(
-            "compositor::refresh #{} ({} LUT) — flushing {} bytes",
+            "compositor::refresh #{} ({} LUT, forced={}) — flushing {} bytes",
             self.refresh_count,
             if full { "FULL" } else { "fast" },
+            forced_full,
             self.framebuffer.len()
         );
-        self.panel.init();
-        self.panel.write_chunk(&self.framebuffer);
+        // begin_frame resets the panel's frame-RAM write cursor to 0
+        // (UC8179: re-issues CMD_DTM2). Without it, write_chunk would
+        // append past the previous refresh's data, garbling the
+        // displayed frame. This replaces the old `self.panel.init()`
+        // call (which did the same thing as a side effect of running
+        // the full boot sequence, but cost ~300 ms hard_reset every
+        // refresh AND clobbered partial-LUT state we need for fast
+        // refresh).
+        self.panel.begin_frame().await;
+        self.panel.write_chunk(&self.framebuffer).await;
         if full {
-            self.panel.refresh();
+            self.panel.refresh().await;
         } else {
-            self.panel.refresh_fast();
+            self.panel.refresh_fast().await;
         }
+        self.force_full_next_refresh = false;
         self.main_cursor =
             main_region_offset(self.width_px, self.status_bar_height, self.color_mode);
     }
 
-    fn refresh_fast(&mut self) {
+    async fn refresh_fast(&mut self) {
         log::info!(
             "compositor::refresh_fast — flushing {} bytes",
             self.framebuffer.len()
         );
-        self.panel.init();
-        self.panel.write_chunk(&self.framebuffer);
-        self.panel.refresh_fast();
+        self.panel.begin_frame().await;
+        self.panel.write_chunk(&self.framebuffer).await;
+        self.panel.refresh_fast().await;
         self.main_cursor =
             main_region_offset(self.width_px, self.status_bar_height, self.color_mode);
     }
 }
+
+// `flush_with_yields` helper removed: chunking the framebuffer flush
+// into 2 KB pieces with `yield_now` between each prevented the panel
+// from displaying the adoption screen — boot screen stayed indefinitely
+// even though /info responded, suggesting one of the intermediate
+// write_chunk calls interacts badly with the UC8179's CMD_DTM2 cursor
+// when paused mid-frame. The async-SPI + DMA path (task #90) is the
+// proper route — it'll yield via the await on each SPI transfer
+// without splitting the data plane.
 
 /// Mutable handle into the main region of the framebuffer. Lets a caller
 /// draw with embedded-graphics on top of whatever's already there.
@@ -471,24 +614,47 @@ pub fn battery_mv_to_percent(mv: u16) -> u8 {
 pub struct BuildInfo {
     /// e.g. `0.1.0+a1b2c3d4`
     pub fw_version: &'static str,
-    /// e.g. `2026-05-20 22:13 UTC`
+    /// e.g. `2026-05-20 22:13 UTC`. Kept on the struct (logged on
+    /// boot, surfaced via /info) even though the 3-column boot-screen
+    /// layout no longer reserves a row for it.
     pub build_time: &'static str,
     /// `true` when the device was flashed via `provtool --dev`. The
     /// boot screen tags the version line with " (DEV)" so it's
     /// visually obvious the firmware is on the dev channel.
     pub is_dev: bool,
+    /// Git branch the firmware was built from (e.g. `main`, `feat/x`).
+    /// Populated by build.rs from `git rev-parse --abbrev-ref HEAD`;
+    /// falls back to `unknown` when the build runs outside a git
+    /// worktree (e.g. CI build from a tarball).
+    pub branch: &'static str,
+    /// Hardware manufacturer (e.g. "Seeed Studio") — sourced from the
+    /// firmware-internal BoardConfig.manufacturer field. Displayed on
+    /// the boot-screen Device column as the "Maker" key.
+    pub manufacturer: &'static str,
+    /// Specific model identifier (e.g. "reTerminal E1001"). Sibling
+    /// to `manufacturer` — the two together reproduce the legacy
+    /// combined-name display.
+    pub device_model: &'static str,
 }
 
 impl BuildInfo {
     /// Render the boot-screen `Key: Value` overlay (Build /
-    /// Environment / Build Date / IP / Device UUID) onto the bottom-
-    /// center of the passed main-region framebuffer. Called by
-    /// `boot.rs` after the boot-screen logo has been blitted; before
+    /// Environment / Build Date / IP / Device UUID + countdown) onto
+    /// the bottom-center of the passed main-region framebuffer. Called
+    /// by `boot.rs` after the boot-screen logo has been blitted; before
     /// the panel flush. `ip` is a state string (e.g. `"connecting..."`,
     /// `"10.0.1.42"`); `device_uuid` defaults to MAC-suffix today and
     /// will be backend-issued once the register endpoint lands.
-    pub fn render_into(&self, region: &mut MainRegion<'_>, device_uuid: &str, ip: &str) {
-        crate::status_bar::draw_build_info(region, self, device_uuid, ip);
+    /// `countdown_secs` populates the bottom line — `Some(n)` shows
+    /// "Transitioning in N seconds…", `None` leaves the line blank
+    /// (the layout always reserves the row regardless so adding /
+    /// removing the countdown doesn't shift the rest of the block).
+    /// Paint the boot-screen overlay into `region`. All chrome values
+    /// (UUID, name, IP, WiFi state, SSID, gateway, backend, countdown)
+    /// are read from the global `paperanywhere_ports::chrome` state at
+    /// render time — set them via `chrome::set_X(...)` before calling.
+    pub fn render_into(&self, region: &mut MainRegion<'_>) {
+        crate::status_bar::draw_build_info(region, self);
     }
 }
 

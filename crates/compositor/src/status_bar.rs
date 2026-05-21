@@ -17,7 +17,7 @@ use embedded_graphics::{
     geometry::{Point, Size},
     mono_font::{
         MonoTextStyle,
-        ascii::{FONT_6X10, FONT_8X13_BOLD},
+        ascii::{FONT_4X6, FONT_6X10, FONT_8X13_BOLD},
     },
     pixelcolor::BinaryColor,
     prelude::*,
@@ -32,6 +32,12 @@ use paperanywhere_ports::{ColorMode, DeviceStatus};
 /// Inputs the runtime supplies before each refresh. Owned by value
 /// inside the compositor; setters on the compositor's hook surface
 /// (`set_chrome`, `on_wifi_state_changed`, …) mutate this in place.
+// Old per-renderer state struct — kept for type-doc reference but
+// nothing reads it anymore. Renderers in this file snapshot
+// `paperanywhere_ports::chrome` directly. Remove this once we're
+// confident no external crate is importing it.
+#[deprecated(note = "use paperanywhere_ports::chrome::ChromeState")]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct StatusInputs {
     /// `None` if the firmware hasn't read a battery sample yet (e.g.
@@ -46,15 +52,47 @@ pub struct StatusInputs {
     /// `None` or `Some(false)` hides it. Stays `None` on boards without
     /// USB-CDC support — they should never set this.
     pub usb_connected: Option<bool>,
+    /// Seconds remaining on the boot-screen hold countdown, or `None`
+    /// when no countdown is active. Runtime decrements this each
+    /// second after DHCP completes and before transitioning to the
+    /// next view (adoption / image), giving the user a visible cue
+    /// that the splash is about to disappear. Rendered as the last
+    /// line of the build-info block.
+    pub boot_countdown_secs: Option<u8>,
+    /// IPv4 gateway address (e.g. `10.0.1.1`) read from embassy-net's
+    /// DHCP lease once associated. Surfaced in the boot-screen's
+    /// Network column. `None` until DHCP completes.
+    pub gateway_v4: Option<HString<24>>,
+    /// Backend URL the device polls / posts to (e.g.
+    /// `https://api.paperanywhere.io`). Pulled from prov / NVS on
+    /// boot; surfaced in the boot-screen's Firmware column so the
+    /// user can verify the device is pointed at the right env.
+    /// `None` until NVS load completes.
+    pub backend_url: Option<HString<64>>,
+    /// 3-state WiFi link status for the boot-screen Network column.
+    /// `wifi_rssi_dbm` is the binary "have signal" flag the status-bar
+    /// widgets read; this is the richer state the boot screen needs.
+    pub wifi_link_state: paperanywhere_ports::WifiLinkState,
+    /// SSID we're attempting to associate with / are associated to.
+    /// `None` when no WiFi creds in NVS yet (factory state).
+    pub ssid: Option<HString<32>>,
     /// Short device id rendered on the left side of the bar
     /// (e.g. `D-3F2A`). `None` shows a placeholder.
     pub device_id: Option<HString<24>>,
+    /// Backend-assigned UUID (36 chars). Surfaced on the boot screen
+    /// as a full-width line below the column block. `None` until the
+    /// device's first `POST /api/device/register` lands.
+    pub device_uuid: Option<HString<48>>,
+    /// User-supplied friendly name. Pre-adoption this is the backend's
+    /// auto-generated `device-XXXX`; post-adoption it's whatever the
+    /// user typed. Shown on the boot screen's DEVICE column.
+    pub device_name: Option<HString<64>>,
     /// Local-time stamp of the most recent successful render
     /// (e.g. `10:23`). `None` shows `--`.
     pub last_update_local: Option<HString<24>>,
     /// IPv4 dotted-quad string (e.g. `10.0.1.42`). Shown on the
     /// boot-screen overlay + left side of the status bar so the
-    /// developer can `pa-dev push --device <ip>` without ARP-scanning.
+    /// developer can identify the device without ARP-scanning.
     pub ip_address: Option<HString<24>>,
     /// High-level lifecycle state shown in the bar's top-left
     /// `Status: …` block. Defaults to `Booting`.
@@ -64,8 +102,13 @@ pub struct StatusInputs {
 /// Render the bar into `framebuffer` (Mono1bpp packed row-major,
 /// MSB-first). Other color modes are no-ops for now — `#71` adds
 /// rasterisers for Gray4 / Gray16 / Color7.
+///
+/// Reads chrome state via [`paperanywhere_ports::chrome::snapshot`]
+/// rather than taking it as a parameter — every renderer in this crate
+/// reads from the same global KV, so passing the state through every
+/// call site would just be redundant plumbing. Callers don't need to
+/// know which fields each renderer touches.
 pub fn render(
-    status: &StatusInputs,
     framebuffer: &mut [u8],
     width_px: u32,
     status_bar_height: u32,
@@ -74,6 +117,7 @@ pub fn render(
     if !matches!(color_mode, ColorMode::Mono1bpp) {
         return;
     }
+    let status = paperanywhere_ports::chrome::snapshot();
 
     let mut target = Mono1bppTarget::new(framebuffer, width_px, status_bar_height);
 
@@ -94,7 +138,7 @@ pub fn render(
     let inset = 1; // border eats one pixel
     let mut right = (width_px as i32) - inset - 10; // 10 px right margin (was 4 — keeps the wifi glyph + BATT label off the panel edge)
 
-    let cell_width = draw_wifi_cell(&mut target, right, status.wifi_rssi_dbm.is_some());
+    let cell_width = draw_wifi_cell(&mut target, right, status.rssi_dbm.is_some());
     let next_right = right - cell_width;
     draw_vertical_divider(&mut target, next_right, status_bar_height);
     right = next_right - 1;
@@ -112,7 +156,7 @@ pub fn render(
     }
 
     // Everything to the left of `right` is the info-text region.
-    draw_left_info(&mut target, status, inset + 6, right);
+    draw_left_info(&mut target, &status, inset + 6, right);
 }
 
 fn draw_border(target: &mut Mono1bppTarget<'_>, width_px: u32, height_px: u32) {
@@ -134,29 +178,48 @@ fn draw_vertical_divider(target: &mut Mono1bppTarget<'_>, x: i32, height_px: u32
 // ── Right-side widgets ───────────────────────────────────────────────────────
 
 fn draw_wifi_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32, connected: bool) -> i32 {
-    const PADDING: i32 = 6;
-    let icon_size = crate::icons::ICON_PX as i32;
-    let cell_width = icon_size + PADDING;
-    // Center the icon on the geometric middle of its cell. The blit
-    // routine measures the bitmap's INK bounding box and offsets the
-    // paint so the inked pixels are centered — not the bitmap edges
-    // — which matters because the Font Awesome wifi-slash glyph's
-    // visible content sits in the lower-left of its 20 px square.
-    let cell_cx = right_edge - cell_width / 2;
-    let cell_cy = (target.height as i32) / 2;
-    let bitmap = if connected {
-        crate::icons::WIFI
+    // Fixed-width network-status label, LEFT-aligned inside its cell.
+    // Two states:
+    //   - "NETWORK: Connected"    (18 chars) when associated
+    //   - "NETWORK: Disconnected" (21 chars) when not
+    //
+    // Cell width is reserved for the longer string so the cell's
+    // left edge never shifts when the state transitions. Per the
+    // style guide (see project_compositor_full_lut_rule memory),
+    // text inside the cell is left-aligned starting at a stable x;
+    // the shorter "Connected" label simply leaves blank pixels on
+    // the right — the fast LUT walks those ink → no-ink transitions
+    // cleanly without ghosting the previous render's tail.
+    const LEFT_PAD: i32 = 4;  // gap between cell-left divider and text
+    const RIGHT_PAD: i32 = 4; // gap between text-end zone and cell-right divider
+    const CHAR_PX: i32 = 6;   // FONT_6X10 advance width
+    const MAX_CHARS: i32 = 21; // "NETWORK: Disconnected"
+    let text_width = MAX_CHARS * CHAR_PX;
+    let cell_width = LEFT_PAD + text_width + RIGHT_PAD;
+
+    let label: &str = if connected {
+        "NETWORK: Connected"
     } else {
-        crate::icons::WIFI_SLASH
+        "NETWORK: Disconnected"
     };
-    blit_mono_icon_centered(
-        target,
-        bitmap,
-        crate::icons::ICON_PX,
-        crate::icons::ICON_PX,
-        cell_cx,
-        cell_cy,
-    );
+    let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+    let left_aligned = TextStyleBuilder::new()
+        .alignment(Alignment::Left)
+        .baseline(Baseline::Middle)
+        .build();
+    let baseline_y = (target.height as i32) / 2;
+    // Cell occupies (right_edge - cell_width .. right_edge). Text
+    // starts LEFT_PAD pixels into the cell from its left edge.
+    let cell_left = right_edge - cell_width;
+    let text_x = cell_left + LEFT_PAD;
+    let _ = Text::with_text_style(
+        label,
+        Point::new(text_x, baseline_y),
+        style,
+        left_aligned,
+    )
+    .draw(target);
+
     cell_width
 }
 
@@ -246,46 +309,61 @@ fn blit_mono_icon(
 }
 
 fn draw_battery_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32, mv: Option<u16>) -> i32 {
-    // Text-only label: "87% BATT" right-aligned to the cell edge.
-    // No glyph at all — the cell border + the all-caps "BATT" suffix
-    // are enough to identify the field without a battery icon.
-    const PADDING: i32 = 6;
-    // Inset so the last character isn't kissing the divider on its
-    // right. embedded-graphics right-alignment puts the text's last
-    // pixel at the given x; we offset 4 px inward to leave breathing
-    // room between the "T" of BATT and the cell boundary.
-    const TEXT_RIGHT_INSET: i32 = 4;
-    let baseline = (target.height as i32) / 2 + 4;
-    let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
-    let right_aligned = TextStyleBuilder::new()
-        .alignment(Alignment::Right)
-        .baseline(Baseline::Bottom)
-        .build();
+    // Fixed-width battery-percent label, LEFT-aligned inside its cell.
+    // Format: "BATTERY: NNN%" where NNN is always 3 chars wide (right-
+    // padded with spaces, or "--" when no sample). Layout never shifts
+    // when the percentage changes — only the digit pixels transition
+    // (e.g. "  87%" → "  86%"), which the fast LUT walks cleanly. See
+    // project_compositor_full_lut_rule memory.
+    const LEFT_PAD: i32 = 4;
+    const RIGHT_PAD: i32 = 4;
+    const CHAR_PX: i32 = 6;
+    const MAX_CHARS: i32 = 13; // "BATTERY: 100%"
+    let text_width = MAX_CHARS * CHAR_PX;
+    let cell_width = LEFT_PAD + text_width + RIGHT_PAD;
 
+    // Build the fixed-width text. The 3-char percent field is right-
+    // aligned within itself so 100% is "100", 87% is " 87", 5% is "  5",
+    // and "no reading" is " --". The string length is 13 chars in every
+    // case — guarantees the trailing "%" lands at the same pixel column
+    // regardless of magnitude.
     let mut text: HString<16> = HString::new();
+    let _ = text.push_str("BATTERY: ");
     match mv {
         Some(mv) => {
             let pct = battery_mv_to_percent(mv);
+            // Right-align pct into a 3-char field with leading spaces.
             let mut buf = [0u8; 5];
             let pct_str = u8_to_str(pct, &mut buf);
+            for _ in 0..(3 - pct_str.len() as i32).max(0) {
+                let _ = text.push(' ');
+            }
             let _ = text.push_str(pct_str);
-            let _ = text.push_str(" BATT");
         }
         None => {
-            let _ = text.push_str("-- BATT");
+            // " --" — 3 chars matching the digit field.
+            let _ = text.push_str(" --");
         }
     }
+    let _ = text.push('%');
 
+    let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+    let left_aligned = TextStyleBuilder::new()
+        .alignment(Alignment::Left)
+        .baseline(Baseline::Middle)
+        .build();
+    let baseline_y = (target.height as i32) / 2;
+    let cell_left = right_edge - cell_width;
+    let text_x = cell_left + LEFT_PAD;
     let _ = Text::with_text_style(
         text.as_str(),
-        Point::new(right_edge - TEXT_RIGHT_INSET, baseline),
+        Point::new(text_x, baseline_y),
         style,
-        right_aligned,
+        left_aligned,
     )
     .draw(target);
 
-    // 9 chars max ("100% BATT") × 6 px per char + inset + padding.
-    (text.len() as i32) * 6 + TEXT_RIGHT_INSET + PADDING
+    cell_width
 }
 
 fn draw_usb_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32) -> i32 {
@@ -318,7 +396,7 @@ fn draw_usb_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32) -> i32 {
 
 fn draw_left_info(
     target: &mut Mono1bppTarget<'_>,
-    status: &StatusInputs,
+    status: &paperanywhere_ports::chrome::ChromeState,
     left_x: i32,
     right_limit: i32,
 ) {
@@ -386,48 +464,220 @@ fn draw_left_info(
 pub fn draw_build_info(
     region: &mut MainRegion<'_>,
     info: &BuildInfo,
-    device_uuid: &str,
-    ip: &str,
 ) {
     if !matches!(region.color_mode, ColorMode::Mono1bpp) {
         return;
     }
+    // Snapshot the global state once at the top — drawing functions
+    // below read from `state.*`. Cheap clone (one critical section,
+    // small struct); we don't want to re-lock for every field access.
+    let state = paperanywhere_ports::chrome::snapshot();
+    let device_uuid: &str = state.device_uuid.as_deref().unwrap_or("");
+    let device_name: Option<&str> = state.device_name.as_deref();
+    let ip: Option<&str> = state.ip.as_deref();
+    let wifi_link_state = state.wifi_link_state;
+    let ssid: Option<&str> = state.ssid.as_deref();
+    let gateway: Option<&str> = state.gateway_v4.as_deref();
+    let backend: Option<&str> = state.backend_url.as_deref();
+    let countdown_secs = state.boot_countdown_secs;
+
     let mut target = Mono1bppTarget::new(region.bytes, region.width_px, region.height_px);
 
-    let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
-    let centered = TextStyleBuilder::new()
+    let body_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+    let header_style = MonoTextStyle::new(&FONT_8X13_BOLD, BinaryColor::On);
+    // Compact font reserved for the UUID line — 36 chars at 4 px/char
+    // = 144 px, fits comfortably in the DEVICE column's value budget.
+    // Used only for the UUID value (the key/label keeps the body font
+    // so the column lines up visually).
+    let small_style = MonoTextStyle::new(&FONT_4X6, BinaryColor::On);
+    let key_aligned = TextStyleBuilder::new()
+        .alignment(Alignment::Right)
+        .baseline(Baseline::Bottom)
+        .build();
+    let value_aligned = TextStyleBuilder::new()
+        .alignment(Alignment::Left)
+        .baseline(Baseline::Bottom)
+        .build();
+    let center_aligned = TextStyleBuilder::new()
         .alignment(Alignment::Center)
         .baseline(Baseline::Bottom)
         .build();
 
-    let center_x = (region.width_px as i32) / 2;
+    // 3-column layout at the bottom of the main region:
+    //
+    //   FIRMWARE              NETWORK              DEVICE
+    //   Version:  ...         WiFi:    ...         Model: ...
+    //   Branch:   ...         IP:      ...         UUID:  ...
+    //   Env:      ...         Gateway: ...
+    //   Backend:  ...
+    //
+    //                Transitioning in N seconds…   (when active)
+    //
+    // The columns share a single 5-row baseline grid (row 0 = header,
+    // rows 1-4 = entries). Within each column, keys are right-aligned
+    // to a per-column colon_x and values are left-aligned to value_x.
+    // Both columns NEVER shift between redraws — fast LUT handles
+    // in-place value changes cleanly per the style guide (see
+    // project_compositor_full_lut_rule memory).
+    let width = region.width_px as i32;
     let bottom_y = (region.height_px as i32) - 8;
+    const ROW_PX: i32 = 12;
+    const ROWS_IN_BLOCK: i32 = 5; // header + 4 entry rows
+    // Row 0 = header (topmost), Row 4 = last entry row, then a one-row
+    // gap, then countdown at bottom_y.
+    let row_y = |row: i32| -> i32 {
+        // Stack upward: bottom_y - (4 - row + 1) * 12 = bottom_y - (5 - row) * 12
+        bottom_y - (ROWS_IN_BLOCK - row + 1) * ROW_PX
+    };
 
-    // Stack five lines upward from the bottom margin with 12 px
-    // between baselines. Total block height ~60 px; leaves the rest
-    // of the main region for the logo above.
+    // Per-column anchor: colon_x is where the key text ends (right-
+    // aligned to it); value_x = colon_x + 4 is where the value starts.
+    // The block is centred horizontally on each panel-third's midpoint
+    // but inset so the widest value fits without spilling between
+    // columns or off the panel edge.
+    let col_centers = [width / 6, width / 2, width * 5 / 6];
+    // Per-column key-width allowances (in pixels). Tuned so the
+    // longest key fits without overlapping the value column:
+    //   Firmware: "Backend:"  (8 chars × 6 = 48 px)
+    //   Network:  "Gateway:"  (8 chars × 6 = 48 px)
+    //   Device:   "Model:"    (6 chars × 6 = 36 px)
+    // We bias colon_x slightly LEFT of each column's centre so the
+    // value text (longer, variable) has more rightward room.
+    let firmware_colon_x = col_centers[0] - 30;
+    let network_colon_x = col_centers[1] - 30;
+    let device_colon_x = col_centers[2] - 30;
+    let firmware_value_x = firmware_colon_x + 4;
+    let network_value_x = network_colon_x + 4;
+    let device_value_x = device_colon_x + 4;
+
+    // ── Headers (row 0) ─────────────────────────────────────────────
+    let header_y = row_y(0);
+    let _ = Text::with_text_style(
+        "FIRMWARE",
+        Point::new(col_centers[0], header_y),
+        header_style,
+        center_aligned,
+    )
+    .draw(&mut target);
+    let _ = Text::with_text_style(
+        "NETWORK",
+        Point::new(col_centers[1], header_y),
+        header_style,
+        center_aligned,
+    )
+    .draw(&mut target);
+    let _ = Text::with_text_style(
+        "DEVICE",
+        Point::new(col_centers[2], header_y),
+        header_style,
+        center_aligned,
+    )
+    .draw(&mut target);
+
+    // Helper to draw one key+value pair in a column.
+    let mut draw_kv =
+        |target: &mut Mono1bppTarget<'_>, colon_x: i32, value_x: i32, y: i32, key: &str, value: &str| {
+            let mut key_buf: HString<24> = HString::new();
+            let _ = key_buf.push_str(key);
+            let _ = key_buf.push(':');
+            let _ = Text::with_text_style(
+                key_buf.as_str(),
+                Point::new(colon_x, y),
+                body_style,
+                key_aligned,
+            )
+            .draw(target);
+            let _ = Text::with_text_style(
+                value,
+                Point::new(value_x, y),
+                body_style,
+                value_aligned,
+            )
+            .draw(target);
+        };
+
+    // ── FIRMWARE column (rows 1-4) ──────────────────────────────────
     let env = if info.is_dev { "dev" } else { "production" };
-    let lines: [(&str, &str); 5] = [
-        ("Build", info.fw_version),
-        ("Environment", env),
-        ("Build Date", info.build_time),
-        ("IP", ip),
-        ("Device UUID", device_uuid),
-    ];
+    let backend_short = backend.unwrap_or("--");
+    draw_kv(&mut target, firmware_colon_x, firmware_value_x, row_y(1), "Version", info.fw_version);
+    draw_kv(&mut target, firmware_colon_x, firmware_value_x, row_y(2), "Branch", info.branch);
+    draw_kv(&mut target, firmware_colon_x, firmware_value_x, row_y(3), "Env", env);
+    draw_kv(&mut target, firmware_colon_x, firmware_value_x, row_y(4), "Backend", backend_short);
 
-    for (i, (key, value)) in lines.iter().enumerate() {
-        // bottom_y is the LAST line; iter index 0 is the topmost,
-        // so we subtract from bottom_y by (count-1 - i) * 12.
-        let y = bottom_y - ((lines.len() as i32 - 1 - i as i32) * 12);
-        let mut buf: HString<80> = HString::new();
-        let _ = buf.push_str(key);
-        let _ = buf.push_str(": ");
-        let _ = buf.push_str(value);
+    // ── NETWORK column (rows 1-4) ───────────────────────────────────
+    // WiFi shows the 3-state link label (Disconnected/Connecting/
+    // Connected) — distinct from the IP field, which is now strictly
+    // the assigned address (or "--" when no DHCP lease). Pre-#90
+    // behaviour conflated the two by putting "connecting..." in the
+    // IP field while WPA was in flight; the new layout cleanly
+    // separates WiFi link-state from IP-address signalling.
+    let wifi_label = wifi_link_state.label();
+    let ssid_str = ssid.unwrap_or("--");
+    let ip_str = ip.unwrap_or("--");
+    let gateway_str = gateway.unwrap_or("--");
+    draw_kv(&mut target, network_colon_x, network_value_x, row_y(1), "WiFi", wifi_label);
+    draw_kv(&mut target, network_colon_x, network_value_x, row_y(2), "SSID", ssid_str);
+    draw_kv(&mut target, network_colon_x, network_value_x, row_y(3), "IP", ip_str);
+    draw_kv(&mut target, network_colon_x, network_value_x, row_y(4), "Gateway", gateway_str);
+
+    // ── DEVICE column (rows 1-4) ────────────────────────────────────
+    // Maker/Model/Name use the body font like the other columns. UUID
+    // gets a compact font on its own row so the full 36-char UUID4
+    // fits within the column's value budget — silent truncation would
+    // hide a quarter of the device's identity, and pushing it
+    // somewhere outside the DEVICE block visually disconnects it from
+    // its label. The compact 4x6 font is only for the UUID value,
+    // not its "UUID:" key (the key stays body-style so the column
+    // alignment looks consistent down the page).
+    let name_str = device_name.unwrap_or("--");
+    draw_kv(&mut target, device_colon_x, device_value_x, row_y(1), "Maker", info.manufacturer);
+    draw_kv(&mut target, device_colon_x, device_value_x, row_y(2), "Model", info.device_model);
+    draw_kv(&mut target, device_colon_x, device_value_x, row_y(3), "Name", name_str);
+
+    // UUID row: key in body font, value in compact font so the full
+    // 36-char UUID fits. Empty/None renders as "(awaiting…)" using
+    // ASCII so the user knows we haven't been issued one yet.
+    let uuid_y = row_y(4);
+    let mut uuid_key_buf: HString<8> = HString::new();
+    let _ = uuid_key_buf.push_str("UUID:");
+    let _ = Text::with_text_style(
+        uuid_key_buf.as_str(),
+        Point::new(device_colon_x, uuid_y),
+        body_style,
+        key_aligned,
+    )
+    .draw(&mut target);
+    let uuid_value = if device_uuid.is_empty() {
+        "(awaiting...)"
+    } else {
+        device_uuid
+    };
+    let _ = Text::with_text_style(
+        uuid_value,
+        Point::new(device_value_x, uuid_y),
+        small_style,
+        value_aligned,
+    )
+    .draw(&mut target);
+
+    // ── Countdown row (at bottom_y) ─────────────────────────────────
+    // Centred and prominent. Always-reserved row so showing/hiding the
+    // countdown doesn't shift any other content. Uses ASCII-only text
+    // (no `…` ellipsis) because FONT_6X10 only includes the ASCII
+    // glyph set — non-ASCII characters render as a placeholder that
+    // can be confused with `%`/`?` shapes.
+    if let Some(n) = countdown_secs {
+        use core::fmt::Write;
+        let mut msg: HString<48> = HString::new();
+        let unit = if n == 1 { "second" } else { "seconds" };
+        let _ = write!(&mut msg, "Transitioning in {} {}...", n, unit);
+
+        let center_x = width / 2;
         let _ = Text::with_text_style(
-            buf.as_str(),
-            Point::new(center_x, y),
-            style,
-            centered,
+            msg.as_str(),
+            Point::new(center_x, bottom_y),
+            body_style,
+            center_aligned,
         )
         .draw(&mut target);
     }

@@ -13,4 +13,26 @@ description = "UC8179 e-paper controller driver. Generic over embedded-hal SPI +
 [dependencies]
 paperanywhere-ports.workspace = true
 embedded-hal = "1"
+# Async SPI trait surface. write_chunk bounds SpiDevice on
+# embedded_hal_async::spi::SpiDevice so each SPI transfer yields to the
+# embassy executor instead of busy-polling the FIFO. Without this, the
+# 38 ms sync flush of a 48 KB framebuffer starves embassy-net's WiFi-RX
+# poll long enough for the gateway to ARP-evict our DHCP lease.
+embedded-hal-async = "1"
 log.workspace = true
+# Used inside the async wait_idle to yield to the embassy executor
+# between BUSY-pin polls. Without this, the multi-second wait during
+# panel refresh blocks every other embassy task on the chip
+# (embassy-net's poll loop, even ICMP) — observed symptom before
+# this landed was clusters of ICMP request timeouts during refreshes
+# and OTA download stalls.
+embassy-time = "0.5"
+# `yield_now` between SPI bursts inside write_chunk. Required to give
+# esp-radio's WiFi task scheduling windows during the framebuffer
+# flush — without explicit yields the cooperative executor keeps
+# polling the SPI task as soon as the FIFO interrupt fires, esp-radio
+# can't ACK beacons / answer ARP, the AP times us out, and the device
+# falls off the network for good (the original symptom that motivated
+# task #90). See the inline comment in the EpaperPanel::write_chunk
+# impl for the full mechanism + upstream esp-rs/esp-wifi-sys#222.
+embassy-futures = "0.1"

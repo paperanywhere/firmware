@@ -20,8 +20,11 @@
 //!   2 → wifi_ssid    (UTF-8, ≤32 bytes)
 //!   3 → wifi_password (UTF-8, ≤64 bytes)
 //!   4 → backend_url  (UTF-8, ≤128 bytes)
-//!   5 → claim_code_pending (UTF-8, ≤16 bytes)
-//!   6 → last_applied_image_id (UTF-8, ≤32 bytes)
+//!   5 → claim_code   (UTF-8, ≤16 bytes)
+//!   6 → last_render_hash (8 bytes LE)
+//!   7 → is_dev_build (1 byte)
+//!   8 → device_uuid  (UTF-8, ≤48 bytes — backend-assigned, stable across boots)
+//!   9 → device_name  (UTF-8, ≤64 bytes — user-set friendly name from /state)
 //!
 //! On boot, the cache is loaded once into an in-memory `NvsCache`. Reads come
 //! from the cache; writes update the cache and write the whole record back —
@@ -72,6 +75,16 @@ const TAG_LAST_RENDER_HASH: u8 = 6;
 /// binary doesn't get clobbered by the next release. Absent / 0x00 =
 /// production build, OTA path active.
 const TAG_IS_DEV_BUILD: u8 = 7;
+/// Backend-assigned device UUID (e.g. `019e4bff-47c0-7882-b1ce-49d4b26e1002`).
+/// Returned by `POST /api/device/register` on first boot and persisted
+/// here so the device displays a stable identity on the boot screen
+/// across reboots and survives backend MAC re-lookups.
+const TAG_DEVICE_UUID: u8 = 8;
+/// User-supplied friendly name (e.g. "Kitchen calendar"). Comes back on
+/// `GET /api/device/state` once a user has adopted the device through
+/// the dashboard. Displayed on the boot screen / status bar in
+/// preference to the UUID once set.
+const TAG_DEVICE_NAME: u8 = 9;
 
 #[derive(Default)]
 struct NvsCache {
@@ -86,6 +99,12 @@ struct NvsCache {
     /// `true` if this device is flashed in dev mode. Defaults to `false`
     /// (production); set to `true` via the prov blob's `--dev` flag.
     is_dev_build: bool,
+    /// Backend-assigned UUID (36 chars + null padding budget). Set once on
+    /// first register; stable across reboots.
+    device_uuid: Option<HString<48>>,
+    /// User-supplied friendly name set during adoption. Refreshed on every
+    /// /state call (cheap — the field comes back on every response).
+    device_name: Option<HString<64>>,
 }
 
 pub struct FwNvs {
@@ -110,8 +129,8 @@ impl FwNvs {
 
     /// Persist the device's claim code so a subsequent boot reuses
     /// it and the backend's claim-by-code lookup can find it. Called
-    /// once at boot from MAC-derived seed if the cache doesn't
-    /// already have one.
+    /// from the runtime after `POST /api/device/register` returns a
+    /// fresh code on first boot.
     pub fn save_claim_code(&mut self, code: &str) {
         if self.cache.claim_code.as_ref().map(|s| s.as_str()) == Some(code) {
             return;
@@ -120,8 +139,40 @@ impl FwNvs {
         self.persist();
     }
 
-    // (the trait method `NvsStore::load_claim_code` already exposes
-    // this; nothing else in firmware needs an inherent method.)
+    /// Persist the bearer token returned by
+    /// `POST /api/device/register`. Called once per unclaimed device on
+    /// first cold boot; subsequent boots load it via
+    /// `NvsStore::load_device_token` and skip the register call.
+    pub fn save_device_token(&mut self, token: &str) {
+        if self.cache.device_token.as_ref().map(|s| s.as_str()) == Some(token) {
+            return;
+        }
+        self.cache.device_token = into_hstring::<64>(token);
+        self.persist();
+    }
+
+    /// Persist the backend-assigned UUID. Stable across reboots — once
+    /// the backend has issued this UUID for this device's MAC, every
+    /// re-register call returns the same value. Used by the boot
+    /// screen to display a stable device identity even before adoption.
+    pub fn save_device_uuid(&mut self, uuid: &str) {
+        if self.cache.device_uuid.as_ref().map(|s| s.as_str()) == Some(uuid) {
+            return;
+        }
+        self.cache.device_uuid = into_hstring::<48>(uuid);
+        self.persist();
+    }
+
+    /// Persist the user-supplied friendly name returned in `GET /state`.
+    /// Refreshed on every state poll so a dashboard rename surfaces on
+    /// the next reboot's boot screen.
+    pub fn save_device_name(&mut self, name: &str) {
+        if self.cache.device_name.as_ref().map(|s| s.as_str()) == Some(name) {
+            return;
+        }
+        self.cache.device_name = into_hstring::<64>(name);
+        self.persist();
+    }
 
     /// Try to migrate a `prov.bin` blob from the prov partition into NVS.
     /// Returns `true` if a valid blob was found and migrated; the prov region
@@ -216,6 +267,30 @@ impl NvsStore for FwNvs {
 
     fn load_claim_code(&self) -> Option<String> {
         self.cache.claim_code.as_ref().map(|s| s.as_str().to_string())
+    }
+
+    fn load_device_uuid(&self) -> Option<String> {
+        self.cache.device_uuid.as_ref().map(|s| s.as_str().to_string())
+    }
+
+    fn load_device_name(&self) -> Option<String> {
+        self.cache.device_name.as_ref().map(|s| s.as_str().to_string())
+    }
+
+    fn save_device_token(&mut self, token: &str) {
+        FwNvs::save_device_token(self, token);
+    }
+
+    fn save_claim_code(&mut self, code: &str) {
+        FwNvs::save_claim_code(self, code);
+    }
+
+    fn save_device_uuid(&mut self, uuid: &str) {
+        FwNvs::save_device_uuid(self, uuid);
+    }
+
+    fn save_device_name(&mut self, name: &str) {
+        FwNvs::save_device_name(self, name);
     }
 }
 
@@ -355,6 +430,12 @@ fn encode_tlv(cache: &NvsCache, payload: &mut [u8]) -> Result<usize, NvsError> {
         // layout (cheap forward-compat for old firmware decoding it).
         pos = write_record(payload, pos, TAG_IS_DEV_BUILD, &[1u8])?;
     }
+    if let Some(s) = &cache.device_uuid {
+        pos = write_record(payload, pos, TAG_DEVICE_UUID, s.as_bytes())?;
+    }
+    if let Some(s) = &cache.device_name {
+        pos = write_record(payload, pos, TAG_DEVICE_NAME, s.as_bytes())?;
+    }
     // tag 0 terminator
     if pos < payload.len() {
         payload[pos] = 0;
@@ -415,6 +496,8 @@ fn parse_tlv(payload: &[u8]) -> Result<NvsCache, NvsError> {
             TAG_WIFI_PASSWORD => cache.password = into_hstring::<64>(value_str),
             TAG_BACKEND_URL => cache.backend_url = into_hstring::<128>(value_str),
             TAG_CLAIM_CODE => cache.claim_code = into_hstring::<16>(value_str),
+            TAG_DEVICE_UUID => cache.device_uuid = into_hstring::<48>(value_str),
+            TAG_DEVICE_NAME => cache.device_name = into_hstring::<64>(value_str),
             _ => {} // unknown tag — silently skip
         }
         i = val_end;

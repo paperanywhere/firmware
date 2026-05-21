@@ -31,12 +31,12 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 mod boards;
 mod boot;
-mod dev_server;
 mod http;
 mod network;
 mod nvs;
 mod ota;
 mod panel;
+mod panel_actor;
 mod power;
 mod provisioning;
 mod resources;
@@ -53,14 +53,34 @@ pub const FW_VERSION: &str = env!("PAPERANYWHERE_FW_VERSION");
 /// device can be cross-checked against the release that built it.
 pub const BUILD_TIME: &str = env!("PAPERANYWHERE_BUILD_TIME");
 
+/// Git branch the firmware was built from. Populated by build.rs (when
+/// it lands the rerun-if-changed for HEAD); `option_env!` falls back
+/// to "unknown" for builds run outside a git worktree (CI tarball,
+/// docker-builder without .git mount, etc.). Surfaced on the boot
+/// screen's Firmware column so the user can tell at a glance which
+/// branch produced the running binary.
+pub const FW_BRANCH: &str = match option_env!("PAPERANYWHERE_BRANCH") {
+    Some(b) => b,
+    None => "unknown",
+};
+
 /// Construct the `BuildInfo` the compositor uses to draw the boot-
 /// screen overlay. `is_dev` is sourced from NVS (set by `provtool --dev`)
 /// so the boot screen visibly tags dev firmware with " (DEV)".
-pub fn build_info(is_dev: bool) -> paperanywhere_compositor::BuildInfo {
+/// `manufacturer` + `device_model` carry the board's identity through
+/// to the compositor's Device column as separate Maker / Model rows.
+pub fn build_info(
+    is_dev: bool,
+    manufacturer: &'static str,
+    device_model: &'static str,
+) -> paperanywhere_compositor::BuildInfo {
     paperanywhere_compositor::BuildInfo {
         fw_version: FW_VERSION,
         build_time: BUILD_TIME,
         is_dev,
+        branch: FW_BRANCH,
+        manufacturer,
+        device_model,
     }
 }
 
@@ -83,7 +103,15 @@ fn init_heap() {
 
 #[esp_hal::main]
 fn main() -> ! {
+    // Earliest-possible heartbeat so we can tell from serial whether main()
+    // is even being reached. esp-println's serial-jtag printer writes
+    // straight to the USB-Serial-JTAG register block, no peripheral init
+    // required — if this line doesn't appear, something in the bootloader-
+    // to-Rust handoff (heap header, panic on entry, etc.) is the culprit.
+    println!("=== pa-fw: entered main() ===");
+
     init_heap();
+    println!("pa-fw: heap initialised");
     // Register esp-println as the `log` crate backend so the runtime's
     // `info!`/`warn!`/`error!` calls reach the UART. Without this all
     // `log::*` macros are no-ops and wake-cycle errors disappear silently.
@@ -91,9 +119,11 @@ fn main() -> ! {
     // env-var variant is read at *compile* time and an unset `ESP_LOG`
     // defaults to silent.
     esp_println::logger::init_logger(log::LevelFilter::Info);
+    println!("pa-fw: logger registered");
     let peripherals = esp_hal::init(
         esp_hal::Config::default().with_cpu_clock(CpuClock::max()),
     );
+    println!("pa-fw: esp_hal::init returned");
 
     let board = boards::current();
     println!("paperanywhere-firmware booting on {}", board.name);
@@ -119,6 +149,11 @@ fn main() -> ! {
     // SPI traffic into audible chirps. Useful diagnostic, embarrassing bug.)
     #[cfg(feature = "board-reterminal-e1001")]
     let panel = {
+        // Build Blocking, then `.into_async()` so each `spi.write(...)`
+        // awaits the FIFO-empty interrupt instead of busy-polling the
+        // status register. Without this the 48 KB framebuffer flush
+        // holds the CPU for ~38 ms with no executor yields and the
+        // gateway ARP-evicts our DHCP lease. Task #90.
         let bus = Spi::new(
             peripherals.SPI2,
             SpiConfig::default()
@@ -127,7 +162,8 @@ fn main() -> ! {
         )
         .expect("SPI2 config")
         .with_sck(peripherals.GPIO7)
-        .with_mosi(peripherals.GPIO9);
+        .with_mosi(peripherals.GPIO9)
+        .into_async();
         resources::PanelHardware {
             spi_bus: bus,
             cs: Output::new(peripherals.GPIO10, Level::High, OutputConfig::default()),

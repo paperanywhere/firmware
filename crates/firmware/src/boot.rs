@@ -7,9 +7,12 @@
 //! which requires `'static` arguments — can accept it.
 
 use embassy_net::Stack;
+use esp_hal::system::Stack as CoreStack;
 use esp_println::println;
 use paperanywhere_ports::{EpaperPanel, NvsStore, Sleeper};
 use static_cell::StaticCell;
+
+use crate::panel_actor;
 
 use crate::boards;
 use crate::http::FwHttp;
@@ -27,10 +30,14 @@ pub const BOOT_SCREEN: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/boot_screen.bin"));
 
 /// "Updating firmware..." status screen, baked from `assets/logo_ota.svg`.
-/// Rendered by the runtime right before kicking off an OTA install so the
-/// user sees something during the ~30–60s flash-write window instead of a
-/// stale image. After the chip resets into the new slot the regular boot
-/// screen takes over.
+/// Rendered by the runtime right before kicking off an OTA install so
+/// the user sees something during the ~30–60s flash-write window. After
+/// the actor-pattern refactor the live OTA-progress view (see
+/// `panel_actor::handle_cmd` for `PaintCmd::OtaProgress`) supersedes
+/// this fallback bitmap; we keep the asset baked so a future
+/// fall-back-path (e.g. headless install with no progress signal)
+/// can use it without a build script change.
+#[allow(dead_code)]
 pub const OTA_SCREEN: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ota_screen.bin"));
 
@@ -45,7 +52,85 @@ static SLEEPER: StaticCell<FwSleeper> = StaticCell::new();
 static OTA: StaticCell<FwOta> = StaticCell::new();
 static STACK_HANDLE: StaticCell<Stack<'static>> = StaticCell::new();
 static EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
-static DEV_SERVER_CTX: StaticCell<crate::dev_server::DevServerCtx> = StaticCell::new();
+
+/// Pointer to the FwNvs instance the persistence hook writes through.
+/// Stored as an `AtomicPtr<FwNvs>` instead of `*mut FwNvs` so the
+/// boot path can publish it before the hook is registered without
+/// upsetting the no-Sync-for-raw-pointers rule. `chrome::persist_now`
+/// (called from `chrome::set_*_with(.., Persist::Flash)`) invokes the
+/// hook below, which reads this atomic.
+///
+/// SAFETY contract:
+///   * Set ONCE from `boot::run` after FwNvs::init returns, before
+///     any task could call `set_*_with(.., Persist::Flash)`.
+///   * Read by the chrome-persistence hook on whatever task triggered
+///     the persist call. Reads happen long after the write completes,
+///     so Acquire/Release ordering is enough — no further sync needed.
+///   * The pointed-to FwNvs lives `'static` (via the NVS StaticCell)
+///     so the pointer is always valid for the lifetime of the program.
+static CHROME_NVS_HANDOFF: core::sync::atomic::AtomicPtr<FwNvs> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Persistence hook installed via `chrome::register_persistence_hook`.
+/// Called synchronously whenever a chrome setter is invoked with
+/// `Persist::Flash`. Reads the current chrome snapshot and mirrors the
+/// flash-relevant fields (device_uuid, device_name, backend_url,
+/// ssid) into NVS. Each `nvs.save_*` early-returns if the value is
+/// unchanged, so spurious calls are cheap.
+fn flash_persist_hook() {
+    let raw = CHROME_NVS_HANDOFF.load(core::sync::atomic::Ordering::Acquire);
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: see CHROME_NVS_HANDOFF invariants. Single mutable
+    // reference is fine here because save_* methods don't await or
+    // recurse into chrome.
+    let nvs = unsafe { &mut *raw };
+    let snap = paperanywhere_ports::chrome::snapshot();
+    if let Some(uuid) = snap.device_uuid.as_deref() {
+        nvs.save_device_uuid(uuid);
+    }
+    if let Some(name) = snap.device_name.as_deref() {
+        nvs.save_device_name(name);
+    }
+    // backend_url + ssid persistence intentionally NOT wired here yet
+    // — those are sourced from the prov partition today, and adding a
+    // write path before the captive-portal / settings UI lands would
+    // create surprising "where did my SSID go" scenarios on a reset.
+    // The hook is the right place once those flows exist.
+}
+
+/// 16 KB stack for the APP core's main thread (where its embassy
+/// executor lives). The actor task itself runs on the executor's
+/// task arena, not this stack — this is just the boot/poll loop for
+/// the second core. 16 KB matches what we'd give a freshly-spawned
+/// embassy task on the primary core.
+const APP_CORE_STACK_BYTES: usize = 16 * 1024;
+static APP_CORE_STACK: StaticCell<CoreStack<APP_CORE_STACK_BYTES>> = StaticCell::new();
+/// Embassy executor that owns the panel-actor task on core 1. Lives
+/// in a StaticCell so we can hand the `&'static mut` required by
+/// `Executor::run` into the second-core closure.
+static CORE1_EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
+
+/// Cross-task channel for OTA progress events. The runtime's OTA
+/// install path writes to this; the panel-actor task reads it and
+/// renders the live progress view. Latest-wins semantics: if
+/// multiple signals arrive before the actor picks them up, only the
+/// most recent phase is preserved — which is what we want, since the
+/// progress view only ever renders the current state.
+pub static OTA_PROGRESS: paperanywhere_runtime::OtaProgressChannel =
+    paperanywhere_runtime::OtaProgressChannel::new();
+
+/// Cross-task paint channel: all view-change + chrome-update commands
+/// flow through here to the panel-actor task (which OWNS the panel
+/// exclusively). Currently the runtime still drives the panel
+/// directly via `&mut Panel`; the next-session migration replaces
+/// every panel.* call site with `PAINT_CHANNEL.send(...)` and
+/// spawns the actor (`panel_actor::panel_actor_task`) on core 1
+/// for true dual-core parallelism. See `panel_actor.rs` for the
+/// task body.
+pub static PAINT_CHANNEL: paperanywhere_runtime::PaintChannel =
+    paperanywhere_runtime::PaintChannel::new();
 
 pub fn run(resources: FirmwareResources) -> ! {
     let FirmwareResources {
@@ -56,8 +141,8 @@ pub fn run(resources: FirmwareResources) -> ! {
         wifi,
         lpwr,
         flash,
-        cpu_ctrl: _,
-        sw_int1: _,
+        cpu_ctrl,
+        sw_int1,
         panel,
     } = resources;
 
@@ -110,6 +195,16 @@ pub fn run(resources: FirmwareResources) -> ! {
     let sleeper_ref = SLEEPER.init(FwSleeper::new(lpwr));
     let ota_ref = OTA.init(FwOta::new());
 
+    // Hand the NVS instance to the chrome persistence hook so
+    // `chrome::set_*_with(.., Persist::Flash)` from any task can write
+    // through to flash. Pointer published BEFORE register_persistence_hook
+    // so a setter racing this couldn't dereference a stale null.
+    CHROME_NVS_HANDOFF.store(
+        nvs_ref as *mut FwNvs,
+        core::sync::atomic::Ordering::Release,
+    );
+    paperanywhere_ports::chrome::register_persistence_hook(flash_persist_hook);
+
     // Device-id fallback: if NVS has no claim token yet, derive an
     // identifier from the chip's base MAC address (last two octets).
     // The runtime's set_device_id call later may override this if a
@@ -124,12 +219,24 @@ pub fn run(resources: FirmwareResources) -> ! {
     };
     panel_ref.set_device_id(&mac_id);
 
-    // NOTE: the claim code is NOT derived from MAC. Collisions are too
-    // likely across a fleet and there's no way to rotate. The backend
-    // issues the code via /api/device/claim-code/request and rotates
-    // every 5 minutes until claimed — see task #84. The runtime
-    // fetches the code in its first wake; until then the adoption
-    // screen shows "(requesting…)" as a placeholder.
+    // Build the identity payload for /api/device/register. Format the
+    // MAC as `aa:bb:cc:dd:ee:ff` since that's the canonical form the
+    // backend's storage layer normalises to anyway. panel_model_id
+    // comes straight from the active board's `BoardConfig`.
+    let mac_str = if mac_bytes.len() >= 6 {
+        alloc::format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac_bytes[0], mac_bytes[1], mac_bytes[2],
+            mac_bytes[3], mac_bytes[4], mac_bytes[5],
+        )
+    } else {
+        alloc::string::String::from("00:00:00:00:00:00")
+    };
+    let identity = paperanywhere_ports::DeviceIdentity {
+        mac: mac_str,
+        panel_model_id: board.panel_model_id,
+        fw_version: alloc::string::String::from(crate::FW_VERSION),
+    };
 
     // If this boot is the first one after an OTA install, the slot is
     // still marked `New`/`PendingVerify`. Graduate it to `Valid` so the
@@ -140,10 +247,11 @@ pub fn run(resources: FirmwareResources) -> ! {
     // structurally identical; the board crate stays self-contained so its
     // module table doesn't have to import ports just for one enum.
     //
-    // Dev devices force AlwaysOn — the dev_server task only listens while
-    // the chip is awake, and deep-sleeping between wakes would mean the
-    // `pa-dev push` user has a 30-second window every 6 hours to hit the
-    // /firmware endpoint. AlwaysOn keeps it reachable continuously.
+    // Dev devices force AlwaysOn so the developer can iterate without
+    // waiting 6 h for the next scheduled wake. Backend-driven OTA
+    // pushes (task #93) rely on the device polling the backend
+    // continuously to pick up `firmware_update` offers; deep sleep
+    // would defer that to the next scheduled wake.
     let policy = if nvs_ref.load_is_dev_build() {
         paperanywhere_ports::PowerPolicy::AlwaysOn
     } else {
@@ -168,76 +276,166 @@ pub fn run(resources: FirmwareResources) -> ! {
     // line). The initial paint below uses the same template with
     // ip=None so the panel comes up immediately, even before WiFi
     // associates.
-    let build_info = crate::build_info(nvs_ref.load_is_dev_build());
+    let build_info = crate::build_info(
+        nvs_ref.load_is_dev_build(),
+        board.manufacturer,
+        board.model,
+    );
     panel_ref.cache_boot_template(BOOT_SCREEN, build_info);
+    // Seed runtime boot-screen state with what we know pre-executor.
+    // Gateway stays None until DHCP completes (the runtime will push
+    // it via set_gateway once embassy-net's stack has a config_v4
+    // lease). Backend URL is read from NVS at boot, so we can render
+    // it on the splash immediately.
+    panel_ref.set_backend_url(backend_url.as_deref());
+    panel_ref.set_gateway(None);
+    panel_ref.set_boot_countdown(None);
 
-    panel_ref.init();
+    // Pre-stage the boot-screen content into the compositor's
+    // framebuffer + chrome state. NO panel SPI yet — that all happens
+    // inside the panel-actor task once the executor is running.
+    //
+    // Why: the panel SPI driver is now async (task #90). Async SPI
+    // writes register a real interrupt waker which `embassy_futures::
+    // block_on`'s noop_waker can't fire — so a pre-executor block_on
+    // of `panel.init().await` busy-loops forever waiting for a wake
+    // that never arrives. Pushing the init + first refresh into the
+    // actor task body sidesteps the problem: by the time the actor
+    // runs, esp-rtos's embassy executor is alive and wakers work.
+    //
+    // Cost: the boot screen appears ~1-2 frames later (executor
+    // startup time) instead of immediately. In practice the panel
+    // takes ~3 s for its full-LUT refresh anyway, so the delta is
+    // imperceptible.
     panel_ref.set_chrome(sleeper_ref.battery_mv(), None);
-    // Seed the dev/boot-screen IP state before the panel paint so the
-    // overlay never shows a blank value. Runtime will overwrite via
-    // panel.set_ip once DHCP completes (or marks it as failed).
-    panel_ref.set_ip("connecting...");
-    panel_ref.write_chunk(BOOT_SCREEN);
+    // IP stays unset (None) pre-DHCP — the boot-screen render
+    // displays "--" rather than the old "connecting..." placeholder.
+    // The WiFi field carries the link-state signalling instead, set
+    // below to Connecting since the first wake cycle will attempt
+    // association immediately.
+    use paperanywhere_ports::WifiLinkState;
+    panel_ref.set_wifi_link_state(WifiLinkState::Connecting);
+    // Surface the SSID we're about to associate with so the user can
+    // verify which network the device is targeting (especially useful
+    // on a shared workbench / multiple test networks).
+    let initial_ssid = crate::nvs::load_wifi_creds_raw().map(|(ssid, _)| ssid);
+    panel_ref.set_ssid(initial_ssid.as_deref());
+
+    // Pre-stage UUID + friendly name from NVS so the FIRST boot screen
+    // already shows them on a non-fresh boot. The runtime refreshes
+    // both on register / /state success — so a freshly factory-reset
+    // device renders "(awaiting...)" in the UUID slot until register
+    // returns, then updates live. We deliberately do NOT fall back
+    // to any MAC-derived placeholder: a UUID slot showing a MAC-like
+    // value misleads the user into thinking that's their identity.
+    let cached_uuid: Option<alloc::string::String> = nvs_ref.load_device_uuid();
+    let cached_name: Option<alloc::string::String> = nvs_ref.load_device_name();
+    panel_ref.set_device_uuid(cached_uuid.as_deref());
+    panel_ref.set_device_name(cached_name.as_deref());
+
+    // Compositor's write_chunk now returns a future (trait signature
+    // matches the bare panel impl), but the actual framebuffer write
+    // happens at the synchronous call edge — the returned future is
+    // just `core::future::ready(())`. Drop it; no await needed.
+    drop(panel_ref.write_chunk(BOOT_SCREEN));
     {
+        // Pre-stage every chrome value the boot-screen overlay reads.
+        // After this block, the global `chrome` KV has everything the
+        // compositor needs; render_into snapshots it internally.
+        // Producers no longer need to thread arguments through the
+        // render API — this IS the chrome-as-source-of-truth design.
+        paperanywhere_ports::chrome::set_device_uuid(cached_uuid.as_deref());
+        paperanywhere_ports::chrome::set_device_name(cached_name.as_deref());
+        paperanywhere_ports::chrome::set_ip(None);
+        paperanywhere_ports::chrome::set_wifi_link_state(WifiLinkState::Connecting);
+        paperanywhere_ports::chrome::set_ssid(initial_ssid.as_deref());
+        paperanywhere_ports::chrome::set_gateway(None);
+        paperanywhere_ports::chrome::set_backend_url(backend_url.as_deref());
+        paperanywhere_ports::chrome::set_boot_countdown_secs(None);
+
         let mut region = panel_ref.main_region_mut();
-        build_info.render_into(&mut region, &mac_id, "connecting...");
+        build_info.render_into(&mut region);
     }
     panel_ref.compose();
-    let pending = panel_ref.pending_hash();
-    let cached = nvs_ref.load_last_render_hash();
-    if pending.is_none() || pending != cached {
-        panel_ref.refresh();
-        if let Some(h) = pending {
-            nvs_ref.save_last_render_hash(h);
-        }
-    } else {
-        println!("boot: panel content unchanged — skipping refresh");
-    }
 
-    // Cache board metadata for the dev HTTP server before we move
-    // `board` into the runtime task. Only constructed/spawned when
-    // the device is in dev mode — production firmware never opens a
-    // listening socket.
-    let dev_server_ctx: Option<&'static crate::dev_server::DevServerCtx> =
-        if nvs_ref.load_is_dev_build() {
-            let (board_mac_bytes, _) = (mac_bytes, ());
-            let mut mac6 = [0u8; 6];
-            if board_mac_bytes.len() >= 6 {
-                mac6.copy_from_slice(&board_mac_bytes[..6]);
-            }
-            Some(DEV_SERVER_CTX.init(crate::dev_server::DevServerCtx {
-                fw_version: crate::FW_VERSION,
-                build_time: crate::BUILD_TIME,
-                board_slug: board.name,
-                panel_width_px: board.panel_width_px,
-                panel_height_px: board.panel_height_px,
-                mac: mac6,
-            }))
-        } else {
-            None
-        };
+    // Dual-core: panel actor pinned to **core 1 (APP_CPU)**, everything
+    // else (net_task, runtime, esp-radio internals) on core 0 (PRO_CPU).
+    // Goal: isolate the panel's multi-second SPI bursts + sync
+    // compositor work from the WiFi-servicing tasks so a refresh
+    // cycle can never starve the network into AP eviction.
+    //
+    // esp-hal marks `Async` as `!Send` via `PhantomData<*const ()>`,
+    // so `Spi<'static, Async>` (and our Panel which contains it,
+    // and any future referencing it) is !Send. `start_second_core`
+    // requires `Send + 'static` for its closure — and the !Send-ness
+    // propagates through any closure capture, even an `unsafe impl
+    // Send` newtype wrapper, because Rust looks at the captured
+    // closure's full type. We sidestep by parking the panel pointer
+    // in a `static AtomicPtr` BEFORE calling `start_second_core`:
+    // the closure captures nothing panel-related and stays Send;
+    // core 1 reads the atomic + materialises the `&'static mut`
+    // inside its own context.
+    //
+    // SAFETY of the AtomicPtr hand-off: (1) core 0 stores the
+    // pointer before start_second_core's barrier; (2) core 1 loads
+    // it once before spawning the actor and never re-reads it; (3)
+    // panel_ref is `&'static mut` — it lives forever and is never
+    // accessed by core 0 again after this point; (4) the SPI
+    // interrupt waker was registered on core 0 when `into_async()`
+    // ran, and esp-rtos's cross-core IPC delivers the wake to core
+    // 1's executor where the actor's await sits.
+    //
+    // esp-wifi-sys#412 caveat: esp-wifi crashes if its OWN tasks
+    // run on the second core. We don't put esp-wifi/esp-radio tasks
+    // there — only the panel actor.
+    static PANEL_HANDOFF: core::sync::atomic::AtomicPtr<boards::Panel> =
+        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+    PANEL_HANDOFF.store(
+        panel_ref as *mut boards::Panel,
+        core::sync::atomic::Ordering::Release,
+    );
+
+    let app_stack = APP_CORE_STACK.init(CoreStack::new());
+    esp_rtos::start_second_core(
+        cpu_ctrl,
+        sw_int1,
+        app_stack,
+        || {
+            // SAFETY: see hand-off invariants above. Pointer was
+            // stored by core 0 before start_second_core; core 0
+            // never touches the Panel again.
+            let panel_ref: &'static mut boards::Panel = unsafe {
+                &mut *PANEL_HANDOFF.load(core::sync::atomic::Ordering::Acquire)
+            };
+            let core1_executor =
+                CORE1_EXECUTOR.init(esp_rtos::embassy::Executor::new());
+            core1_executor.run(|spawner| {
+                let actor_token = panel_actor::panel_actor_task(
+                    panel_ref,
+                    &PAINT_CHANNEL,
+                    &OTA_PROGRESS,
+                )
+                .expect("panel_actor_task pool");
+                spawner.spawn(actor_token);
+            });
+        },
+    );
 
     let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
     executor.run(|spawner| {
         let net_token = crate::network::net_task(runner).expect("net_task pool");
         spawner.spawn(net_token);
-        if let Some(ctx) = dev_server_ctx {
-            let dev_token = crate::dev_server::run(stack_ref, ctx).expect("dev_server pool");
-            spawner.spawn(dev_token);
-        }
-        // Boot screen is already on the panel by this point (paint
-        // above), so the runtime doesn't need to render it again. Pass
-        // an empty slice to short-circuit its boot-screen path.
+        // Panel actor moved to core 1 above — DO NOT spawn it here.
         let rt_token = runtime_task(
             wifi_ref,
             http_ref,
             nvs_ref,
-            panel_ref,
             sleeper_ref,
             ota_ref,
             policy,
-            &[],
-            OTA_SCREEN,
+            identity,
+            &OTA_PROGRESS,
+            &PAINT_CHANNEL,
         )
         .expect("runtime_task pool");
         spawner.spawn(rt_token);
@@ -249,23 +447,23 @@ async fn runtime_task(
     wifi: &'static mut FwWifi,
     http: &'static mut FwHttp,
     nvs: &'static mut FwNvs,
-    panel: &'static mut boards::Panel,
     sleeper: &'static mut FwSleeper,
     ota: &'static mut FwOta,
     policy: paperanywhere_ports::PowerPolicy,
-    boot_screen: &'static [u8],
-    ota_screen: &'static [u8],
+    identity: paperanywhere_ports::DeviceIdentity,
+    ota_progress: &'static paperanywhere_runtime::OtaProgressChannel,
+    paint: &'static paperanywhere_runtime::PaintChannel,
 ) -> ! {
     paperanywhere_runtime::run(
         wifi,
         http,
         nvs,
-        panel,
         sleeper,
         ota,
         policy,
-        boot_screen,
-        ota_screen,
+        identity,
+        ota_progress,
+        paint,
     )
     .await
 }
