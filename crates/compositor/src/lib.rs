@@ -210,6 +210,10 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
         self.status.ip_address = Some(s);
     }
 
+    fn set_status(&mut self, status: paperanywhere_ports::DeviceStatus) {
+        self.status.device_status = status;
+    }
+
     fn redraw_boot_screen(&mut self) {
         let Some(tpl) = self.boot_template.clone() else {
             return;

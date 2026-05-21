@@ -358,6 +358,47 @@ impl WifiCreds {
 
 // ── Ports ─────────────────────────────────────────────────────────────────────
 
+/// High-level device lifecycle state surfaced in the status bar's
+/// top-left block. The runtime calls
+/// [`EpaperPanel::set_status`] at each transition so the user can
+/// see at a glance what the device is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceStatus {
+    /// Cold boot, before the runtime starts polling.
+    Booting,
+    /// WiFi associate / DHCP in progress.
+    Connecting,
+    /// Hitting `/state` to fetch the next image + config.
+    DownloadingConfig,
+    /// OTA install running.
+    Updating,
+    /// Wake cycle bounced through an error path — sleeping for the
+    /// failure-retry interval before trying again.
+    Stalled,
+    /// Idle, between wakes / serving the dev_server.
+    Ready,
+}
+
+impl Default for DeviceStatus {
+    fn default() -> Self {
+        Self::Booting
+    }
+}
+
+impl DeviceStatus {
+    /// Lower-case label for the status bar's "Status:" prefix.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Booting => "booting",
+            Self::Connecting => "connecting",
+            Self::DownloadingConfig => "downloading configuration",
+            Self::Updating => "updating",
+            Self::Stalled => "stalled",
+            Self::Ready => "ready",
+        }
+    }
+}
+
 /// L2 WiFi association. The runtime asks for an association each wake and a
 /// disconnect before sleep — IP-stack setup is the [`HttpTransport`]'s problem.
 pub trait WifiLink {
@@ -493,6 +534,12 @@ pub trait EpaperPanel {
     /// path in the firmware. Runtime calls this once per wake after
     /// successfully fetching /state.
     fn redraw_boot_screen(&mut self) {}
+    /// Push the high-level device status into the status bar's top-
+    /// left block. Default no-op. Runtime updates this at each
+    /// transition: Booting → Connecting → DownloadingConfig → Ready
+    /// (or → Updating / Stalled depending on what happens). The
+    /// compositor renders the human-readable label.
+    fn set_status(&mut self, _status: DeviceStatus) {}
     /// Append `bytes` to the panel's frame RAM at the current cursor. Chunk
     /// boundaries don't need to align to any pixel structure.
     fn write_chunk(&mut self, bytes: &[u8]);

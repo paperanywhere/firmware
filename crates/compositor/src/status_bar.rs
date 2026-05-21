@@ -27,7 +27,7 @@ use embedded_graphics::{
 use heapless::String as HString;
 
 use crate::{BuildInfo, MainRegion, battery_mv_to_percent};
-use paperanywhere_ports::ColorMode;
+use paperanywhere_ports::{ColorMode, DeviceStatus};
 
 /// Inputs the runtime supplies before each refresh. Owned by value
 /// inside the compositor; setters on the compositor's hook surface
@@ -56,6 +56,9 @@ pub struct StatusInputs {
     /// boot-screen overlay + left side of the status bar so the
     /// developer can `pa-dev push --device <ip>` without ARP-scanning.
     pub ip_address: Option<HString<24>>,
+    /// High-level lifecycle state shown in the bar's top-left
+    /// `Status: …` block. Defaults to `Booting`.
+    pub device_status: DeviceStatus,
 }
 
 /// Render the bar into `framebuffer` (Mono1bpp packed row-major,
@@ -131,21 +134,85 @@ fn draw_vertical_divider(target: &mut Mono1bppTarget<'_>, x: i32, height_px: u32
 // ── Right-side widgets ───────────────────────────────────────────────────────
 
 fn draw_wifi_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32, connected: bool) -> i32 {
-    let icon_size = crate::icons::ICON_PX as i32;
-    // Split padding evenly so the icon sits in the geometric middle
-    // of its cell (was right-flush, which read as visually pulled
-    // toward the panel border).
     const PADDING: i32 = 6;
+    let icon_size = crate::icons::ICON_PX as i32;
     let cell_width = icon_size + PADDING;
-    let top = ((target.height as i32) - icon_size) / 2;
-    let left = right_edge - icon_size - PADDING / 2;
+    // Center the icon on the geometric middle of its cell. The blit
+    // routine measures the bitmap's INK bounding box and offsets the
+    // paint so the inked pixels are centered — not the bitmap edges
+    // — which matters because the Font Awesome wifi-slash glyph's
+    // visible content sits in the lower-left of its 20 px square.
+    let cell_cx = right_edge - cell_width / 2;
+    let cell_cy = (target.height as i32) / 2;
     let bitmap = if connected {
         crate::icons::WIFI
     } else {
         crate::icons::WIFI_SLASH
     };
-    blit_mono_icon(target, bitmap, crate::icons::ICON_PX, crate::icons::ICON_PX, left, top);
+    blit_mono_icon_centered(
+        target,
+        bitmap,
+        crate::icons::ICON_PX,
+        crate::icons::ICON_PX,
+        cell_cx,
+        cell_cy,
+    );
     cell_width
+}
+
+/// Variant of [`blit_mono_icon`] that anchors on the icon's INK
+/// bounding box instead of the bitmap's geometric extent. Useful for
+/// Font Awesome glyphs whose drawn path doesn't fill the SVG viewBox
+/// evenly — left-biased ink would otherwise read as "hanging left"
+/// inside the cell.
+fn blit_mono_icon_centered(
+    target: &mut Mono1bppTarget<'_>,
+    bitmap: &[u8],
+    src_w: u32,
+    src_h: u32,
+    center_x: i32,
+    center_y: i32,
+) {
+    let stride = ((src_w + 7) / 8) as usize;
+    let mut min_x = src_w as i32;
+    let mut min_y = src_h as i32;
+    let mut max_x = -1i32;
+    let mut max_y = -1i32;
+    for sy in 0..src_h {
+        for sx in 0..src_w {
+            let byte_idx = sy as usize * stride + (sx / 8) as usize;
+            if byte_idx >= bitmap.len() {
+                continue;
+            }
+            let bit_mask = 1u8 << (7 - (sx % 8));
+            if bitmap[byte_idx] & bit_mask == 0 {
+                let x = sx as i32;
+                let y = sy as i32;
+                if x < min_x {
+                    min_x = x;
+                }
+                if x > max_x {
+                    max_x = x;
+                }
+                if y < min_y {
+                    min_y = y;
+                }
+                if y > max_y {
+                    max_y = y;
+                }
+            }
+        }
+    }
+    if max_x < 0 {
+        // No ink — nothing to draw.
+        return;
+    }
+    let bbox_cx = (min_x + max_x) / 2;
+    let bbox_cy = (min_y + max_y) / 2;
+    // Shift the source so bbox center lands on (center_x, center_y).
+    let dst_x = center_x - bbox_cx;
+    let dst_y = center_y - bbox_cy;
+    blit_mono_icon(target, bitmap, src_w, src_h, dst_x, dst_y);
 }
 
 /// Stamp a build-time-rasterised Mono1bpp icon onto the framebuffer.
@@ -258,11 +325,14 @@ fn draw_left_info(
     let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
     let baseline = (target.height as i32) / 2 + 4;
 
-    // "Last Update: HH:MM" — the only text on the bar's left side.
-    // IP and Device UUID live on the boot screen; the status bar is
-    // intentionally compact so the chrome icons dominate.
-    let mut line: HString<48> = HString::new();
-    let _ = line.push_str("Last Update: ");
+    // "Status: <state>   |   Last Update: HH:MM" — left-side text.
+    // Status is the device's lifecycle phase (booting / connecting /
+    // downloading configuration / updating / stalled / ready). IP +
+    // Device UUID live on the boot screen, not here.
+    let mut line: HString<96> = HString::new();
+    let _ = line.push_str("Status: ");
+    let _ = line.push_str(status.device_status.label());
+    let _ = line.push_str("   |   Last Update: ");
     match status.last_update_local.as_ref() {
         Some(t) => {
             let _ = line.push_str(t.as_str());

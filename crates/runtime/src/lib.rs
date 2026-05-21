@@ -26,8 +26,8 @@ use alloc::string::ToString;
 
 use log::{debug, error, info, warn};
 use paperanywhere_ports::{
-    AckPhase, DeviceAck, EpaperPanel, FirmwareUpdater, HttpTransport, NvsStore, PowerPolicy,
-    Sleeper, WifiLink,
+    AckPhase, DeviceAck, DeviceStatus, EpaperPanel, FirmwareUpdater, HttpTransport, NvsStore,
+    PowerPolicy, Sleeper, WifiLink,
 };
 
 /// Reasons a single wake cycle can fail. All non-fatal — the loop logs and
@@ -118,9 +118,13 @@ where
         )
         .await
         {
-            Ok((secs, p)) => (secs, p),
+            Ok((secs, p)) => {
+                panel.set_status(DeviceStatus::Ready);
+                (secs, p)
+            }
             Err(e) => {
                 warn!("wake: cycle failed: {:?}", e);
+                panel.set_status(DeviceStatus::Stalled);
                 (FAILURE_RETRY_SEC, active_policy)
             }
         };
@@ -150,6 +154,7 @@ where
     F: FirmwareUpdater,
 {
     let creds = nvs.load_wifi_creds().ok_or(WakeError::NoWifiCreds)?;
+    panel.set_status(DeviceStatus::Connecting);
     info!("wake: associating to SSID \"{}\"", creds.ssid.as_str());
     wifi.associate(&creds).await.map_err(|e| {
         error!("wake: wifi.associate FAILED: {:?}", e);
@@ -218,14 +223,20 @@ where
             // DO NOT disconnect — the dev_server task is still bound to
             // the same embassy-net stack and the user might `pa-dev push`
             // at any moment. We want the IP to stick around.
+            panel.set_status(DeviceStatus::Ready);
             return Ok((FAILURE_RETRY_SEC, PowerPolicy::AlwaysOn));
         }
     };
 
-    let state = http.get_state(&token).await.map_err(|e| {
-        error!("wake: get_state: {:?}", e);
-        WakeError::StateFetch
-    })?;
+    panel.set_status(DeviceStatus::DownloadingConfig);
+    let state = match http.get_state(&token).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("wake: get_state: {:?}", e);
+            panel.set_status(DeviceStatus::Stalled);
+            return Err(WakeError::StateFetch);
+        }
+    };
 
     // Firmware update offered? Apply it BEFORE rendering anything else —
     // if the install succeeds the device reboots and we never reach the
