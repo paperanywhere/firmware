@@ -132,16 +132,20 @@ fn draw_vertical_divider(target: &mut Mono1bppTarget<'_>, x: i32, height_px: u32
 
 fn draw_wifi_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32, connected: bool) -> i32 {
     let icon_size = crate::icons::ICON_PX as i32;
+    // Split padding evenly so the icon sits in the geometric middle
+    // of its cell (was right-flush, which read as visually pulled
+    // toward the panel border).
     const PADDING: i32 = 6;
+    let cell_width = icon_size + PADDING;
     let top = ((target.height as i32) - icon_size) / 2;
-    let left = right_edge - icon_size;
+    let left = right_edge - icon_size - PADDING / 2;
     let bitmap = if connected {
         crate::icons::WIFI
     } else {
         crate::icons::WIFI_SLASH
     };
     blit_mono_icon(target, bitmap, crate::icons::ICON_PX, crate::icons::ICON_PX, left, top);
-    icon_size + PADDING
+    cell_width
 }
 
 /// Stamp a build-time-rasterised Mono1bpp icon onto the framebuffer.
