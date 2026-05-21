@@ -89,7 +89,7 @@ pub fn render(
     // 1 px vertical divider on each cell's LEFT edge so cells are
     // visually separated.
     let inset = 1; // border eats one pixel
-    let mut right = (width_px as i32) - inset - 4; // 4 px right margin
+    let mut right = (width_px as i32) - inset - 10; // 10 px right margin (was 4 — keeps the wifi glyph + BATT label off the panel edge)
 
     let cell_width = draw_wifi_cell(&mut target, right, status.wifi_rssi_dbm.is_some());
     let next_right = right - cell_width;
@@ -179,6 +179,11 @@ fn draw_battery_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32, mv: Optio
     // No glyph at all — the cell border + the all-caps "BATT" suffix
     // are enough to identify the field without a battery icon.
     const PADDING: i32 = 6;
+    // Inset so the last character isn't kissing the divider on its
+    // right. embedded-graphics right-alignment puts the text's last
+    // pixel at the given x; we offset 4 px inward to leave breathing
+    // room between the "T" of BATT and the cell boundary.
+    const TEXT_RIGHT_INSET: i32 = 4;
     let baseline = (target.height as i32) / 2 + 4;
     let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
     let right_aligned = TextStyleBuilder::new()
@@ -202,14 +207,14 @@ fn draw_battery_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32, mv: Optio
 
     let _ = Text::with_text_style(
         text.as_str(),
-        Point::new(right_edge, baseline),
+        Point::new(right_edge - TEXT_RIGHT_INSET, baseline),
         style,
         right_aligned,
     )
     .draw(target);
 
-    // 9 chars max ("100% BATT") × 6 px per char + padding.
-    (text.len() as i32) * 6 + PADDING
+    // 9 chars max ("100% BATT") × 6 px per char + inset + padding.
+    (text.len() as i32) * 6 + TEXT_RIGHT_INSET + PADDING
 }
 
 fn draw_usb_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32) -> i32 {
