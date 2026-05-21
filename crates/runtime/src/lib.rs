@@ -112,26 +112,90 @@ where
     }
     let mut active_policy = default_policy;
 
+    let mut wake_counter: u32 = 0;
+    let mut consecutive_failures: u32 = 0;
+    // Boot screen is a one-time render after cold boot + first DHCP.
+    // boot.rs paints the splash with IP="connecting..."; the runtime
+    // does ONE redraw with the real IP overlay and then leaves the
+    // panel alone until an image or the adoption screen replaces it.
+    // Subsequent wakes don't touch the boot screen.
+    let mut boot_screen_finalized: bool = false;
     loop {
+        wake_counter = wake_counter.wrapping_add(1);
+        info!(
+            "=== wake #{} start (consecutive failures: {}, boot finalized: {}) ===",
+            wake_counter, consecutive_failures, boot_screen_finalized
+        );
         let (sleep_seconds, policy) = match single_wake_cycle(
-            wifi, http, nvs, panel, sleeper, fw_updater, ota_screen,
+            wifi,
+            http,
+            nvs,
+            panel,
+            sleeper,
+            fw_updater,
+            ota_screen,
+            &mut boot_screen_finalized,
         )
         .await
         {
             Ok((secs, p)) => {
+                if consecutive_failures > 0 {
+                    info!(
+                        "wake #{}: recovered after {} consecutive failures",
+                        wake_counter, consecutive_failures
+                    );
+                }
+                consecutive_failures = 0;
+                info!("wake #{}: cycle ok, sleeping {}s", wake_counter, secs);
                 panel.set_status(DeviceStatus::Ready);
                 (secs, p)
             }
             Err(e) => {
-                warn!("wake: cycle failed: {:?}", e);
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                warn!(
+                    "wake #{}: cycle failed ({:?}) — consecutive failure #{} of {}",
+                    wake_counter, e, consecutive_failures, FAILURE_LIMIT_BEFORE_HALT
+                );
                 panel.set_status(DeviceStatus::Stalled);
-                (FAILURE_RETRY_SEC, active_policy)
+                if consecutive_failures >= FAILURE_LIMIT_BEFORE_HALT {
+                    error!(
+                        "wake #{}: hit failure limit ({} consecutive) — halting device",
+                        wake_counter, consecutive_failures
+                    );
+                    halt_with_screen(
+                        panel,
+                        "Your device ran into a problem.",
+                        "Too many consecutive failures reaching the backend.",
+                        "PA-NET-001",
+                    );
+                }
+                // Exponential backoff: 2^N seconds, capped at 30 s.
+                // Sequence: 1, 2, 4, 8, 16, 30, 30, ... so the device
+                // retries fast initially and settles at 30 s while
+                // approaching the halt threshold.
+                let exp = consecutive_failures.saturating_sub(1).min(10);
+                let backoff = (1u32 << exp).min(MAX_BACKOFF_SEC);
+                info!(
+                    "wake #{}: backing off {}s before next attempt",
+                    wake_counter, backoff
+                );
+                (backoff, active_policy)
             }
         };
         active_policy = policy;
         sleeper.sleep_for(sleep_seconds, active_policy);
     }
 }
+
+/// Halt threshold — number of consecutive `single_wake_cycle` failures
+/// before the runtime paints the BSOD-style halt screen and stops
+/// trying. Beyond this point only a power-cycle or re-provision
+/// recovers the device.
+const FAILURE_LIMIT_BEFORE_HALT: u32 = 30;
+
+/// Cap on the exponential-backoff sleep between failed wake cycles.
+/// Pattern: 1, 2, 4, 8, 16, then 30 s until the halt threshold.
+const MAX_BACKOFF_SEC: u32 = 30;
 
 /// Single wake: associate, fetch state, maybe render, ack, disconnect.
 /// Returns `(seconds_to_sleep, policy_to_use)` so the outer loop knows when
@@ -144,6 +208,7 @@ async fn single_wake_cycle<W, H, N, P, S, F>(
     sleeper: &mut S,
     fw_updater: &mut F,
     ota_screen: &[u8],
+    boot_screen_finalized: &mut bool,
 ) -> Result<(u32, PowerPolicy), WakeError>
 where
     W: WifiLink,
@@ -168,88 +233,84 @@ where
     panel.on_wifi_state_changed(wifi.rssi_dbm());
     panel.on_battery_sample(sleeper.battery_mv());
 
-    // Poll the wifi stack briefly for the DHCP-assigned IP, then push
-    // it into the compositor + redraw the boot screen. We do this
-    // BEFORE the token check so an unclaimed dev device still shows
-    // its IP on the panel (so the user can `pa-dev push` to it).
-    let ip = wait_for_local_ip(wifi).await;
-    if let Some(ip) = ip {
+    // Poll the wifi stack briefly for the DHCP-assigned IP. We push
+    // it into the compositor's status state regardless of which main-
+    // region view we end up painting, since the IP is used by both
+    // the boot screen overlay AND the adoption screen.
+    let ip_bytes = wait_for_local_ip(wifi).await;
+    let ip_string: Option<alloc::string::String> = ip_bytes.map(|ip| {
         let mut buf: alloc::string::String = alloc::string::String::with_capacity(16);
         let _ = core::fmt::write(
             &mut buf,
             format_args!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
         );
+        buf
+    });
+    if let Some(buf) = ip_string.as_ref() {
         info!("wake: local IP = {}", buf);
-        panel.set_ip(&buf);
-        // Connecting is no longer accurate — WiFi is up + we have an
-        // IP. Transition the status before the redraw so the bar
-        // doesn't paint a stale "connecting" alongside the new IP
-        // and the connected wifi icon. The /state call right below
-        // will flip it to DownloadingConfig briefly; the outer loop
-        // sets Ready at end of cycle.
-        panel.set_status(DeviceStatus::Ready);
-        panel.redraw_boot_screen();
-        panel.compose();
-        let pending = panel.pending_hash();
-        let cached = nvs.load_last_render_hash();
-        if pending.is_none() || pending != cached {
-            info!("wake: boot-screen template differs (likely IP changed) — refreshing");
-            panel.refresh();
-            if let Some(h) = pending {
-                nvs.save_last_render_hash(h);
-            }
-        }
+        panel.set_ip(buf);
     } else {
         warn!("wake: DHCP didn't complete within wait window");
-        // Stamp the IP field so the boot screen reflects the failure
-        // instead of staying stuck on "connecting...".
         panel.set_ip("no DHCP");
+    }
+
+    // Branch on token presence BEFORE touching the main region so we
+    // never ping-pong between boot screen and adoption screen on
+    // unclaimed devices (each would have a different hash, so dedup
+    // would flip on every wake).
+    let token_opt = nvs.load_device_token();
+    info!(
+        "wake: token in NVS? {}",
+        if token_opt.is_some() { "yes — render boot screen + /state" } else { "no — render adoption screen" }
+    );
+    let Some(token) = token_opt else {
+        warn!(
+            "wake: no device token (unclaimed) — adoption screen on main region, skipping /state"
+        );
+        panel.set_status(DeviceStatus::WaitingForAdoption);
+        paint_adoption_screen(panel, nvs, wifi);
+        // Keep wifi up so the dev_server stays reachable for `pa-dev push`.
+        return Ok((FAILURE_RETRY_SEC, PowerPolicy::AlwaysOn));
+    };
+
+    // Claimed device: paint the boot screen with the live IP — but
+    // ONLY ONCE per cold boot. Subsequent wakes leave the panel
+    // alone; /state's image render is what next touches the main
+    // region. The boot screen isn't re-rendered on every poll
+    // because that would burn an e-ink refresh for no visible change.
+    panel.set_status(DeviceStatus::Ready);
+    if !*boot_screen_finalized && ip_string.is_some() {
+        info!("boot-screen: one-time post-DHCP redraw to overlay IP");
         panel.redraw_boot_screen();
         panel.compose();
         let pending = panel.pending_hash();
         let cached = nvs.load_last_render_hash();
+        info!(
+            "boot-screen: pending_hash={:?} cached_hash={:?}",
+            pending.map(|h| h & 0xFFFF_FFFF),
+            cached.map(|h| h & 0xFFFF_FFFF)
+        );
         if pending.is_none() || pending != cached {
+            info!("boot-screen: refreshing panel");
             panel.refresh();
             if let Some(h) = pending {
                 nvs.save_last_render_hash(h);
             }
         }
+        *boot_screen_finalized = true;
+    } else {
+        info!(
+            "boot-screen: already finalized this boot — leaving panel alone (image render path handles updates)"
+        );
     }
-
-    // Now check for a device token. Without one we can't hit /state, but
-    // the panel is up + the dev_server is reachable, which is enough
-    // for a dev rig waiting to be claimed (or for `pa-dev push` to
-    // flash a new build). Return Ok so the caller doesn't trigger the
-    // failure-retry path and we sleep our normal interval.
-    let token = match nvs.load_device_token() {
-        Some(t) => t,
-        None => {
-            warn!(
-                "wake: no device token in NVS (not yet claimed) — rendering adoption screen + sleeping until next wake"
-            );
-            // The device is unclaimed. Show the adoption screen on
-            // the main region with the QR + claim code so the user
-            // can adopt it via the frontend. dev_server stays up
-            // for direct OTA pushes in the meantime.
-            panel.set_status(DeviceStatus::WaitingForAdoption);
-            paint_adoption_screen(panel, nvs, wifi);
-            // DO NOT disconnect — the dev_server task is still bound to
-            // the same embassy-net stack and we want the IP to stick around.
-            return Ok((FAILURE_RETRY_SEC, PowerPolicy::AlwaysOn));
-        }
-    };
 
     panel.set_status(DeviceStatus::DownloadingConfig);
     let state = match http.get_state(&token).await {
         Ok(s) => s,
         Err(e) => {
             error!("wake: get_state failed: {:?}", e);
-            halt_with_screen(
-                panel,
-                "Your device ran into a problem.",
-                "Could not reach the configured backend.",
-                "PA-NET-001",
-            );
+            panel.set_status(DeviceStatus::Stalled);
+            return Err(WakeError::StateFetch);
         }
     };
 
@@ -407,7 +468,7 @@ fn halt_with_screen<P: EpaperPanel>(
 /// is associated (has an IP) but has no `device_token` yet. Reads
 /// the cached claim code from NVS — empty placeholder until task #84
 /// wires the backend's /api/device/claim-code/request endpoint.
-fn paint_adoption_screen<P, N, W>(panel: &mut P, nvs: &N, wifi: &W)
+fn paint_adoption_screen<P, N, W>(panel: &mut P, nvs: &mut N, wifi: &W)
 where
     P: EpaperPanel,
     N: NvsStore,
@@ -431,24 +492,36 @@ where
         .local_ip()
         .map(|ip| alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]))
         .unwrap_or_else(|| alloc::string::String::from("--"));
-    // Backend URL comes from the prov partition / NVS (provtool bakes
-    // it in at flash time). For local dev that's something like
-    // http://10.0.1.109:8080 — we append `/adopt` so the QR sends the
-    // user to a path the backend can route to the frontend's adopt
-    // page (the backend may proxy or 302 to the actual frontend).
+    // Backend URL from prov / NVS — see comment in single_wake_cycle.
     let base_url = nvs
         .load_backend_url()
         .unwrap_or_else(|| alloc::string::String::from("https://paperanywhere.io"));
     let mut adopt_url = alloc::string::String::new();
     adopt_url.push_str(base_url.trim_end_matches('/'));
     adopt_url.push_str("/adopt");
+
+    info!(
+        "adoption: claim_code={} device_id={} ip={} url={}",
+        claim_code, device_id, ip, adopt_url
+    );
     panel.render_adoption_screen(&claim_code, &device_id, &ip, &adopt_url);
     panel.compose();
-    // Adoption screen always paints — hash dedup still applies, but
-    // unconditionally calling refresh is cheap when the bytes match
-    // (compositor's refresh writes the same framebuffer the panel
-    // already shows).
-    panel.refresh();
+    let pending = panel.pending_hash();
+    let cached = nvs.load_last_render_hash();
+    info!(
+        "adoption: pending_hash={:?} cached_hash={:?}",
+        pending.map(|h| h & 0xFFFF_FFFF),
+        cached.map(|h| h & 0xFFFF_FFFF)
+    );
+    if pending.is_none() || pending != cached {
+        info!("adoption: hash differs — refreshing panel");
+        panel.refresh();
+        if let Some(h) = pending {
+            nvs.save_last_render_hash(h);
+        }
+    } else {
+        info!("adoption: hash matches — skipping refresh");
+    }
 }
 
 /// Poll `wifi.local_ip()` with a small back-off until it returns Some

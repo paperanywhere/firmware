@@ -385,21 +385,17 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
     }
 
     fn refresh(&mut self) {
-        // Stream the staged framebuffer to the panel. The runtime is
-        // expected to have called `compose()` (and consulted
-        // `pending_hash()`) immediately before this; calling refresh
-        // without compose is fine too, the framebuffer just won't have
-        // the latest status bar painted.
-        //
-        // Promote every Nth refresh to a full-LUT cycle to clear
-        // partial-LUT ghosting; the rest run the partial path. On
-        // panels without partial-LUT support `refresh_fast` is a
-        // default that falls through to `refresh`, so the per-N
-        // alternation is a no-op there.
+        self.refresh_count = self.refresh_count.wrapping_add(1);
+        let full = self.refresh_count.is_multiple_of(FULL_REFRESH_EVERY);
+        log::info!(
+            "compositor::refresh #{} ({} LUT) — flushing {} bytes",
+            self.refresh_count,
+            if full { "FULL" } else { "fast" },
+            self.framebuffer.len()
+        );
         self.panel.init();
         self.panel.write_chunk(&self.framebuffer);
-        self.refresh_count = self.refresh_count.wrapping_add(1);
-        if self.refresh_count.is_multiple_of(FULL_REFRESH_EVERY) {
+        if full {
             self.panel.refresh();
         } else {
             self.panel.refresh_fast();
@@ -409,9 +405,10 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
     }
 
     fn refresh_fast(&mut self) {
-        // Caller explicitly asked for the fast path — honour it. Don't
-        // touch refresh_count here; full-refresh cadence is driven by
-        // the unconditional refresh() entry above.
+        log::info!(
+            "compositor::refresh_fast — flushing {} bytes",
+            self.framebuffer.len()
+        );
         self.panel.init();
         self.panel.write_chunk(&self.framebuffer);
         self.panel.refresh_fast();
