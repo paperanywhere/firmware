@@ -311,6 +311,14 @@ fn draw_left_info(
 /// center of the main region. Called from `boot.rs` after the boot-
 /// screen logo has been blitted into the main-region framebuffer.
 pub fn draw_build_info(region: &mut MainRegion<'_>, info: &BuildInfo) {
+    draw_build_info_with_ip(region, info, None)
+}
+
+/// Same as [`draw_build_info`] plus an optional IP line under the
+/// build time. Used by the compositor's `redraw_boot_screen` path
+/// after DHCP completes — lets the developer read the device's IP
+/// off the panel for `pa-dev push --device <ip>`.
+pub fn draw_build_info_with_ip(region: &mut MainRegion<'_>, info: &BuildInfo, ip: Option<&str>) {
     if !matches!(region.color_mode, ColorMode::Mono1bpp) {
         return;
     }
@@ -325,9 +333,32 @@ pub fn draw_build_info(region: &mut MainRegion<'_>, info: &BuildInfo) {
     let center_x = (region.width_px as i32) / 2;
     let bottom_y = (region.height_px as i32) - 8;
 
+    // Lines stack upward from the bottom margin:
+    //   bottom_y                          IP line (only when present)
+    //   bottom_y - 12                     build_time
+    //   bottom_y - 26                     version + (DEV) tag
+    let (build_time_y, version_y) = match ip {
+        Some(_) => (bottom_y - 12, bottom_y - 26),
+        None => (bottom_y, bottom_y - 14),
+    };
+
+    if let Some(ip_str) = ip {
+        // Prefix with "IP: " so the line is unambiguous.
+        let mut ip_line: HString<48> = HString::new();
+        let _ = ip_line.push_str("IP: ");
+        let _ = ip_line.push_str(ip_str);
+        let _ = Text::with_text_style(
+            ip_line.as_str(),
+            Point::new(center_x, bottom_y),
+            style,
+            centered,
+        )
+        .draw(&mut target);
+    }
+
     let _ = Text::with_text_style(
         info.build_time,
-        Point::new(center_x, bottom_y),
+        Point::new(center_x, build_time_y),
         style,
         centered,
     )
@@ -344,7 +375,7 @@ pub fn draw_build_info(region: &mut MainRegion<'_>, info: &BuildInfo) {
     }
     let _ = Text::with_text_style(
         version_line.as_str(),
-        Point::new(center_x, bottom_y - 14),
+        Point::new(center_x, version_y),
         bold,
         centered,
     )

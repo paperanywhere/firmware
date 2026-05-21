@@ -14,6 +14,8 @@
 use alloc::string::String;
 
 use embassy_futures::block_on;
+use embassy_futures::select::{Either, select};
+use embassy_time::{Duration, Timer};
 use esp_hal::interrupt::software::SoftwareInterrupt;
 use esp_hal::peripherals::{RNG, TIMG0, WIFI};
 use esp_hal::timer::timg::TimerGroup;
@@ -30,6 +32,11 @@ pub enum WifiError {
     BadCreds,
     SetConfig,
     ConnectFailed,
+    /// esp-radio's connect future didn't resolve within the bounded
+    /// wait window. Either the AP is unreachable, creds are wrong,
+    /// or the WPA handshake stalled. Caller logs + retries on the
+    /// next wake instead of blocking forever.
+    Timeout,
 }
 
 /// Owns the active controller after a successful `init`. Implements
@@ -102,8 +109,22 @@ impl WifiLink for FwWifi {
         // `set_config` performs an implicit `esp_wifi_start` when mode goes
         // NULL → STA, so there's no separate `start` to call.
         self.controller.set_config(&cfg).map_err(|_| WifiError::SetConfig)?;
-        block_on(self.controller.connect_async()).map_err(|_| WifiError::ConnectFailed)?;
-        Ok(())
+        // Race the connect future against a 25 s timeout so we never
+        // hang the wake cycle on a stalled WPA handshake or stale AP.
+        // Caller logs the failure + falls back to the FAILURE_RETRY_SEC
+        // sleep, which gives us another shot on the next wake.
+        let result = block_on(async {
+            select(
+                self.controller.connect_async(),
+                Timer::after(Duration::from_secs(25)),
+            )
+            .await
+        });
+        match result {
+            Either::First(Ok(_info)) => Ok(()),
+            Either::First(Err(_)) => Err(WifiError::ConnectFailed),
+            Either::Second(_) => Err(WifiError::Timeout),
+        }
     }
 
     fn disconnect(&mut self) -> Result<(), Self::Error> {

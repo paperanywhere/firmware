@@ -48,6 +48,10 @@ enum Cmd {
     /// GET the dev device's /info endpoint and pretty-print the JSON
     /// (firmware version, board, channel, IP, etc.).
     Info(InfoArgs),
+    /// Erase the NVS partition over serial so the next boot migrates
+    /// fresh credentials from the prov partition. Use when WiFi creds
+    /// were updated but the device's NVS cache still has the old ones.
+    FactoryReset(FactoryResetArgs),
 }
 
 #[derive(Args, Debug)]
@@ -128,6 +132,13 @@ struct InfoArgs {
     port: u16,
 }
 
+#[derive(Args, Debug)]
+struct FactoryResetArgs {
+    /// Serial port the device is attached to.
+    #[arg(long, default_value = "COM6")]
+    port: String,
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
@@ -137,7 +148,28 @@ fn main() -> Result<()> {
         Cmd::Monitor(a) => run_monitor(a),
         Cmd::Push(a) => run_push(a),
         Cmd::Info(a) => run_info(a),
+        Cmd::FactoryReset(a) => run_factory_reset(a),
     }
+}
+
+fn run_factory_reset(args: FactoryResetArgs) -> Result<()> {
+    // espflash 4.x's `erase-region` takes (offset, size) and clears
+    // the underlying flash. NVS lives at 0x9000, size 24 KB (0x6000),
+    // matching crates/firmware/flash/partition-table.csv.
+    println!("pa-dev: erasing NVS region (0x9000, 24 KB) on {}", args.port);
+    let status = Command::new(espflash_bin())
+        .args(["erase-region", "--port", &args.port, "0x9000", "0x6000"])
+        .status()
+        .context("invoke espflash erase-region")?;
+    if !status.success() {
+        bail!("espflash erase-region failed: exit {:?}", status.code());
+    }
+    println!(
+        "pa-dev: NVS wiped. On next boot the firmware will re-migrate \
+         from the prov partition. Flash a fresh prov.bin via `pa-dev \
+         provision` if you also want to update WiFi creds."
+    );
+    Ok(())
 }
 
 // ── Provision ───────────────────────────────────────────────────────────────

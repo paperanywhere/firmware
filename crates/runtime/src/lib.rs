@@ -150,28 +150,18 @@ where
     F: FirmwareUpdater,
 {
     let creds = nvs.load_wifi_creds().ok_or(WakeError::NoWifiCreds)?;
+    info!("wake: associating to SSID \"{}\"", creds.ssid.as_str());
     wifi.associate(&creds).map_err(|e| {
-        error!("wake: wifi.associate: {:?}", e);
+        error!("wake: wifi.associate FAILED: {:?}", e);
         // Tell the compositor we're disconnected before bailing so any
         // subsequent forced refresh (e.g. boot screen on a retry) shows
         // the slashed wifi icon.
         panel.on_wifi_state_changed(None);
         WakeError::WifiAssociate
     })?;
-    // Association succeeded — push the new RSSI + IP into the status
-    // bar. The IP comes from DHCP via the embassy-net stack; on the
-    // sim path it'll be the host's loopback (or whatever the impl
-    // chooses).
+    info!("wake: wifi associated ok");
     panel.on_wifi_state_changed(wifi.rssi_dbm());
     panel.on_battery_sample(sleeper.battery_mv());
-    if let Some(ip) = wifi.local_ip() {
-        let mut buf: alloc::string::String = alloc::string::String::with_capacity(16);
-        let _ = core::fmt::write(
-            &mut buf,
-            format_args!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
-        );
-        panel.set_ip(&buf);
-    }
 
     let token = nvs.load_device_token().ok_or(WakeError::NoDeviceToken)?;
 
@@ -179,6 +169,36 @@ where
         error!("wake: get_state: {:?}", e);
         WakeError::StateFetch
     })?;
+    // DHCP has definitely completed by now — http.get_state opened a TCP
+    // connection, which can't happen without an IP. Query + push to the
+    // compositor (status bar + boot-screen overlay both consume it),
+    // then ask the panel to re-paint its cached boot template so the
+    // IP line lands under the version on the splash.
+    if let Some(ip) = wifi.local_ip() {
+        let mut buf: alloc::string::String = alloc::string::String::with_capacity(16);
+        let _ = core::fmt::write(
+            &mut buf,
+            format_args!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
+        );
+        info!("wake: local IP = {}", buf);
+        panel.set_ip(&buf);
+        // Stage a fresh boot-screen render with the IP overlaid; the
+        // compose + hash dedup below decides whether to actually flush
+        // (it will on the first wake of each boot since the IP is new).
+        panel.redraw_boot_screen();
+        panel.compose();
+        let pending = panel.pending_hash();
+        let cached = nvs.load_last_render_hash();
+        if pending.is_none() || pending != cached {
+            info!("wake: boot-screen template differs (likely IP changed) — refreshing");
+            panel.refresh();
+            if let Some(h) = pending {
+                nvs.save_last_render_hash(h);
+            }
+        }
+    } else {
+        warn!("wake: /state succeeded but wifi.local_ip() returned None — stack config seam?");
+    }
 
     // Firmware update offered? Apply it BEFORE rendering anything else —
     // if the install succeeds the device reboots and we never reach the

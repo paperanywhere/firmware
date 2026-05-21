@@ -484,6 +484,14 @@ pub trait EpaperPanel {
     /// bar's left-side info text. Runtime sets this once DHCP
     /// resolves, after `WifiLink::associate` succeeds.
     fn set_ip(&mut self, _ip: &str) {}
+    /// Re-paint the boot-screen template with current chrome state
+    /// (notably the IP, which lands under the version line). Default
+    /// no-op for bare drivers; compositors that cache the boot screen
+    /// at startup use this to refresh the splash once DHCP completes,
+    /// so the IP shows up on the panel without a separate render
+    /// path in the firmware. Runtime calls this once per wake after
+    /// successfully fetching /state.
+    fn redraw_boot_screen(&mut self) {}
     /// Append `bytes` to the panel's frame RAM at the current cursor. Chunk
     /// boundaries don't need to align to any pixel structure.
     fn write_chunk(&mut self, bytes: &[u8]);

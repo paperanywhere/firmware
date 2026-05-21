@@ -147,12 +147,20 @@ pub fn run(resources: FirmwareResources) -> ! {
     // also counts as "new content" — the previous wake's battery %
     // becoming stale doesn't get skipped just because the boot screen
     // bytes are identical.
+    // Cache the boot screen on the compositor so the runtime can
+    // re-render it after DHCP (with the IP overlaid under the version
+    // line). The initial paint below uses the same template with
+    // ip=None so the panel comes up immediately, even before WiFi
+    // associates.
+    let build_info = crate::build_info(nvs_ref.load_is_dev_build());
+    panel_ref.cache_boot_template(BOOT_SCREEN, build_info);
+
     panel_ref.init();
     panel_ref.set_chrome(sleeper_ref.battery_mv(), None);
     panel_ref.write_chunk(BOOT_SCREEN);
     {
         let mut region = panel_ref.main_region_mut();
-        crate::build_info(nvs_ref.load_is_dev_build()).render_into(&mut region);
+        build_info.render_into(&mut region);
     }
     panel_ref.compose();
     let pending = panel_ref.pending_hash();

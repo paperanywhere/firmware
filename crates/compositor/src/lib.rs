@@ -72,6 +72,18 @@ pub struct Compositor<P: EpaperPanel> {
     /// [`Compositor::update_status`]; rendered into the top region
     /// during `refresh()`.
     status: StatusInputs,
+    /// Cached boot screen + build info. Set once at boot.rs time via
+    /// [`Compositor::cache_boot_template`]; consumed by
+    /// [`EpaperPanel::redraw_boot_screen`] when the runtime wants to
+    /// repaint the splash after DHCP comes up (so the IP can land on
+    /// the boot-screen overlay, not just the status bar).
+    boot_template: Option<BootTemplate>,
+}
+
+#[derive(Debug, Clone)]
+struct BootTemplate {
+    bytes: &'static [u8],
+    info: BuildInfo,
 }
 
 impl<P: EpaperPanel> Compositor<P> {
@@ -103,7 +115,17 @@ impl<P: EpaperPanel> Compositor<P> {
             framebuffer,
             main_cursor: main_region_offset(width_px, status_bar_height, color_mode),
             status: StatusInputs::default(),
+            boot_template: None,
         }
+    }
+
+    /// Cache the boot screen bytes + build info so the runtime can ask
+    /// for a repaint later (e.g. when DHCP completes and we want to
+    /// add the IP line under the version stamp). One-shot from
+    /// `boot::run`; the compositor holds &'static refs so there's no
+    /// allocation here.
+    pub fn cache_boot_template(&mut self, bytes: &'static [u8], info: BuildInfo) {
+        self.boot_template = Some(BootTemplate { bytes, info });
     }
 
     /// Width of the visible main region in pixels. Backend code building
@@ -185,6 +207,41 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
         let mut s: heapless::String<24> = heapless::String::new();
         let _ = s.push_str(ip);
         self.status.ip_address = Some(s);
+    }
+
+    fn redraw_boot_screen(&mut self) {
+        let Some(tpl) = self.boot_template.clone() else {
+            return;
+        };
+        // Reset framebuffer to white, then blit the cached boot screen
+        // into the main region.
+        for b in self.framebuffer.iter_mut() {
+            *b = 0xFF;
+        }
+        self.main_cursor =
+            main_region_offset(self.width_px, self.status_bar_height, self.color_mode);
+        let end = (self.main_cursor + tpl.bytes.len()).min(self.framebuffer.len());
+        let take = end - self.main_cursor;
+        self.framebuffer[self.main_cursor..end].copy_from_slice(&tpl.bytes[..take]);
+        self.main_cursor = end;
+
+        // Paint the build-info overlay (version + build time + IP if
+        // we have it) onto the main region. The IP string is copied
+        // out before taking the mutable borrow on `framebuffer` so we
+        // don't end up holding two borrows on `self` at once.
+        let ip_copy: Option<heapless::String<24>> = self.status.ip_address.clone();
+        let width_px = self.width_px;
+        let height_px = self.main_height_px();
+        let color_mode = self.color_mode;
+        let offset = main_region_offset(width_px, self.status_bar_height, color_mode);
+        let mut region = MainRegion {
+            bytes: &mut self.framebuffer[offset..],
+            width_px,
+            height_px,
+            color_mode,
+        };
+        let ip_ref: Option<&str> = ip_copy.as_ref().map(|s| s.as_str());
+        crate::status_bar::draw_build_info_with_ip(&mut region, &tpl.info, ip_ref);
     }
 
     fn init(&mut self) {
