@@ -2,14 +2,16 @@
 //!
 //! Layout (left → right):
 //!
-//!   [Device ID: D-3F2A  |  Last Update: 10:23][USB][Battery 87%][WiFi]
+//!   [IP: 10.0.1.42  |  Last Update: 10:23][USB][Battery 87%][WiFi]
 //!
 //! - 1 px black border framing the whole bar (top + bottom + sides).
 //! - 1 px vertical dividers between widget cells on the right side.
-//! - Left half is informational text: short device id + the local time
+//! - Left half is informational text: current IP state + local time
 //!   of the most recent panel refresh.
 //! - Right side has the chrome icons: USB (only when a serial host is
 //!   present), battery + percent, wifi.
+//! - Device ID lives on the boot screen (under the version line), not
+//!   here — kept off the bar to keep the chrome compact.
 
 use embedded_graphics::{
     geometry::{Point, Size},
@@ -259,27 +261,29 @@ fn draw_left_info(
     let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
     let baseline = (target.height as i32) / 2 + 4;
 
-    // Build "Device ID: XXX  |  IP: 10.0.1.42  |  Last Update: YYY"
-    // without alloc::format. heapless::String<160> is sized for the
-    // worst case (24 + 24 + 24 + labels + separators ≈ 100 chars).
-    let mut line: HString<160> = HString::new();
-    let _ = line.push_str("Device ID: ");
-    if let Some(id) = status.device_id.as_ref() {
-        let _ = line.push_str(id.as_str());
-    } else {
-        let _ = line.push_str("--");
-    }
-    let _ = line.push_str("  |  IP: ");
-    if let Some(ip) = status.ip_address.as_ref() {
-        let _ = line.push_str(ip.as_str());
-    } else {
-        let _ = line.push_str("--");
+    // Build "IP: <state>  |  Last Update: YYY" without alloc::format.
+    // The IP field is always present — its content is whatever string
+    // the runtime last pushed (e.g. "10.0.1.42", "connecting...",
+    // "not connected", "failed"). Device ID is intentionally not here
+    // — that lives on the boot screen.
+    let mut line: HString<128> = HString::new();
+    let _ = line.push_str("IP: ");
+    match status.ip_address.as_ref() {
+        Some(s) => {
+            let _ = line.push_str(s.as_str());
+        }
+        None => {
+            let _ = line.push_str("connecting...");
+        }
     }
     let _ = line.push_str("  |  Last Update: ");
-    if let Some(t) = status.last_update_local.as_ref() {
-        let _ = line.push_str(t.as_str());
-    } else {
-        let _ = line.push_str("--");
+    match status.last_update_local.as_ref() {
+        Some(t) => {
+            let _ = line.push_str(t.as_str());
+        }
+        None => {
+            let _ = line.push_str("--");
+        }
     }
 
     // Clip naively to the available width by chopping the string at
@@ -307,18 +311,28 @@ fn draw_left_info(
 
 // ── Boot-screen overlay (used by boot.rs after the logo lands) ───────────────
 
-/// Render the firmware version + UTC build time stamp into the bottom-
-/// center of the main region. Called from `boot.rs` after the boot-
-/// screen logo has been blitted into the main-region framebuffer.
-pub fn draw_build_info(region: &mut MainRegion<'_>, info: &BuildInfo) {
-    draw_build_info_with_ip(region, info, None)
-}
-
-/// Same as [`draw_build_info`] plus an optional IP line under the
-/// build time. Used by the compositor's `redraw_boot_screen` path
-/// after DHCP completes — lets the developer read the device's IP
-/// off the panel for `pa-dev push --device <ip>`.
-pub fn draw_build_info_with_ip(region: &mut MainRegion<'_>, info: &BuildInfo, ip: Option<&str>) {
+/// Render the boot-screen overlay under the centered logo. Five
+/// `Key: Value` lines, stacked from the top of the text block
+/// downward toward the panel's bottom margin:
+///
+///   Build:       <version>
+///   Environment: dev | production
+///   Build Date:  <build_time>
+///   IP:          <ip state>
+///   Device UUID: <device_uuid>
+///
+/// `ip` is whatever the runtime last pushed via
+/// [`paperanywhere_ports::EpaperPanel::set_ip`] — typically
+/// `"10.0.1.42"`, `"connecting..."`, `"not connected"`, or
+/// `"failed"`. Always rendered (no Option, no separate code path)
+/// so the developer sees the connection state at a glance even
+/// before DHCP completes.
+pub fn draw_build_info(
+    region: &mut MainRegion<'_>,
+    info: &BuildInfo,
+    device_uuid: &str,
+    ip: &str,
+) {
     if !matches!(region.color_mode, ColorMode::Mono1bpp) {
         return;
     }
@@ -333,53 +347,34 @@ pub fn draw_build_info_with_ip(region: &mut MainRegion<'_>, info: &BuildInfo, ip
     let center_x = (region.width_px as i32) / 2;
     let bottom_y = (region.height_px as i32) - 8;
 
-    // Lines stack upward from the bottom margin:
-    //   bottom_y                          IP line (only when present)
-    //   bottom_y - 12                     build_time
-    //   bottom_y - 26                     version + (DEV) tag
-    let (build_time_y, version_y) = match ip {
-        Some(_) => (bottom_y - 12, bottom_y - 26),
-        None => (bottom_y, bottom_y - 14),
-    };
+    // Stack five lines upward from the bottom margin with 12 px
+    // between baselines. Total block height ~60 px; leaves the rest
+    // of the main region for the logo above.
+    let env = if info.is_dev { "dev" } else { "production" };
+    let lines: [(&str, &str); 5] = [
+        ("Build", info.fw_version),
+        ("Environment", env),
+        ("Build Date", info.build_time),
+        ("IP", ip),
+        ("Device UUID", device_uuid),
+    ];
 
-    if let Some(ip_str) = ip {
-        // Prefix with "IP: " so the line is unambiguous.
-        let mut ip_line: HString<48> = HString::new();
-        let _ = ip_line.push_str("IP: ");
-        let _ = ip_line.push_str(ip_str);
+    for (i, (key, value)) in lines.iter().enumerate() {
+        // bottom_y is the LAST line; iter index 0 is the topmost,
+        // so we subtract from bottom_y by (count-1 - i) * 12.
+        let y = bottom_y - ((lines.len() as i32 - 1 - i as i32) * 12);
+        let mut buf: HString<80> = HString::new();
+        let _ = buf.push_str(key);
+        let _ = buf.push_str(": ");
+        let _ = buf.push_str(value);
         let _ = Text::with_text_style(
-            ip_line.as_str(),
-            Point::new(center_x, bottom_y),
+            buf.as_str(),
+            Point::new(center_x, y),
             style,
             centered,
         )
         .draw(&mut target);
     }
-
-    let _ = Text::with_text_style(
-        info.build_time,
-        Point::new(center_x, build_time_y),
-        style,
-        centered,
-    )
-    .draw(&mut target);
-
-    let bold = MonoTextStyle::new(&FONT_8X13_BOLD, BinaryColor::On);
-    // Compose "<version> (DEV)" when the dev flag is set, else plain
-    // version. heapless::String<48> is sized for the longest possible
-    // SHA-suffixed version + " (DEV)" tail.
-    let mut version_line: HString<48> = HString::new();
-    let _ = version_line.push_str(info.fw_version);
-    if info.is_dev {
-        let _ = version_line.push_str(" (DEV)");
-    }
-    let _ = Text::with_text_style(
-        version_line.as_str(),
-        Point::new(center_x, version_y),
-        bold,
-        centered,
-    )
-    .draw(&mut target);
 }
 
 // ── Mono1bpp draw target ─────────────────────────────────────────────────────

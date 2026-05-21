@@ -166,10 +166,14 @@ pub fn run(resources: FirmwareResources) -> ! {
 
     panel_ref.init();
     panel_ref.set_chrome(sleeper_ref.battery_mv(), None);
+    // Seed the dev/boot-screen IP state before the panel paint so the
+    // overlay never shows a blank value. Runtime will overwrite via
+    // panel.set_ip once DHCP completes (or marks it as failed).
+    panel_ref.set_ip("connecting...");
     panel_ref.write_chunk(BOOT_SCREEN);
     {
         let mut region = panel_ref.main_region_mut();
-        build_info.render_into(&mut region);
+        build_info.render_into(&mut region, &mac_id, "connecting...");
     }
     panel_ref.compose();
     let pending = panel_ref.pending_hash();

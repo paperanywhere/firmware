@@ -225,11 +225,29 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
         self.framebuffer[self.main_cursor..end].copy_from_slice(&tpl.bytes[..take]);
         self.main_cursor = end;
 
-        // Paint the build-info overlay (version + build time + IP if
-        // we have it) onto the main region. The IP string is copied
-        // out before taking the mutable borrow on `framebuffer` so we
-        // don't end up holding two borrows on `self` at once.
-        let ip_copy: Option<heapless::String<24>> = self.status.ip_address.clone();
+        // Paint the build-info overlay onto the main region. The
+        // values need to outlive the mutable borrow on `framebuffer`,
+        // so snapshot them by clone first. IP state defaults to
+        // "connecting..." when nothing has been pushed yet — runtime
+        // overrides via `set_ip` once DHCP completes (or fails).
+        let ip_copy: heapless::String<24> = self
+            .status
+            .ip_address
+            .clone()
+            .unwrap_or_else(|| {
+                let mut s: heapless::String<24> = heapless::String::new();
+                let _ = s.push_str("connecting...");
+                s
+            });
+        let device_id_copy: heapless::String<24> = self
+            .status
+            .device_id
+            .clone()
+            .unwrap_or_else(|| {
+                let mut s: heapless::String<24> = heapless::String::new();
+                let _ = s.push_str("unassigned");
+                s
+            });
         let width_px = self.width_px;
         let height_px = self.main_height_px();
         let color_mode = self.color_mode;
@@ -240,8 +258,12 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
             height_px,
             color_mode,
         };
-        let ip_ref: Option<&str> = ip_copy.as_ref().map(|s| s.as_str());
-        crate::status_bar::draw_build_info_with_ip(&mut region, &tpl.info, ip_ref);
+        crate::status_bar::draw_build_info(
+            &mut region,
+            &tpl.info,
+            device_id_copy.as_str(),
+            ip_copy.as_str(),
+        );
     }
 
     fn init(&mut self) {
@@ -368,11 +390,15 @@ pub struct BuildInfo {
 }
 
 impl BuildInfo {
-    /// Render the version + build time onto the bottom-center of the
-    /// passed main-region framebuffer. Called by `boot.rs` after the
-    /// boot-screen logo has been blitted; before the panel flush.
-    pub fn render_into(&self, region: &mut MainRegion<'_>) {
-        crate::status_bar::draw_build_info(region, self);
+    /// Render the boot-screen `Key: Value` overlay (Build /
+    /// Environment / Build Date / IP / Device UUID) onto the bottom-
+    /// center of the passed main-region framebuffer. Called by
+    /// `boot.rs` after the boot-screen logo has been blitted; before
+    /// the panel flush. `ip` is a state string (e.g. `"connecting..."`,
+    /// `"10.0.1.42"`); `device_uuid` defaults to MAC-suffix today and
+    /// will be backend-issued once the register endpoint lands.
+    pub fn render_into(&self, region: &mut MainRegion<'_>, device_uuid: &str, ip: &str) {
+        crate::status_bar::draw_build_info(region, self, device_uuid, ip);
     }
 }
 

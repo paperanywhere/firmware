@@ -188,7 +188,20 @@ where
             }
         }
     } else {
-        warn!("wake: DHCP didn't complete within wait window — boot screen won't show IP");
+        warn!("wake: DHCP didn't complete within wait window");
+        // Stamp the IP field so the boot screen reflects the failure
+        // instead of staying stuck on "connecting...".
+        panel.set_ip("no DHCP");
+        panel.redraw_boot_screen();
+        panel.compose();
+        let pending = panel.pending_hash();
+        let cached = nvs.load_last_render_hash();
+        if pending.is_none() || pending != cached {
+            panel.refresh();
+            if let Some(h) = pending {
+                nvs.save_last_render_hash(h);
+            }
+        }
     }
 
     // Now check for a device token. Without one we can't hit /state, but
