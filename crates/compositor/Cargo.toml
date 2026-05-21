@@ -6,10 +6,14 @@ license.workspace = true
 description = "Layered framebuffer + status-bar compositor that sits between the runtime and the panel driver. Status bar lives at the top of the screen; the runtime owns the main region."
 
 [build-dependencies]
-# Host-side SVG → 1bpp rasteriser. Reused for the boot screen logo
-# and for the Font Awesome icons baked by build.rs.
-paperanywhere-boot-screen = { workspace = true }
-paperanywhere-ports = { workspace = true }
+# Direct SVG → 1bpp icon rasteriser (lives in build.rs). We don't go
+# through the boot-screen crate's pipeline for icons because that
+# pipeline Floyd-Steinberg-dithers the result, which produces noisy
+# edges at icon scales (20 px). Icons need a hard alpha threshold so
+# antialiased strokes either become solid ink or disappear.
+resvg = "0.43"
+usvg = "0.43"
+tiny-skia = "0.11"
 
 [dependencies]
 paperanywhere-ports = { workspace = true }

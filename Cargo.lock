@@ -2417,8 +2417,10 @@ dependencies = [
  "embedded-graphics",
  "heapless 0.8.0",
  "log",
- "paperanywhere-boot-screen",
  "paperanywhere-ports",
+ "resvg",
+ "tiny-skia",
+ "usvg",
 ]
 
 [[package]]
