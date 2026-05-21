@@ -175,61 +175,41 @@ fn blit_mono_icon(
 }
 
 fn draw_battery_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32, mv: Option<u16>) -> i32 {
-    const BODY_W: i32 = 22;
-    const BODY_H: i32 = 12;
-    const NUB_W: i32 = 2;
-    const NUB_H: i32 = 6;
+    // Text-only label: "87% BATT" right-aligned to the cell edge.
+    // No glyph at all — the cell border + the all-caps "BATT" suffix
+    // are enough to identify the field without a battery icon.
     const PADDING: i32 = 6;
-    const LABEL_W: i32 = 26; // "100%" ≈ 24 px in FONT_6X10
+    let baseline = (target.height as i32) / 2 + 4;
+    let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+    let right_aligned = TextStyleBuilder::new()
+        .alignment(Alignment::Right)
+        .baseline(Baseline::Bottom)
+        .build();
 
-    let top = ((target.height as i32) - BODY_H) / 2;
-    let nub_x = right_edge - NUB_W;
-    let nub_y = top + (BODY_H - NUB_H) / 2;
-    target.fill_rect_signed(nub_x, nub_y, NUB_W as u32, NUB_H as u32, true);
-
-    let body_right = nub_x;
-    let body_left = body_right - BODY_W;
-    target.draw_rect_outline(body_left, top, BODY_W as u32, BODY_H as u32);
-
-    let label_baseline = top + (BODY_H + 9) / 2;
-    let label_right = body_left - 3;
-    if let Some(mv) = mv {
-        let pct = battery_mv_to_percent(mv);
-        let inner_w = (BODY_W - 4) as u32;
-        let fill_w = (inner_w * pct as u32) / 100;
-        if fill_w > 0 {
-            target.fill_rect_signed(body_left + 2, top + 2, fill_w, (BODY_H - 4) as u32, true);
+    let mut text: HString<16> = HString::new();
+    match mv {
+        Some(mv) => {
+            let pct = battery_mv_to_percent(mv);
+            let mut buf = [0u8; 5];
+            let pct_str = u8_to_str(pct, &mut buf);
+            let _ = text.push_str(pct_str);
+            let _ = text.push_str(" BATT");
         }
-        let mut buf = [0u8; 5];
-        let s = u8_to_str(pct, &mut buf);
-        let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
-        let _ = Text::with_text_style(
-            s,
-            Point::new(label_right, label_baseline),
-            style,
-            TextStyleBuilder::new()
-                .alignment(Alignment::Right)
-                .baseline(Baseline::Bottom)
-                .build(),
-        )
-        .draw(target);
-    } else {
-        // Empty / unknown battery: thin dash in the label slot to mark
-        // the absence rather than leaving the cell blank.
-        let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
-        let _ = Text::with_text_style(
-            "--",
-            Point::new(label_right, label_baseline),
-            style,
-            TextStyleBuilder::new()
-                .alignment(Alignment::Right)
-                .baseline(Baseline::Bottom)
-                .build(),
-        )
-        .draw(target);
+        None => {
+            let _ = text.push_str("-- BATT");
+        }
     }
 
-    BODY_W + NUB_W + LABEL_W + PADDING
+    let _ = Text::with_text_style(
+        text.as_str(),
+        Point::new(right_edge, baseline),
+        style,
+        right_aligned,
+    )
+    .draw(target);
+
+    // 9 chars max ("100% BATT") × 6 px per char + padding.
+    (text.len() as i32) * 6 + PADDING
 }
 
 fn draw_usb_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32) -> i32 {
