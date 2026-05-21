@@ -181,6 +181,13 @@ where
         );
         info!("wake: local IP = {}", buf);
         panel.set_ip(&buf);
+        // Connecting is no longer accurate — WiFi is up + we have an
+        // IP. Transition the status before the redraw so the bar
+        // doesn't paint a stale "connecting" alongside the new IP
+        // and the connected wifi icon. The /state call right below
+        // will flip it to DownloadingConfig briefly; the outer loop
+        // sets Ready at end of cycle.
+        panel.set_status(DeviceStatus::Ready);
         panel.redraw_boot_screen();
         panel.compose();
         let pending = panel.pending_hash();
