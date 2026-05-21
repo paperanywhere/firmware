@@ -225,12 +225,16 @@ where
         Some(t) => t,
         None => {
             warn!(
-                "wake: no device token in NVS (not yet claimed) — skipping /state, panel + dev_server stay up"
+                "wake: no device token in NVS (not yet claimed) — rendering adoption screen + sleeping until next wake"
             );
+            // The device is unclaimed. Show the adoption screen on
+            // the main region with the QR + claim code so the user
+            // can adopt it via the frontend. dev_server stays up
+            // for direct OTA pushes in the meantime.
+            panel.set_status(DeviceStatus::WaitingForAdoption);
+            paint_adoption_screen(panel, nvs, wifi);
             // DO NOT disconnect — the dev_server task is still bound to
-            // the same embassy-net stack and the user might `pa-dev push`
-            // at any moment. We want the IP to stick around.
-            panel.set_status(DeviceStatus::Ready);
+            // the same embassy-net stack and we want the IP to stick around.
             return Ok((FAILURE_RETRY_SEC, PowerPolicy::AlwaysOn));
         }
     };
@@ -363,6 +367,54 @@ where
     // compose() + the driver-level hash dedup before deciding to flush.
     let _ = image.byte_len.to_string(); // silence unused-import lint paths
     Ok(())
+}
+
+/// Paint the adoption screen onto the panel. Called when the device
+/// is associated (has an IP) but has no `device_token` yet. Reads
+/// the cached claim code from NVS — empty placeholder until task #84
+/// wires the backend's /api/device/claim-code/request endpoint.
+fn paint_adoption_screen<P, N, W>(panel: &mut P, nvs: &N, wifi: &W)
+where
+    P: EpaperPanel,
+    N: NvsStore,
+    W: WifiLink,
+{
+    let claim_code = nvs
+        .load_claim_code()
+        .unwrap_or_else(|| alloc::string::String::from("(requesting…)"));
+    let device_id = nvs
+        .load_device_token()
+        .as_deref()
+        .map(|t| {
+            if t.len() > 4 {
+                alloc::format!("D-{}", &t[t.len() - 4..])
+            } else {
+                alloc::format!("D-{}", t)
+            }
+        })
+        .unwrap_or_else(|| alloc::string::String::from("(unassigned)"));
+    let ip = wifi
+        .local_ip()
+        .map(|ip| alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]))
+        .unwrap_or_else(|| alloc::string::String::from("--"));
+    // Backend URL comes from the prov partition / NVS (provtool bakes
+    // it in at flash time). For local dev that's something like
+    // http://10.0.1.109:8080 — we append `/adopt` so the QR sends the
+    // user to a path the backend can route to the frontend's adopt
+    // page (the backend may proxy or 302 to the actual frontend).
+    let base_url = nvs
+        .load_backend_url()
+        .unwrap_or_else(|| alloc::string::String::from("https://paperanywhere.io"));
+    let mut adopt_url = alloc::string::String::new();
+    adopt_url.push_str(base_url.trim_end_matches('/'));
+    adopt_url.push_str("/adopt");
+    panel.render_adoption_screen(&claim_code, &device_id, &ip, &adopt_url);
+    panel.compose();
+    // Adoption screen always paints — hash dedup still applies, but
+    // unconditionally calling refresh is cheap when the bytes match
+    // (compositor's refresh writes the same framebuffer the panel
+    // already shows).
+    panel.refresh();
 }
 
 /// Poll `wifi.local_ip()` with a small back-off until it returns Some

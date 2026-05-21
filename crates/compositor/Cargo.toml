@@ -20,3 +20,7 @@ paperanywhere-ports = { workspace = true }
 embedded-graphics = { workspace = true }
 heapless = { workspace = true }
 log = { workspace = true }
+# NOTE: QR encoding for the adoption screen is deferred — qrcodegen
+# 1.x requires std even with default features off. Adoption screen
+# currently shows a placeholder where the QR will go. See task in
+# the tracker for "Adoption screen: no_std QR encoder".

@@ -375,6 +375,10 @@ pub enum DeviceStatus {
     /// Wake cycle bounced through an error path — sleeping for the
     /// failure-retry interval before trying again.
     Stalled,
+    /// Device is associated + has an IP but no `device_token` in NVS
+    /// — waiting to be adopted to a user account. The adoption screen
+    /// is on the main region.
+    WaitingForAdoption,
     /// Idle, between wakes / serving the dev_server.
     Ready,
 }
@@ -394,6 +398,7 @@ impl DeviceStatus {
             Self::DownloadingConfig => "downloading configuration",
             Self::Updating => "updating",
             Self::Stalled => "stalled",
+            Self::WaitingForAdoption => "waiting for adoption",
             Self::Ready => "ready",
         }
     }
@@ -484,6 +489,14 @@ pub trait NvsStore {
     fn load_is_dev_build(&self) -> bool {
         false
     }
+    /// Device-side claim code (e.g. `1234-5678`) that the user types
+    /// into the frontend to adopt this device. Generated once from
+    /// the chip MAC at boot time and persisted by the firmware so
+    /// it's stable across reboots. `None` on impls (sim) that don't
+    /// support a claim flow.
+    fn load_claim_code(&self) -> Option<alloc::string::String> {
+        None
+    }
 }
 
 /// E-paper panel surface. HTTPS chunks arrive at arbitrary byte boundaries —
@@ -540,6 +553,20 @@ pub trait EpaperPanel {
     /// (or → Updating / Stalled depending on what happens). The
     /// compositor renders the human-readable label.
     fn set_status(&mut self, _status: DeviceStatus) {}
+    /// Paint the adoption screen into the main region (QR code + big
+    /// claim code + device id + IP + adopt URL). Called by the
+    /// runtime when the device has no `device_token` in NVS, i.e.
+    /// the device hasn't been claimed to a user account yet.
+    /// Default no-op for bare panels; compositors that know their
+    /// framebuffer layout override and rasterise the screen.
+    fn render_adoption_screen(
+        &mut self,
+        _claim_code: &str,
+        _device_id: &str,
+        _ip: &str,
+        _adopt_url: &str,
+    ) {
+    }
     /// Append `bytes` to the panel's frame RAM at the current cursor. Chunk
     /// boundaries don't need to align to any pixel structure.
     fn write_chunk(&mut self, bytes: &[u8]);

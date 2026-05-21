@@ -442,18 +442,18 @@ pub fn draw_build_info(
 // emits, so the UC8179 driver's `panel_data_inverted` pass produces
 // the right thing on hardware.
 
-struct Mono1bppTarget<'a> {
+pub(crate) struct Mono1bppTarget<'a> {
     bytes: &'a mut [u8],
     width_px: u32,
-    height: u32,
+    pub(crate) height: u32,
 }
 
 impl<'a> Mono1bppTarget<'a> {
-    fn new(bytes: &'a mut [u8], width_px: u32, height_px: u32) -> Self {
+    pub(crate) fn new(bytes: &'a mut [u8], width_px: u32, height_px: u32) -> Self {
         Self { bytes, width_px, height: height_px }
     }
 
-    fn set_pixel(&mut self, x: i32, y: i32, on: bool) {
+    pub(crate) fn set_pixel(&mut self, x: i32, y: i32, on: bool) {
         if x < 0 || y < 0 {
             return;
         }

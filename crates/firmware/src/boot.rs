@@ -124,6 +124,13 @@ pub fn run(resources: FirmwareResources) -> ! {
     };
     panel_ref.set_device_id(&mac_id);
 
+    // NOTE: the claim code is NOT derived from MAC. Collisions are too
+    // likely across a fleet and there's no way to rotate. The backend
+    // issues the code via /api/device/claim-code/request and rotates
+    // every 5 minutes until claimed — see task #84. The runtime
+    // fetches the code in its first wake; until then the adoption
+    // screen shows "(requesting…)" as a placeholder.
+
     // If this boot is the first one after an OTA install, the slot is
     // still marked `New`/`PendingVerify`. Graduate it to `Valid` so the
     // bootloader doesn't auto-roll-back. Cheap no-op on normal boots.

@@ -108,6 +108,21 @@ impl FwNvs {
         }
     }
 
+    /// Persist the device's claim code so a subsequent boot reuses
+    /// it and the backend's claim-by-code lookup can find it. Called
+    /// once at boot from MAC-derived seed if the cache doesn't
+    /// already have one.
+    pub fn save_claim_code(&mut self, code: &str) {
+        if self.cache.claim_code.as_ref().map(|s| s.as_str()) == Some(code) {
+            return;
+        }
+        self.cache.claim_code = into_hstring::<16>(code);
+        self.persist();
+    }
+
+    // (the trait method `NvsStore::load_claim_code` already exposes
+    // this; nothing else in firmware needs an inherent method.)
+
     /// Try to migrate a `prov.bin` blob from the prov partition into NVS.
     /// Returns `true` if a valid blob was found and migrated; the prov region
     /// is then erased so the next boot doesn't re-migrate (and the WiFi
@@ -197,6 +212,10 @@ impl NvsStore for FwNvs {
 
     fn load_is_dev_build(&self) -> bool {
         self.cache.is_dev_build
+    }
+
+    fn load_claim_code(&self) -> Option<String> {
+        self.cache.claim_code.as_ref().map(|s| s.as_str().to_string())
     }
 }
 
