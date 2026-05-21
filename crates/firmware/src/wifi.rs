@@ -26,7 +26,7 @@ use paperanywhere_ports::{WifiCreds, WifiLink};
 // The variants are read by the runtime via the derived `Debug` impl when
 // logging WakeError contexts; `dead_code` doesn't see through `{:?}`.
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum WifiError {
     BadCreds,
     SetConfig,

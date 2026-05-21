@@ -358,58 +358,127 @@ pub fn run(resources: FirmwareResources) -> ! {
     }
     panel_ref.compose();
 
-    // Dual-core: panel actor pinned to **core 1 (APP_CPU)**, everything
-    // else (net_task, runtime, esp-radio internals) on core 0 (PRO_CPU).
-    // Goal: isolate the panel's multi-second SPI bursts + sync
-    // compositor work from the WiFi-servicing tasks so a refresh
-    // cycle can never starve the network into AP eviction.
+    // Dual-core split (task #100):
     //
-    // esp-hal marks `Async` as `!Send` via `PhantomData<*const ()>`,
-    // so `Spi<'static, Async>` (and our Panel which contains it,
-    // and any future referencing it) is !Send. `start_second_core`
-    // requires `Send + 'static` for its closure — and the !Send-ness
-    // propagates through any closure capture, even an `unsafe impl
-    // Send` newtype wrapper, because Rust looks at the captured
-    // closure's full type. We sidestep by parking the panel pointer
-    // in a `static AtomicPtr` BEFORE calling `start_second_core`:
-    // the closure captures nothing panel-related and stays Send;
-    // core 1 reads the atomic + materialises the `&'static mut`
-    // inside its own context.
+    //   * Core 0 (PRO_CPU): net_task + http_proxy_task + esp-radio
+    //     internals. The network stack and HTTP client get this core
+    //     to themselves, so a heavy wake-cycle on the application
+    //     side can't starve TCP / DHCP / DNS polling.
+    //   * Core 1 (APP_CPU): runtime_task + panel_actor_task. The
+    //     state machine + panel rendering share an executor. When
+    //     the runtime needs HTTP it sends through `http_proxy::
+    //     REQ_CHANNEL` (a `CriticalSectionRawMutex` channel that
+    //     crosses cores cleanly) and awaits a `Signal`-backed reply
+    //     slot. The runtime can stall briefly during a panel SPI
+    //     burst on the same executor, but the proxy on core 0 keeps
+    //     driving the actual TCP socket — no network starvation.
     //
-    // SAFETY of the AtomicPtr hand-off: (1) core 0 stores the
-    // pointer before start_second_core's barrier; (2) core 1 loads
-    // it once before spawning the actor and never re-reads it; (3)
-    // panel_ref is `&'static mut` — it lives forever and is never
-    // accessed by core 0 again after this point; (4) the SPI
-    // interrupt waker was registered on core 0 when `into_async()`
-    // ran, and esp-rtos's cross-core IPC delivers the wake to core
-    // 1's executor where the actor's await sits.
+    // Why the runtime moved off core 0: pre-#100, runtime + net_task
+    // shared an executor; a fanout of chrome::set_* + paint::submit
+    // + post-DHCP countdown ticks consumed enough CPU that net_task
+    // couldn't poll often enough, and a first-register on a fresh
+    // boot would take ~90 s instead of seconds. Splitting them
+    // collapses that to the actual TLS+TCP RTT.
     //
-    // esp-wifi-sys#412 caveat: esp-wifi crashes if its OWN tasks
-    // run on the second core. We don't put esp-wifi/esp-radio tasks
-    // there — only the panel actor.
+    // Why HTTP can't just live on core 1: embassy_net::Stack is
+    // !Send (PhantomData<*const ()>) — the Stack runner + every
+    // task that builds a TcpSocket against it must share an
+    // executor. esp-radio's tasks also pin to core 0
+    // (esp-wifi-sys#412 crashes if migrated). So the Stack and
+    // FwHttp stay on core 0; the proxy task on core 0 is the
+    // single user of FwHttp.
+    //
+    // Why the AtomicPtr handoffs: esp-hal marks `Async` as `!Send`
+    // via PhantomData<*const ()> — `boards::Panel` (containing
+    // Spi<Async>) is !Send, and `&'static mut Panel` is !Send too.
+    // `start_second_core` takes `FnOnce + Send + 'static`, and a
+    // closure that captures any !Send value isn't Send. We
+    // sidestep by parking each ref in a `static AtomicPtr` BEFORE
+    // calling `start_second_core`; the closure captures nothing
+    // typed and stays Send. Core 1 reads each pointer once and
+    // never again. FwWifi / FwNvs / FwSleeper / FwOta get the same
+    // treatment for consistency — even ones that might be Send
+    // today could acquire !Send fields later, and the AtomicPtr
+    // pattern is uniform.
+    //
+    // SAFETY of each handoff:
+    //   1. Core 0 stores the pointer before `start_second_core`'s
+    //      barrier (Release).
+    //   2. Core 1 loads it once at task-spawn time (Acquire) and
+    //      never re-reads.
+    //   3. Each underlying object is `&'static mut`, lives forever,
+    //      and is never accessed by core 0 again after the handoff.
     static PANEL_HANDOFF: core::sync::atomic::AtomicPtr<boards::Panel> =
         core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+    static NVS_REF_HANDOFF: core::sync::atomic::AtomicPtr<FwNvs> =
+        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+    static SLEEPER_HANDOFF: core::sync::atomic::AtomicPtr<FwSleeper> =
+        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+    static OTA_HANDOFF: core::sync::atomic::AtomicPtr<FwOta> =
+        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+    static IDENTITY_CELL: StaticCell<paperanywhere_ports::DeviceIdentity> =
+        StaticCell::new();
+    static HTTP_PROXY_CLIENT_CELL: StaticCell<crate::http_proxy::HttpProxyClient> =
+        StaticCell::new();
+    static WIFI_PROXY_CLIENT_CELL: StaticCell<crate::wifi_proxy::WifiProxyClient> =
+        StaticCell::new();
     PANEL_HANDOFF.store(
         panel_ref as *mut boards::Panel,
         core::sync::atomic::Ordering::Release,
     );
+    NVS_REF_HANDOFF.store(
+        nvs_ref as *mut FwNvs,
+        core::sync::atomic::Ordering::Release,
+    );
+    SLEEPER_HANDOFF.store(
+        sleeper_ref as *mut FwSleeper,
+        core::sync::atomic::Ordering::Release,
+    );
+    OTA_HANDOFF.store(
+        ota_ref as *mut FwOta,
+        core::sync::atomic::Ordering::Release,
+    );
+    // FwWifi stays on core 0 (owned by wifi_proxy_task) because it
+    // accesses the embassy-net Stack, which is !Send. Runtime on
+    // core 1 uses WifiProxyClient which forwards async ops through
+    // a channel and reads sync IP/RSSI/gateway values from the
+    // chrome KV (the wifi_proxy_task keeps those fresh on a 200 ms
+    // poll).
+    // DeviceIdentity goes through a StaticCell because it's an
+    // owned, Send, !Copy value — capturing it by-value in the
+    // closure would consume it, and the runtime needs an owned
+    // copy. Static-cell promotes it to a 'static ref the closure
+    // can clone from cleanly.
+    let identity_ref: &'static paperanywhere_ports::DeviceIdentity =
+        IDENTITY_CELL.init(identity);
+    let http_client_ref: &'static mut crate::http_proxy::HttpProxyClient =
+        HTTP_PROXY_CLIENT_CELL.init(crate::http_proxy::HttpProxyClient);
+    let wifi_client_ref: &'static mut crate::wifi_proxy::WifiProxyClient =
+        WIFI_PROXY_CLIENT_CELL.init(crate::wifi_proxy::WifiProxyClient);
 
     let app_stack = APP_CORE_STACK.init(CoreStack::new());
     esp_rtos::start_second_core(
         cpu_ctrl,
         sw_int1,
         app_stack,
-        || {
-            // SAFETY: see hand-off invariants above. Pointer was
-            // stored by core 0 before start_second_core; core 0
-            // never touches the Panel again.
+        move || {
+            // SAFETY: see handoff invariants in the parent comment.
             let panel_ref: &'static mut boards::Panel = unsafe {
                 &mut *PANEL_HANDOFF.load(core::sync::atomic::Ordering::Acquire)
+            };
+            let nvs_ref: &'static mut FwNvs = unsafe {
+                &mut *NVS_REF_HANDOFF.load(core::sync::atomic::Ordering::Acquire)
+            };
+            let sleeper_ref: &'static mut FwSleeper = unsafe {
+                &mut *SLEEPER_HANDOFF.load(core::sync::atomic::Ordering::Acquire)
+            };
+            let ota_ref: &'static mut FwOta = unsafe {
+                &mut *OTA_HANDOFF.load(core::sync::atomic::Ordering::Acquire)
             };
             let core1_executor =
                 CORE1_EXECUTOR.init(esp_rtos::embassy::Executor::new());
             core1_executor.run(|spawner| {
+                // Panel actor: unchanged.
                 let actor_token = panel_actor::panel_actor_task(
                     panel_ref,
                     &PAINT_CHANNEL,
@@ -417,35 +486,48 @@ pub fn run(resources: FirmwareResources) -> ! {
                 )
                 .expect("panel_actor_task pool");
                 spawner.spawn(actor_token);
+                // Runtime: now on core 1 alongside the actor, talks
+                // to the network via HttpProxyClient → REQ_CHANNEL →
+                // http_proxy_task on core 0.
+                let rt_token = runtime_task(
+                    wifi_client_ref,
+                    http_client_ref,
+                    nvs_ref,
+                    sleeper_ref,
+                    ota_ref,
+                    policy,
+                    identity_ref.clone(),
+                    &OTA_PROGRESS,
+                    &PAINT_CHANNEL,
+                )
+                .expect("runtime_task pool");
+                spawner.spawn(rt_token);
             });
         },
     );
 
+    // Core 0's executor: net_task + http_proxy_task only. No app
+    // logic, no panel work, no chrome-state mutation. The runtime
+    // on core 1 may still write to chrome via the CriticalSection
+    // mutex (cross-core safe), but the bulk of CPU stays off this
+    // core.
     let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
     executor.run(|spawner| {
         let net_token = crate::network::net_task(runner).expect("net_task pool");
         spawner.spawn(net_token);
-        // Panel actor moved to core 1 above — DO NOT spawn it here.
-        let rt_token = runtime_task(
-            wifi_ref,
-            http_ref,
-            nvs_ref,
-            sleeper_ref,
-            ota_ref,
-            policy,
-            identity,
-            &OTA_PROGRESS,
-            &PAINT_CHANNEL,
-        )
-        .expect("runtime_task pool");
-        spawner.spawn(rt_token);
+        let http_token =
+            crate::http_proxy::http_proxy_task(http_ref).expect("http_proxy_task pool");
+        spawner.spawn(http_token);
+        let wifi_token =
+            crate::wifi_proxy::wifi_proxy_task(wifi_ref).expect("wifi_proxy_task pool");
+        spawner.spawn(wifi_token);
     })
 }
 
 #[embassy_executor::task]
 async fn runtime_task(
-    wifi: &'static mut FwWifi,
-    http: &'static mut FwHttp,
+    wifi: &'static mut crate::wifi_proxy::WifiProxyClient,
+    http: &'static mut crate::http_proxy::HttpProxyClient,
     nvs: &'static mut FwNvs,
     sleeper: &'static mut FwSleeper,
     ota: &'static mut FwOta,
