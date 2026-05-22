@@ -202,6 +202,32 @@ fn main() -> ! {
     #[cfg(not(feature = "board-reterminal-e1001"))]
     let battery: Option<resources::BatteryHardware> = None;
 
+    // SD card pins. Schematic-confirmed for the reTerminal E1001:
+    //   MISO=GPIO8, CS=GPIO14, DET=GPIO15, EN=GPIO16. SCK/MOSI are
+    //   on GPIO7/GPIO9 — the same pins the panel already owns, so
+    //   the SD reuses the panel's shared SPI bus via a separate
+    //   CriticalSectionDevice in boot.rs. MISO is a board-level
+    //   detail (UC8179 is write-only, so the panel never pulls it),
+    //   bound here so esp-hal allocates the GPIO once.
+    #[cfg(feature = "board-reterminal-e1001")]
+    let sd = {
+        let _ = peripherals.GPIO8; // MISO — owned by the SPI bus init below.
+        Some(crate::sd::SdHardware {
+            cs: Output::new(peripherals.GPIO14, Level::High, OutputConfig::default()),
+            detect: Input::new(
+                peripherals.GPIO15,
+                InputConfig::default().with_pull(Pull::Up),
+            ),
+            // Start power-enable LOW so the card is off until the SD
+            // driver explicitly powers it during mount(). Avoids
+            // wasting the load switch's quiescent current on boards
+            // booting without an SD inserted.
+            power_enable: Output::new(peripherals.GPIO16, Level::Low, OutputConfig::default()),
+        })
+    };
+    #[cfg(not(feature = "board-reterminal-e1001"))]
+    let sd: Option<crate::sd::SdHardware> = None;
+
     let resources = resources::FirmwareResources {
         board,
         timg0: peripherals.TIMG0,
@@ -214,6 +240,7 @@ fn main() -> ! {
         sw_int1: sw_ints.software_interrupt1,
         panel,
         battery,
+        sd,
     };
 
     boot::run(resources)

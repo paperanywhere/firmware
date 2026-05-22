@@ -2103,6 +2103,7 @@ dependencies = [
 name = "paperanywhere-firmware"
 version = "0.1.0"
 dependencies = [
+ "critical-section",
  "embassy-executor",
  "embassy-futures",
  "embassy-net",

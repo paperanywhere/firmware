@@ -46,6 +46,12 @@ paperanywhere-compositor.workspace = true
 # schematic wires the SD slot in SPI mode anyway (SCK=GPIO7,
 # MOSI=GPIO9, MISO=GPIO8, CS=GPIO14, DET=GPIO15, EN=GPIO16).
 embedded-sdmmc = { version = "0.8", default-features = false }
+# critical-section: explicitly declared so the panel+SD shared
+# bus type alias in boards/mod.rs (`SharedSpiBus`) can name
+# `critical_section::Mutex`. The crate is transitively pulled in
+# by esp-hal already; surfacing it as a direct dep removes the
+# implicit-prelude footgun.
+critical-section = "1"
 # embedded-hal-bus's bus-sharing wrappers (CriticalSectionDevice)
 # are what we need for the panel+SD shared SPI2 refactor. The
 # existing dep declaration further down enables `async` (panel

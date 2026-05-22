@@ -44,6 +44,11 @@ pub struct BatteryHardware {
 /// Boards that don't use UC8179 (e.g. ACeP color panels with UC8159, IT8951
 /// gray panels) would expand this into an enum or pick a different bundle
 /// type per-board. For now there's only one bundle shape.
+/// Panel-side pins + the once-only SPI bus. main.rs constructs the
+/// bus, stores it in the shared `'static` mutex (see
+/// `boards::SharedSpiBus`), and hands the pins + a `&'static` ref
+/// to the bus down to `boards::build_panel`. SD reuses the same
+/// `&'static` ref via its own CS-aware device wrapper.
 pub struct PanelHardware {
     pub spi_bus: Spi<'static, Async>,
     pub cs: Output<'static>,
@@ -74,6 +79,13 @@ pub struct FirmwareResources {
 
     // ── Battery readout (board-specific; None on USB-only carriers) ──
     pub battery: Option<BatteryHardware>,
+
+    // ── SD card pins (board-specific; None on cards without a slot) ──
+    //
+    // SCK + MOSI are NOT listed here — those are part of the panel's
+    // SPI2 bus, which boot.rs parks in a shared `'static` mutex so
+    // the SD's `CriticalSectionDevice` can draw against the same bus.
+    pub sd: Option<crate::sd::SdHardware>,
 
     // ── Second-core embassy executor (reserved) ──
     //

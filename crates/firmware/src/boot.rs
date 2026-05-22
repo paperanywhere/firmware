@@ -147,6 +147,7 @@ pub fn run(resources: FirmwareResources) -> ! {
         sw_int1,
         panel,
         battery,
+        sd,
     } = resources;
 
     if factory_reset_held(board) {
@@ -195,6 +196,16 @@ pub fn run(resources: FirmwareResources) -> ! {
     let http_ref = HTTP.init(FwHttp::new(stack_ref, backend_url.as_deref()));
     let nvs_ref = NVS.init(nvs);
     let panel_ref = PANEL.init(boards::build_panel(panel, board));
+    // SD scaffolding: today this just probes card-detect and logs
+    // the result. Actual mount + format-as-FAT32 lands once the
+    // SPI-bus-share work in task #116 wires the SD's
+    // `CriticalSectionDevice` against the same bus the panel uses
+    // (`boards::SharedSpiBus`). The pins, board quirks, and module
+    // structure are already in place.
+    if let Some(sd_hw) = sd {
+        let state = crate::sd::FwSd::mount(sd_hw);
+        log::info!("sd: mount() returned {:?}", state);
+    }
     let sleeper_ref = SLEEPER.init(FwSleeper::new(lpwr));
     // Battery gauge built from the per-board hardware bundle. Owned
     // by core 1 alongside the runtime (it's a peripheral-access path,

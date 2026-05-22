@@ -8,6 +8,9 @@
 //! the active board) and `build_panel`, which assembles the driver from the
 //! GPIO/SPI handles main.rs gathered into `FirmwareResources`.
 
+use core::cell::RefCell;
+
+use critical_section::Mutex;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::Async;
 use esp_hal::delay::Delay;
@@ -16,6 +19,17 @@ use esp_hal::spi::master::Spi;
 use paperanywhere_panel_uc8179::{Pins, Uc8179};
 
 use crate::resources::PanelHardware;
+
+/// Future home of the panel+SD shared SPI2 bus. Today the panel
+/// owns the bus exclusively via `ExclusiveDevice`; sharing requires
+/// a blocking-over-async adapter (the panel uses async SpiDevice,
+/// embedded-sdmmc uses blocking) which is its own focused chunk of
+/// work — see task #116 + `crate::sd` for the design path.
+///
+/// Type alias kept as a documentation handle so the SD module can
+/// reference the eventual shape without us having to plumb the
+/// final wrapper through every call site preemptively.
+pub type SharedSpiBus = Mutex<RefCell<Spi<'static, Async>>>;
 
 /// Bare panel driver, before the compositor wraps it. The SPI bus
 /// runs in **async** mode (`Spi<'static, Async>`) so each transfer
@@ -45,10 +59,11 @@ pub type BarePanel = Uc8179<
 /// land in the main region only.
 pub type Panel = paperanywhere_compositor::Compositor<BarePanel>;
 
-/// Assemble the SPI device (bus + CS), instantiate the UC8179 driver
-/// against the runtime-typed pins main.rs gathered, and wrap it in the
-/// compositor so the runtime sees a layered framebuffer.
-/// `invert_data_plane` is sourced from the board's `BoardConfig`.
+/// Assemble the SPI device (bus + CS), instantiate the UC8179
+/// driver against the runtime-typed pins main.rs gathered, and
+/// wrap it in the compositor so the runtime sees a layered
+/// framebuffer. `invert_data_plane` is sourced from the board's
+/// `BoardConfig`.
 pub fn build_panel(hw: PanelHardware, board: BoardConfig) -> Panel {
     let delay = Delay::new();
     let spi_device = ExclusiveDevice::new(hw.spi_bus, hw.cs, embassy_time::Delay)
