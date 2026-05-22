@@ -966,6 +966,62 @@ impl<'d, D: Driver> Runner<'d, D> {
 /// cost. paperanywhere uses this in its core-0 heartbeat to confirm
 /// net_task is actually running during /state hangs.
 pub mod diag {
-    use core::sync::atomic::AtomicU32;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+
     pub static NET_RUNNER_POLLS: AtomicU32 = AtomicU32::new(0);
+    /// Total packets handed FROM smoltcp TO the driver (TX).
+    pub static NET_TX_PKTS: AtomicU32 = AtomicU32::new(0);
+    /// Total packets handed FROM the driver TO smoltcp (RX).
+    pub static NET_RX_PKTS: AtomicU32 = AtomicU32::new(0);
+
+    pub const TX_SLOTS: usize = 30;
+    pub const RX_SLOTS: usize = 12;
+
+    /// One captured packet header.
+    #[derive(Clone, Copy)]
+    pub struct PktSlot {
+        pub head: [u8; 54],
+        pub head_len: u8,
+        pub total_len: u16,
+    }
+    impl PktSlot {
+        const EMPTY: Self = Self { head: [0u8; 54], head_len: 0, total_len: 0 };
+    }
+
+    static TX_RING: BlockingMutex<CriticalSectionRawMutex, core::cell::RefCell<[PktSlot; TX_SLOTS]>> =
+        BlockingMutex::new(core::cell::RefCell::new([PktSlot::EMPTY; TX_SLOTS]));
+    static RX_RING: BlockingMutex<CriticalSectionRawMutex, core::cell::RefCell<[PktSlot; RX_SLOTS]>> =
+        BlockingMutex::new(core::cell::RefCell::new([PktSlot::EMPTY; RX_SLOTS]));
+
+    pub fn stash_tx(idx: usize, head: [u8; 54], head_len: u8, total_len: u16) {
+        if idx >= TX_SLOTS {
+            return;
+        }
+        TX_RING.lock(|cell| {
+            cell.borrow_mut()[idx] = PktSlot { head, head_len, total_len };
+        });
+    }
+    pub fn stash_rx(idx: usize, head: [u8; 54], head_len: u8, total_len: u16) {
+        if idx >= RX_SLOTS {
+            return;
+        }
+        RX_RING.lock(|cell| {
+            cell.borrow_mut()[idx] = PktSlot { head, head_len, total_len };
+        });
+    }
+
+    /// Snapshot the rings for the consumer to dump.
+    pub fn snapshot_tx() -> [PktSlot; TX_SLOTS] {
+        let _ = NET_TX_PKTS.load(Ordering::Relaxed);
+        let mut out = [PktSlot::EMPTY; TX_SLOTS];
+        TX_RING.lock(|cell| out.copy_from_slice(&*cell.borrow()));
+        out
+    }
+    pub fn snapshot_rx() -> [PktSlot; RX_SLOTS] {
+        let mut out = [PktSlot::EMPTY; RX_SLOTS];
+        RX_RING.lock(|cell| out.copy_from_slice(&*cell.borrow()));
+        out
+    }
 }

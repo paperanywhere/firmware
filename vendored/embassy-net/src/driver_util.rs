@@ -83,6 +83,20 @@ where
         F: FnOnce(&[u8]) -> R,
     {
         self.0.consume(|buf| {
+            crate::diag::NET_RX_PKTS
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // Snapshot the first few header bytes of the first 12
+            // RX packets so the firmware can dump them via a slot
+            // accessor — useful for confirming SYN-ACK arrival
+            // when a TCP connect hangs.
+            let n = crate::diag::NET_RX_PKTS
+                .load(core::sync::atomic::Ordering::Relaxed) as usize;
+            if n >= 1 && n <= 12 {
+                let head_len = buf.len().min(54);
+                let mut slot = [0u8; 54];
+                slot[..head_len].copy_from_slice(&buf[..head_len]);
+                crate::diag::stash_rx(n - 1, slot, head_len as u8, buf.len() as u16);
+            }
             #[cfg(feature = "packet-trace")]
             trace!("embassy device rx: {:02x}", buf);
             f(buf)
@@ -104,6 +118,19 @@ where
     {
         self.0.consume(len, |buf| {
             let r = f(buf);
+            crate::diag::NET_TX_PKTS
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let n = crate::diag::NET_TX_PKTS
+                .load(core::sync::atomic::Ordering::Relaxed) as usize;
+            // Stash first-N TX headers in a ring so the firmware can
+            // dump them later. Confirms SYNs reach the driver edge
+            // (vs being lost in smoltcp's poll).
+            if n >= 1 && n <= 30 {
+                let head_len = buf.len().min(54);
+                let mut slot = [0u8; 54];
+                slot[..head_len].copy_from_slice(&buf[..head_len]);
+                crate::diag::stash_tx(n - 1, slot, head_len as u8, buf.len() as u16);
+            }
             #[cfg(feature = "packet-trace")]
             trace!("embassy device tx: {:02x}", buf);
             r
