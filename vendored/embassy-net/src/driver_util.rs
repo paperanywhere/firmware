@@ -28,14 +28,25 @@ where
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.inner
+        let result = self
+            .inner
             .receive(unwrap!(self.cx.as_deref_mut()))
-            .map(|(rx, tx)| (RxTokenAdapter(rx), TxTokenAdapter(tx)))
+            .map(|(rx, tx)| (RxTokenAdapter(rx), TxTokenAdapter(tx)));
+        if result.is_none() {
+            crate::diag::NET_RX_NONE
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
     /// Construct a transmit token.
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        self.inner.transmit(unwrap!(self.cx.as_deref_mut())).map(TxTokenAdapter)
+        let result = self.inner.transmit(unwrap!(self.cx.as_deref_mut())).map(TxTokenAdapter);
+        if result.is_none() {
+            crate::diag::NET_TX_NONE
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
     /// Get a description of device capabilities.

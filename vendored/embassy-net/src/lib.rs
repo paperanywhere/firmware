@@ -1021,6 +1021,20 @@ pub mod diag {
     pub static NET_TX_PKTS: AtomicU32 = AtomicU32::new(0);
     /// Total packets handed FROM the driver TO smoltcp (RX).
     pub static NET_RX_PKTS: AtomicU32 = AtomicU32::new(0);
+    /// Times the driver's `transmit()` returned None — i.e. smoltcp
+    /// wanted to send a packet but the radio said "no TX descriptors
+    /// available right now". High counts here mean the radio's TX
+    /// queue is saturated or the driver is dropping packets at the
+    /// edge. Typical idle: 0. Healthy under load: small. Stuck-radio
+    /// pattern: this counter keeps climbing while NET_TX_PKTS stays
+    /// flat.
+    pub static NET_TX_NONE: AtomicU32 = AtomicU32::new(0);
+    /// Times the driver's `receive()` returned None — i.e. smoltcp
+    /// polled for a packet and the radio had nothing. Idle stations
+    /// rack this up constantly (every poll with no traffic). Useful
+    /// as a sanity check that the driver IS being polled; should
+    /// climb proportional to NET_RUNNER_POLLS.
+    pub static NET_RX_NONE: AtomicU32 = AtomicU32::new(0);
 
     pub const TX_SLOTS: usize = 30;
     pub const RX_SLOTS: usize = 12;

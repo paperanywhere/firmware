@@ -415,9 +415,13 @@ async fn request_with_full_body(
                 .load(core::sync::atomic::Ordering::Relaxed);
             let rx_count = embassy_net::diag::NET_RX_PKTS
                 .load(core::sync::atomic::Ordering::Relaxed);
+            let tx_none = embassy_net::diag::NET_TX_NONE
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let rx_none = embassy_net::diag::NET_RX_NONE
+                .load(core::sync::atomic::Ordering::Relaxed);
             log::error!(
                 "http: [{} {}] connect TIMEOUT after 10s (addr={:?}, port={}) — \
-                 post: link_up={} cfg_v4={:?} polls={} tx={} rx={} sock_state={:?}",
+                 post: link_up={} cfg_v4={:?} polls={} tx_ok={} tx_denied={} rx_ok={} rx_empty={} sock_state={:?}",
                 method,
                 path,
                 addr,
@@ -427,7 +431,9 @@ async fn request_with_full_body(
                 embassy_net::diag::NET_RUNNER_POLLS
                     .load(core::sync::atomic::Ordering::Relaxed),
                 tx_count,
+                tx_none,
                 rx_count,
+                rx_none,
                 socket.state()
             );
             // Dump the smoltcp neighbor (ARP) cache. If the destination
