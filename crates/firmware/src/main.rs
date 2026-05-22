@@ -129,6 +129,29 @@ fn main() -> ! {
     );
     println!("pa-fw: esp_hal::init returned");
 
+    // Add the ESP32-S3R8's 8 MB external PSRAM as a global heap
+    // region. The internal SRAM heap above stays at 96 KB; PSRAM
+    // gets stacked on top, so the allocator has ~8.1 MB total.
+    // This is the single biggest memory-pressure win available
+    // for free — cardstock graph rasters, hourly NOAA forecast
+    // payloads, large image buffers all fit in heap without
+    // needing to spill to the SD-backed SwapAlloc.
+    //
+    // Footgun (documented by esp_alloc's psram_allocator! macro):
+    // Atomic* types in PSRAM misbehave on ESP32-S3 — the chip's
+    // CPU treats PSRAM accesses as non-atomic regardless of
+    // instruction prefix. Small allocations (Arc, Channel, etc.)
+    // organically stay in internal SRAM because they fit there;
+    // only large byte buffers actually reach PSRAM. If we ever
+    // hit Atomic*-in-PSRAM corruption we'd flip to explicit
+    // `Vec::new_in(esp_alloc::ExternalMemory)` for the giant
+    // buffers and keep the global allocator internal-only.
+    esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
+    println!(
+        "pa-fw: PSRAM heap region added; total heap free = {} bytes",
+        esp_alloc::HEAP.free()
+    );
+
     let board = boards::current();
     println!("paperanywhere-firmware booting on {}", board.name);
 
