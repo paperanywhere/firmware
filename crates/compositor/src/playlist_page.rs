@@ -77,10 +77,19 @@ fn draw_card(
             };
             draw_widget(target, *x, *y, *style, "Battery", value.as_str(), bold, small, left);
         }
-        Card::Clock { x, y, format: _, style } => {
+        Card::Clock {
+            x,
+            y,
+            format: _,
+            style,
+            tz_offset_minutes: _,
+            refresh_hint: _,
+        } => {
             // NTP sync isn't wired yet (task #78). Render a stable
             // "--:--" placeholder so the card slot still occupies
-            // the position the user laid out.
+            // the position the user laid out. tz_offset_minutes +
+            // refresh_hint land here once NTP gives us a real wall
+            // clock to apply them to.
             let value = HString::<32>::try_from("--:--").unwrap_or_default();
             draw_widget(target, *x, *y, *style, "Time", value.as_str(), bold, small, left);
         }
@@ -101,6 +110,13 @@ fn draw_card(
             let value_str = if value.is_empty() { "--" } else { value.as_str() };
             draw_widget(target, *x, *y, *style, "IP", value_str, bold, small, left);
         }
+        // Weather + Graph are server-rasterised cards: their data
+        // ships alongside the playlist in `DeviceState.datasources`,
+        // and the eventual renderer paints a pre-packed framebuffer
+        // for the card's pixel rectangle. Skipping silently here
+        // keeps the forward-compat contract while the dedicated
+        // renderers come online.
+        Card::Weather { .. } | Card::Graph { .. } => {}
     }
 }
 
