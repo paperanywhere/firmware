@@ -75,65 +75,29 @@ pub struct DeviceState {
     pub playlist: Option<cardstock::Playlist>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ImageRef {
-    pub image_id: String,
-    pub blob_url: String,
-    pub sha256_hex: String,
-    pub byte_len: u64,
+// Polling-protocol image + firmware-update shapes live in proto.
+// Field-for-field identical between firmware + backend; sharing the
+// type means a future addition (e.g. expiry timestamp) only needs
+// to land in one place.
+pub use paperanywhere_proto::{FirmwareUpdate, ImageRef};
+
+// Single source of truth for these wire shapes lives in
+// `paperanywhere-proto`. Backend serialises them; firmware
+// deserialises the same bytes. Re-exported under the existing
+// `paperanywhere_ports::X` paths so this consolidation is a no-op
+// for every downstream consumer.
+pub use paperanywhere_proto::{AckPhase, DeviceAck, DeviceConfig, PowerPolicy};
+
+/// Helper methods on proto's wire enums. Rust forbids inherent
+/// `impl` blocks on types defined in a different crate; this trait
+/// + the blanket impl below re-attaches the previously-local
+/// behaviour without moving these strings upstream into proto.
+pub trait AckPhaseExt {
+    fn as_str(self) -> &'static str;
 }
 
-#[derive(Debug, Clone)]
-pub struct FirmwareUpdate {
-    /// Human-readable version stamp the new image will report after boot
-    /// (e.g. `0.2.0+f1e2d3c4`). Devices store this once they've finished
-    /// flashing so they don't loop on the same offer.
-    pub version: String,
-    /// Path the device GETs to stream the image bytes. Bearer-authenticated
-    /// with the device token, same as `image.blob_url`.
-    pub blob_url: String,
-    /// SHA-256 of the binary as a hex string. Verified chunked during
-    /// download — mismatch aborts the install without touching otadata.
-    pub sha256_hex: String,
-    pub byte_len: u64,
-    /// Set by the server-side kill switch: forces this update even if the
-    /// device's current version was higher (rollback to a known-good
-    /// release after a bad rollout still booted).
-    pub revoke: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct DeviceConfig {
-    pub sleep_interval_sec: u32,
-    pub power_policy: PowerPolicy,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PowerPolicy {
-    ScheduledWake,
-    AlwaysOn,
-}
-
-/// Request body for `POST /api/device/ack`. Reports the outcome of an image
-/// render attempt plus telemetry.
-#[derive(Debug, Clone)]
-pub struct DeviceAck {
-    pub image_id: String,
-    pub phase: AckPhase,
-    pub error: Option<String>,
-    pub battery_mv: Option<u16>,
-    pub rssi_dbm: Option<i16>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AckPhase {
-    Received,
-    Applied,
-    Failed,
-}
-
-impl AckPhase {
-    pub fn as_str(self) -> &'static str {
+impl AckPhaseExt for AckPhase {
+    fn as_str(self) -> &'static str {
         match self {
             AckPhase::Received => "received",
             AckPhase::Applied => "applied",
@@ -142,10 +106,16 @@ impl AckPhase {
     }
 }
 
-impl DeviceAck {
+/// Wire-format helper on `DeviceAck`. Same `impl`-on-foreign-type
+/// restriction as `AckPhaseExt`.
+pub trait DeviceAckExt {
+    fn to_json(&self) -> String;
+}
+
+impl DeviceAckExt for DeviceAck {
     /// Render to JSON without pulling serde. Matches what the backend route in
     /// `paperanywhere/crates/backend/src/routes/device_api.rs` accepts.
-    pub fn to_json(&self) -> String {
+    fn to_json(&self) -> String {
         let mut out = String::from("{");
         push_kv_str(&mut out, "image_id", &self.image_id);
         out.push(',');
@@ -262,7 +232,13 @@ pub fn parse_device_state(body: &str) -> Option<DeviceState> {
 
     Some(DeviceState {
         image,
-        config: DeviceConfig { sleep_interval_sec, power_policy },
+        config: DeviceConfig {
+            sleep_interval_sec,
+            power_policy,
+            // Firmware doesn't use the WS heartbeat path today;
+            // 60 s matches proto's `DEFAULT_SCHEDULED.heartbeat_interval_sec`.
+            heartbeat_interval_sec: 60,
+        },
         next_check_at,
         firmware_update,
         name,
@@ -397,24 +373,10 @@ fn needle_for(key: &str, quoted_value: bool) -> String {
 
 // ── Panel geometry ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColorMode {
-    Mono1bpp,
-    MonoRed1bpp,
-    MonoYellow1bpp,
-    Gray4,
-    Gray16,
-    Color7,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PackingKind {
-    RowMajorMsbFirst1bpp,
-    RowMajorLsbFirst1bpp,
-    RowMajorBe2bpp,
-    RowMajorBe4bpp,
-    AcepIndexed4bpp,
-}
+// Wire-level panel enums live in proto; firmware re-exports so the
+// existing `paperanywhere_ports::{ColorMode, PackingKind}` paths
+// keep working.
+pub use paperanywhere_proto::{ColorMode, PackingKind};
 
 /// What the runtime needs to know about the device. Concrete board configs
 /// (with pin maps, peripheral capability flags, etc.) live in the firmware
@@ -527,37 +489,10 @@ pub trait WifiLink {
     }
 }
 
-/// Identity an unclaimed device sends to `POST /api/device/register` so the
-/// backend can create an anonymous device row keyed by MAC and surface the
-/// device's hardware shape (panel model) to the dashboard before the user
-/// adopts it. After the user enters the returned `claim_code` in the
-/// dashboard, the backend already knows the panel model + firmware version
-/// — the adoption form is just `claim_code + optional name`.
-#[derive(Debug, Clone)]
-pub struct DeviceIdentity {
-    /// `aa:bb:cc:dd:ee:ff` — backend normalises so any common formatting works.
-    pub mac: alloc::string::String,
-    /// Catalog row in the backend's `panel_models` table. Comes from the
-    /// firmware's `BoardConfig::panel_model_id` constant — every board crate
-    /// declares its own.
-    pub panel_model_id: i32,
-    /// Firmware build stamp (e.g. `0.1.0+a1b2c3d4`). Sent so the dashboard
-    /// can decide whether to offer an OTA update on the adopt-success page.
-    pub fw_version: alloc::string::String,
-}
-
-/// What the backend hands back after a successful registration. The
-/// firmware persists all three to NVS:
-///   * `device_token` becomes the bearer for `/api/device/state` + `/ack`,
-///   * `claim_code` is what the adoption screen renders for the user,
-///   * `device_uuid` is the identifier the backend uses internally — useful
-///     for any future device-initiated lookup but not user-visible.
-#[derive(Debug, Clone)]
-pub struct DeviceRegistration {
-    pub device_uuid: alloc::string::String,
-    pub device_token: alloc::string::String,
-    pub claim_code: alloc::string::String,
-}
+// Registration shapes also live in proto — the request body
+// (DeviceIdentity) and the response (DeviceRegistration) are
+// field-for-field identical, so this is a pure re-export.
+pub use paperanywhere_proto::{DeviceIdentity, DeviceRegistration};
 
 /// HTTPS calls against the backend. Most are bearer-authenticated with the
 /// device token from [`NvsStore::load_device_token`]; [`register`] is the

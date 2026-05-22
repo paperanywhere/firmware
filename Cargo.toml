@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/cardstock",
+    "crates/paperanywhere-proto",
     "crates/ports",
     "crates/runtime",
     "crates/panel-uc8179",
@@ -31,13 +32,11 @@ log = "0.4"
 paperanywhere-ports = { path = "crates/ports" }
 paperanywhere-runtime = { path = "crates/runtime" }
 cardstock = { path = "crates/cardstock" }
-# paperanywhere-proto is wired in as a submodule at
-# `crates/paperanywhere-proto` but not yet consumed by any firmware
-# crate. The actual migration of ports' duplicate wire types onto
-# proto types is task #111 and is blocked on a serde feature-
-# unification issue exposed when proto enters the workspace
-# (5800+ errors in serde_core). Submodule stays so the consolidation
-# can proceed without re-cloning.
+# Firmware consumes proto with `default-features = false` so the
+# `ws` feature (which pulls in ulid's std-only serde impl) stays
+# off. Polling-protocol types live in proto's always-on modules and
+# don't need ulid.
+paperanywhere-proto = { path = "crates/paperanywhere-proto", default-features = false }
 paperanywhere-panel-uc8179 = { path = "crates/panel-uc8179" }
 paperanywhere-boot-screen = { path = "crates/boot-screen" }
 paperanywhere-compositor = { path = "crates/compositor" }

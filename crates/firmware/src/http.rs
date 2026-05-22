@@ -40,7 +40,8 @@ use embedded_io_07::{Error as EioError07, ErrorKind as EioErrorKind07, ErrorType
 use embedded_io_async_07::{Read, Write};
 use embedded_tls::{Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext, UnsecureProvider};
 use paperanywhere_ports::{
-    DeviceAck, DeviceIdentity, DeviceRegistration, DeviceState, HttpTransport, parse_device_state,
+    DeviceAck, DeviceAckExt, DeviceIdentity, DeviceRegistration, DeviceState, HttpTransport,
+    parse_device_state,
 };
 
 const TCP_RX_BUF: usize = 4 * 1024;

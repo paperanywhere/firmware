@@ -19,6 +19,12 @@ embassy-sync = "0.7"
 # runtime can hand it to the panel actor. Deserialised via serde_json
 # below.
 cardstock = { workspace = true }
+# Canonical wire-type definitions shared with the backend. We pull
+# proto with `default-features = false` so the `ws` feature stays
+# off (its ulid serde impl needs std, which we don't have on
+# firmware). Polling-protocol types (DeviceState, DeviceAck, etc.)
+# live in proto's always-on module.
+paperanywhere-proto = { workspace = true }
 # Full serde_json — no_std with alloc — to deserialise the playlist
 # field of the /state response. The hand-rolled extract_str path is
 # fine for flat fields but the nested Card variants need real serde.
