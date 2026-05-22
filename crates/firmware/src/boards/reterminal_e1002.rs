@@ -27,5 +27,6 @@ pub const CONFIG: BoardConfig = BoardConfig {
     battery_adc: Some(1),
     // ACeP Color7 panel — uses a different controller (UC8159), so the
     // UC8179-specific polarity flag is moot for this board. Placeholder.
+    sd: None,
     panel_data_inverted: false,
 };

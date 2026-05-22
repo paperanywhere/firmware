@@ -27,5 +27,6 @@ pub const CONFIG: BoardConfig = BoardConfig {
     panel_mosi: 9,
     battery_adc: Some(1),
     // ACeP Color7 13.3" panel — UC8159, not UC8179. Flag inapplicable.
+    sd: None,
     panel_data_inverted: false,
 };

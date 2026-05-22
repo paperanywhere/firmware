@@ -32,6 +32,16 @@ pub const CONFIG: BoardConfig = BoardConfig {
     panel_sclk: 8,
     panel_mosi: 9,
     battery_adc: Some(1),
+    // Pin map confirmed against the V1.0 schematic
+    // (202004307_reTerminal_E1001_V1.0_SCH_250805.pdf). The SD slot
+    // sits on SPI2 alongside the panel; SCK + MOSI are shared, and
+    // CS / DET / EN / MISO are SD-only.
+    sd: Some(super::SdPinMap {
+        miso: 8,
+        cs: 14,
+        detect: 15,
+        power_enable: 16,
+    }),
     // Good Display GDEW075T7 (the panel module Seeed integrates here)
     // wants `0 = white, 1 = black` on its DTM2 plane. Verified by flashing
     // the boot screen and observing inverted output without this flag.

@@ -83,6 +83,24 @@ pub enum PackingKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerPolicy { ScheduledWake, AlwaysOn }
 
+/// Board-specific SD-card pin assignments. SCK + MOSI are
+/// intentionally not listed here — they're shared with the panel's
+/// SPI bus and live on the panel pin map. The `FwSd` driver borrows
+/// the panel's bus through a shared device wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SdPinMap {
+    /// SD's data-out line (MCU input). reTerminal E1001 = GPIO8.
+    pub miso: u8,
+    /// SD chip select, active low. reTerminal E1001 = GPIO14.
+    pub cs: u8,
+    /// Card-detect input (active low — pulled low when a card is
+    /// inserted). reTerminal E1001 = GPIO15.
+    pub detect: u8,
+    /// SD power-enable output (drives a TPS22916 load switch on the
+    /// E-series). Active high. reTerminal E1001 = GPIO16.
+    pub power_enable: u8,
+}
+
 /// Capabilities + pin map for a specific physical device. Constructed once at
 /// boot by `current()` based on the active Cargo feature.
 #[derive(Debug, Clone, Copy)]
@@ -117,6 +135,11 @@ pub struct BoardConfig {
     pub panel_sclk: u8,
     pub panel_mosi: u8,
     pub battery_adc: Option<u8>,
+    /// SD card SPI pin map. `None` on boards without an SD slot
+    /// wired to the MCU. On the reTerminal E-series the SD shares
+    /// SCK + MOSI with the panel (same SPI2 bus, different CS) and
+    /// adds its own MISO + CS + card-detect + power-enable lines.
+    pub sd: Option<SdPinMap>,
     /// Whether the panel's data plane is natively `0 = white, 1 = black`
     /// (opposite of the renderer-friendly convention). True for most Good
     /// Display 7.5" V2 BW modules including the one in reTerminal E1001;

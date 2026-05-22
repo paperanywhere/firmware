@@ -39,6 +39,18 @@ paperanywhere-runtime.workspace = true
 paperanywhere-panel-uc8179.workspace = true
 paperanywhere-compositor.workspace = true
 
+# ── SD card stack ──
+# embedded-sdmmc: SPI-mode SD card driver + FAT16/FAT32 filesystem.
+# We use SPI mode (not native SDMMC) because esp-hal 1.1 doesn't
+# expose an SDMMC peripheral driver, and the reTerminal E1001
+# schematic wires the SD slot in SPI mode anyway (SCK=GPIO7,
+# MOSI=GPIO9, MISO=GPIO8, CS=GPIO14, DET=GPIO15, EN=GPIO16).
+embedded-sdmmc = { version = "0.8", default-features = false }
+# embedded-hal-bus's bus-sharing wrappers (CriticalSectionDevice)
+# are what we need for the panel+SD shared SPI2 refactor. The
+# existing dep declaration further down enables `async` (panel
+# requirement); we just rely on that.
+
 # ── esp-rs (current matrix) ──
 # `esp-wifi` was renamed to `esp-radio` for the 1.x line. `esp-radio` 0.18 uses
 # the new `esp-rtos` scheduler crate instead of the private feature on esp-hal

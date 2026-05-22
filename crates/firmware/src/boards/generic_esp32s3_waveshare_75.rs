@@ -29,5 +29,6 @@ pub const CONFIG: BoardConfig = BoardConfig {
     battery_adc: None,
     // Waveshare 7.5" V2 BW modules use the same data-plane convention as
     // the Good Display variant in the reTerminal — see UC8179 driver docs.
+    sd: None,
     panel_data_inverted: true,
 };

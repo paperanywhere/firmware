@@ -27,5 +27,6 @@ pub const CONFIG: BoardConfig = BoardConfig {
     panel_mosi: 9,
     battery_adc: Some(1),
     // Gray16 10.3" panel — uses IT8951, not UC8179. Flag inapplicable.
+    sd: None,
     panel_data_inverted: false,
 };

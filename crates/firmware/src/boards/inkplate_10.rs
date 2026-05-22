@@ -21,5 +21,6 @@ pub const CONFIG: BoardConfig = BoardConfig {
     panel_busy: 0, panel_rst: 0, panel_dc: 0, panel_cs: 0, panel_sclk: 0, panel_mosi: 0,
     battery_adc: Some(35),
     // Inkplate 10 uses a parallel-RGB e-paper interface, not UC8179 SPI.
+    sd: None,
     panel_data_inverted: false,
 };

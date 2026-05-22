@@ -36,6 +36,8 @@ mod diagnostics;
 mod http;
 mod network;
 mod nvs;
+mod sd;
+mod swap;
 mod ota;
 mod panel;
 mod panel_actor;

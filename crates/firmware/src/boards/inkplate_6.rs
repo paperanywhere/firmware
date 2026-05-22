@@ -22,5 +22,6 @@ pub const CONFIG: BoardConfig = BoardConfig {
     battery_adc: Some(35),
     // Inkplate 6 uses a parallel-RGB e-paper interface, not UC8179 SPI.
     // Flag inapplicable; placeholder for the BoardConfig schema.
+    sd: None,
     panel_data_inverted: false,
 };
