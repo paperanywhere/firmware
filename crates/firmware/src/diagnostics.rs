@@ -33,11 +33,18 @@ pub async fn heartbeat_task() -> ! {
         let s = chrome::snapshot();
         let heap_free = esp_alloc::HEAP.free();
         let heap_used = esp_alloc::HEAP.used();
+        // Net-runner poll counter: if this stops advancing during a
+        // /state hang, net_task is genuinely stuck on core 0. If it
+        // keeps climbing, the hang is in the TCP state machine or
+        // the SocketDevice driver and net_task itself is fine.
+        let net_polls = embassy_net::diag::NET_RUNNER_POLLS
+            .load(core::sync::atomic::Ordering::Relaxed);
         log::info!(
-            "diag #{}: heap free={} used={} | wifi={:?} rssi={:?} ip={:?} gw={:?} | batt {}mv ({}%) | status={:?} uuid={} code={}",
+            "diag #{}: heap free={} used={} | net_polls={} | wifi={:?} rssi={:?} ip={:?} gw={:?} | batt {}mv ({}%) | status={:?} uuid={} code={}",
             tick,
             heap_free,
             heap_used,
+            net_polls,
             s.wifi_link_state,
             s.rssi_dbm,
             s.ip.as_deref().unwrap_or("--"),

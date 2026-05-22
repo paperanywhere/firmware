@@ -265,16 +265,47 @@ async fn request_with_full_body(
     } = http;
     let t_connect = Instant::now();
     let mut socket = TcpSocket::new(**stack, &mut tcp_rx_buf[..], &mut tcp_tx_buf[..]);
-    socket
-        .connect((addr, *port))
-        .await
-        .map_err(|_| HttpError::SocketConnect)?;
     log::info!(
-        "http: [{} {}] stage=tcp_connect +{}ms",
-        method,
-        path,
-        (Instant::now() - t_connect).as_millis()
+        "http: [{} {}] stage=connect_begin (addr={:?}, port={})",
+        method, path, addr, *port
     );
+    // Time-bound the connect so a hung TCP handshake surfaces as a
+    // log line instead of a silent stall. 10 s is generous against
+    // typical LAN connect latency (~ms) but lets us see clearly
+    // when net_task isn't progressing the handshake.
+    let connect_fut = socket.connect((addr, *port));
+    match embassy_time::with_timeout(
+        embassy_time::Duration::from_secs(10),
+        connect_fut,
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            log::info!(
+                "http: [{} {}] stage=tcp_connect +{}ms",
+                method,
+                path,
+                (Instant::now() - t_connect).as_millis()
+            );
+        }
+        Ok(Err(e)) => {
+            log::error!(
+                "http: [{} {}] connect FAILED after {}ms: {:?}",
+                method,
+                path,
+                (Instant::now() - t_connect).as_millis(),
+                e
+            );
+            return Err(HttpError::SocketConnect);
+        }
+        Err(_) => {
+            log::error!(
+                "http: [{} {}] connect TIMEOUT after 10s (addr={:?}, port={})",
+                method, path, addr, *port
+            );
+            return Err(HttpError::SocketConnect);
+        }
+    }
 
     match scheme {
         Scheme::Http => {
