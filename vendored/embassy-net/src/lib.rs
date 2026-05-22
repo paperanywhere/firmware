@@ -1036,6 +1036,11 @@ pub mod diag {
     /// climb proportional to NET_RUNNER_POLLS.
     pub static NET_RX_NONE: AtomicU32 = AtomicU32::new(0);
 
+    // ── Re-exports from the vendored smoltcp fork ─────────────
+    // Saves firmware the trouble of adding a direct smoltcp dep just
+    // to read TCP-layer counters.
+    pub use smoltcp::diag::{TCP_RETRANSMITS, TCP_TIMEOUTS};
+
     pub const TX_SLOTS: usize = 30;
     pub const RX_SLOTS: usize = 12;
 

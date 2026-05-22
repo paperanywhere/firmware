@@ -2279,6 +2279,12 @@ impl<'a> Socket<'a> {
             if let Some(retransmit_delta) = self.timer.should_retransmit(cx.now()) {
                 // If a retransmit timer expired, we should resend data starting at the last ACK.
                 net_debug!("retransmitting at t+{}", retransmit_delta);
+                // Paperanywhere fork: count retransmits so consumers
+                // can distinguish "smoltcp is actively retrying" from
+                // "smoltcp gave up" without enabling smoltcp's log
+                // tracing.
+                crate::diag::TCP_RETRANSMITS
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
                 // Rewind "last sequence number sent", as if we never
                 // had sent them. This will cause all data in the queue

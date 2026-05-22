@@ -169,6 +169,31 @@ pub mod storage;
 pub mod time;
 pub mod wire;
 
+/// Paperanywhere fork diagnostics. Exposes a small set of atomic
+/// counters that smoltcp itself increments at internal state-machine
+/// transitions, so a consumer (embassy-net, firmware) can sample them
+/// without enabling smoltcp's full `log` / `defmt` tracing.
+pub mod diag {
+    use core::sync::atomic::AtomicU32;
+
+    /// Number of TCP retransmits initiated by smoltcp's TCP socket
+    /// dispatch — incremented every time `should_retransmit` returns
+    /// `Some(...)` and the socket actually rewinds for resend.
+    ///
+    /// Pairs with `embassy_net::diag::NET_TX_PKTS` for the canonical
+    /// diagnostic question "is smoltcp giving up, or is it actively
+    /// retrying with no response?". If this climbs while no progress
+    /// is made (socket stuck in SynSent), retransmits ARE going out;
+    /// the issue is downstream of smoltcp (driver, AP, or destination).
+    pub static TCP_RETRANSMITS: AtomicU32 = AtomicU32::new(0);
+
+    /// Number of TCP timeouts that fired and aborted a connection.
+    /// Different from the bounded-timeout the firmware wraps connect
+    /// in — this is smoltcp's own user-timeout (default disabled in
+    /// embassy-net 0.7, but bounded for our own pre-flight checks).
+    pub static TCP_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+}
+
 #[cfg(all(
     test,
     any(
