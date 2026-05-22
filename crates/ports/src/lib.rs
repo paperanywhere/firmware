@@ -195,181 +195,37 @@ fn push_unicode_escape(out: &mut String, c: char) {
 /// what we need. Returns `None` on any structural surprise; caller treats it
 /// as "skip this wake, retry next".
 pub fn parse_device_state(body: &str) -> Option<DeviceState> {
-    let image_id = extract_str(body, "image_id");
-    let blob_url = extract_str(body, "blob_url");
-    let sha256 = extract_str(body, "sha256");
-    let byte_len = extract_u64(body, "byte_len");
-    let sleep_interval_sec = extract_u64(body, "sleep_interval_sec").unwrap_or(21_600) as u32;
-    let next_check_at = extract_u64(body, "next_check_at")?;
-    let policy_str = extract_str(body, "power_policy").unwrap_or_else(|| String::from("scheduled_wake"));
-    let power_policy = match policy_str.as_str() {
-        "always_on" => PowerPolicy::AlwaysOn,
-        _ => PowerPolicy::ScheduledWake,
-    };
-
-    let image = match (image_id, blob_url, sha256, byte_len) {
-        (Some(id), Some(url), Some(sha), Some(len)) => Some(ImageRef {
-            image_id: id,
-            blob_url: url,
-            sha256_hex: sha,
-            byte_len: len,
-        }),
-        _ => None,
-    };
-
-    // Optional firmware-update block. Backend serializes a JSON object as
-    // `firmware_update`; we parse it field-by-field via the existing
-    // extractors. If any required field is missing we treat the whole
-    // block as absent so a malformed response can't accidentally trigger
-    // an OTA install.
-    let firmware_update = parse_firmware_update(body);
-
-    let name = extract_str(body, "name");
-    let device_uuid = extract_str(body, "device_uuid");
-    let owner_email = extract_str(body, "owner_email");
-    let project_name = extract_str(body, "project_name");
-    let playlist = parse_playlist(body);
-
+    // Backend serialises `paperanywhere_proto::DeviceState` verbatim;
+    // we deserialise it via real serde_json (now that the firmware
+    // ports crate depends on serde_json for the cardstock playlist
+    // parse anyway). The only conversion step is unpacking the
+    // raw `playlist_json: Option<String>` into the runtime's
+    // `Option<cardstock::Playlist>`. Everything else is a 1:1
+    // move into firmware's runtime DeviceState.
+    let wire: paperanywhere_proto::DeviceState =
+        serde_json::from_str(body).ok()?;
+    let playlist = wire
+        .playlist_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<cardstock::Playlist>(s).ok());
     Some(DeviceState {
-        image,
-        config: DeviceConfig {
-            sleep_interval_sec,
-            power_policy,
-            // Firmware doesn't use the WS heartbeat path today;
-            // 60 s matches proto's `DEFAULT_SCHEDULED.heartbeat_interval_sec`.
-            heartbeat_interval_sec: 60,
-        },
-        next_check_at,
-        firmware_update,
-        name,
-        device_uuid,
-        owner_email,
-        project_name,
+        image: wire.image,
+        config: wire.config,
+        next_check_at: wire.next_check_at,
+        firmware_update: wire.firmware_update,
+        name: wire.name,
+        device_uuid: wire.device_uuid,
+        owner_email: wire.owner_email,
+        project_name: wire.project_name,
         playlist,
     })
 }
 
-/// Pull the optional `playlist` object out of the /state JSON body
-/// and run it through serde_json. The hand-rolled extractors above
-/// can't handle the nested `Card` variants (each is a tagged enum
-/// with per-variant fields), so we delegate this single field to
-/// real serde. A malformed playlist is treated as "no playlist" —
-/// the device falls back to the main placeholder rather than
-/// erroring the wake cycle.
-fn parse_playlist(body: &str) -> Option<cardstock::Playlist> {
-    // Locate the `"playlist":` key. Slice from the opening `{`
-    // through its matching `}`, then hand that substring to
-    // serde_json::from_str. We track nesting depth across `{` and
-    // `}` so embedded objects in the card tree don't terminate the
-    // slice early. String contents are skipped via a tiny escape-
-    // aware scanner so a `}` inside a value never closes the outer
-    // object.
-    let key = "\"playlist\"";
-    let key_at = body.find(key)?;
-    let after_key = &body[key_at + key.len()..];
-    let open_rel = after_key.find('{')?;
-    let bytes = after_key.as_bytes();
-    let start = open_rel;
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut escaped = false;
-    let mut end = None;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_str = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(i + 1);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let end = end?;
-    let slice = &after_key[start..end];
-    serde_json::from_str::<cardstock::Playlist>(slice).ok()
-}
-
-fn parse_firmware_update(body: &str) -> Option<FirmwareUpdate> {
-    let version = extract_str(body, "firmware_version")?;
-    let blob_url = extract_str(body, "firmware_blob_url")?;
-    let sha256_hex = extract_str(body, "firmware_sha256")?;
-    let byte_len = extract_u64(body, "firmware_byte_len")?;
-    let revoke = extract_u64(body, "firmware_revoke").unwrap_or(0) != 0;
-    Some(FirmwareUpdate { version, blob_url, sha256_hex, byte_len, revoke })
-}
-
-fn extract_str(body: &str, key: &str) -> Option<String> {
-    let needle = needle_for(key, true);
-    let start = body.find(needle.as_str())? + needle.len();
-    let rest = &body[start..];
-    let mut end = 0;
-    let mut chars = rest.char_indices();
-    while let Some((i, ch)) = chars.next() {
-        if ch == '\\' {
-            let _ = chars.next();
-            continue;
-        }
-        if ch == '"' {
-            end = i;
-            break;
-        }
-    }
-    if end == 0 {
-        return None;
-    }
-    let raw = &rest[..end];
-    let mut out = String::with_capacity(raw.len());
-    let mut iter = raw.chars();
-    while let Some(c) = iter.next() {
-        if c == '\\' {
-            match iter.next()? {
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                'n' => out.push('\n'),
-                'r' => out.push('\r'),
-                't' => out.push('\t'),
-                '/' => out.push('/'),
-                _ => return None,
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    Some(out)
-}
-
-fn extract_u64(body: &str, key: &str) -> Option<u64> {
-    let needle = needle_for(key, false);
-    let start = body.find(needle.as_str())? + needle.len();
-    let rest = body[start..].trim_start();
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    rest[..end].parse().ok()
-}
-
-fn needle_for(key: &str, quoted_value: bool) -> String {
-    let mut s = String::with_capacity(key.len() + 5);
-    s.push('"');
-    s.push_str(key);
-    s.push_str("\":");
-    if quoted_value {
-        s.push('"');
-    }
-    s
-}
+// Hand-rolled `extract_str` / `extract_u64` / `parse_firmware_update`
+// / `parse_playlist` extractors lived here previously. They are
+// retired now that `parse_device_state` deserialises straight off
+// `paperanywhere_proto::DeviceState` via serde_json — a single
+// shared source of truth for the wire shape.
 
 // ── Panel geometry ────────────────────────────────────────────────────────────
 
