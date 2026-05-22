@@ -105,6 +105,7 @@ pub async fn panel_actor_task(
     enum CurrentView {
         Boot,
         Adoption,
+        Main,
         Image,
         Halt,
         // OTA progress is handled separately (the OTA latch above)
@@ -195,6 +196,7 @@ pub async fn panel_actor_task(
         match &cmd {
             PaintCmd::RedrawBootScreen => current_view = CurrentView::Boot,
             PaintCmd::ShowAdoption { .. } => current_view = CurrentView::Adoption,
+            PaintCmd::ShowMain { .. } => current_view = CurrentView::Main,
             PaintCmd::ShowHalt { .. } => current_view = CurrentView::Halt,
             PaintCmd::ShowImage { .. } => current_view = CurrentView::Image,
             PaintCmd::ChromeChanged(kind) => {
@@ -316,6 +318,20 @@ async fn handle_cmd(
             );
             commit_view(panel, last_painted_hash, "adoption").await;
         }
+        PaintCmd::ShowMain {
+            ip,
+            last_update,
+            owner_email,
+            project_name,
+        } => {
+            panel.render_main_placeholder(
+                ip.as_str(),
+                last_update.as_ref().map(|s| s.as_str()),
+                owner_email.as_ref().map(|s| s.as_str()),
+                project_name.as_ref().map(|s| s.as_str()),
+            );
+            commit_view(panel, last_painted_hash, "main").await;
+        }
         PaintCmd::ShowHalt { headline, detail, code } => {
             panel.render_halt_screen(headline, detail, code);
             commit_view(panel, last_painted_hash, "halt").await;
@@ -379,6 +395,7 @@ fn cmd_name(cmd: &PaintCmd) -> &'static str {
     match cmd {
         PaintCmd::RedrawBootScreen => "RedrawBootScreen",
         PaintCmd::ShowAdoption { .. } => "ShowAdoption",
+        PaintCmd::ShowMain { .. } => "ShowMain",
         PaintCmd::ShowHalt { .. } => "ShowHalt",
         PaintCmd::ShowImage { .. } => "ShowImage",
         PaintCmd::UpdateChrome { .. } => "UpdateChrome",

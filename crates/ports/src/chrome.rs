@@ -94,8 +94,22 @@ pub struct ChromeState {
     /// User-supplied friendly name. Pre-adoption: backend's auto-generated
     /// `device-XXXX`. Post-adoption: whatever the user typed.
     pub device_name: Option<HString<64>>,
+    /// Email of the user whose project this device belongs to.
+    /// Surfaced on the main-view placeholder. `None` while the
+    /// device is in the unclaimed pool.
+    pub owner_email: Option<HString<64>>,
+    /// Friendly name of the project the device sits in (e.g.
+    /// "Kitchen Displays"). `None` for unclaimed devices.
+    pub project_name: Option<HString<48>>,
     // ── Power / connectivity ─────────────────────────────────
     pub battery_mv: Option<u16>,
+    /// State-of-charge percentage (0-100). Set alongside `battery_mv`
+    /// by the per-board `BatteryGauge` impl — boards with a fuel-gauge
+    /// IC publish the chip's reading here; boards with only an ADC +
+    /// divider publish `lipo_percent_from_mv(mv)`. Status-bar widgets
+    /// prefer this field over re-deriving from `battery_mv` so that
+    /// fuel-gauge boards don't lose accuracy in the render path.
+    pub battery_percent: Option<u8>,
     pub usb_connected: Option<bool>,
     // ── Lifecycle ────────────────────────────────────────────
     pub device_status: DeviceStatus,
@@ -120,7 +134,10 @@ static CHROME: Mutex<CriticalSectionRawMutex, RefCell<ChromeState>> =
         device_id: None,
         device_uuid: None,
         device_name: None,
+        owner_email: None,
+        project_name: None,
         battery_mv: None,
+        battery_percent: None,
         usb_connected: None,
         device_status: DeviceStatus::Booting,
         last_update_local: None,
@@ -301,8 +318,38 @@ pub fn set_device_name_with(name: Option<&str>, persist: Persist) {
     invalidate(RefreshKind::Fast);
 }
 
+pub fn set_owner_email(email: Option<&str>) {
+    set_owner_email_with(email, Persist::Volatile);
+}
+pub fn set_owner_email_with(email: Option<&str>, persist: Persist) {
+    with_mut(|s| s.owner_email = email.map(hstring_from));
+    maybe_persist(persist);
+    invalidate(RefreshKind::Fast);
+}
+
+pub fn set_project_name(name: Option<&str>) {
+    set_project_name_with(name, Persist::Volatile);
+}
+pub fn set_project_name_with(name: Option<&str>, persist: Persist) {
+    with_mut(|s| s.project_name = name.map(hstring_from));
+    maybe_persist(persist);
+    invalidate(RefreshKind::Fast);
+}
+
 pub fn set_battery_mv(mv: Option<u16>) {
     with_mut(|s| s.battery_mv = mv);
+    invalidate(RefreshKind::Fast);
+}
+
+/// Atomic battery update: mv + percent published together. Used by
+/// [`BatteryGauge`] consumers so the status bar never reads a torn
+/// pair where mv reflects a fresh sample but percent is stale (or
+/// vice versa). Pass `None` to clear (e.g. "battery disconnected").
+pub fn set_battery(sample: Option<crate::BatterySample>) {
+    with_mut(|s| {
+        s.battery_mv = sample.map(|x| x.mv);
+        s.battery_percent = sample.map(|x| x.percent);
+    });
     invalidate(RefreshKind::Fast);
 }
 

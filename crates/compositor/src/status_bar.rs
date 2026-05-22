@@ -143,7 +143,12 @@ pub fn render(
     draw_vertical_divider(&mut target, next_right, status_bar_height);
     right = next_right - 1;
 
-    let cell_width = draw_battery_cell(&mut target, right, status.battery_mv);
+    let cell_width = draw_battery_cell(
+        &mut target,
+        right,
+        status.battery_mv,
+        status.battery_percent,
+    );
     let next_right = right - cell_width;
     draw_vertical_divider(&mut target, next_right, status_bar_height);
     right = next_right - 1;
@@ -308,7 +313,12 @@ fn blit_mono_icon(
     }
 }
 
-fn draw_battery_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32, mv: Option<u16>) -> i32 {
+fn draw_battery_cell(
+    target: &mut Mono1bppTarget<'_>,
+    right_edge: i32,
+    mv: Option<u16>,
+    percent: Option<u8>,
+) -> i32 {
     // Fixed-width battery-percent label, LEFT-aligned inside its cell.
     // Format: "BATTERY: NNN%" where NNN is always 3 chars wide (right-
     // padded with spaces, or "--" when no sample). Layout never shifts
@@ -329,9 +339,13 @@ fn draw_battery_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32, mv: Optio
     // regardless of magnitude.
     let mut text: HString<16> = HString::new();
     let _ = text.push_str("BATTERY: ");
-    match mv {
-        Some(mv) => {
-            let pct = battery_mv_to_percent(mv);
+    // Prefer the gauge's own percent reading (e.g. a fuel-gauge IC's
+    // SoC). Fall back to deriving from mv via the shared LiPo curve
+    // for ADC-only boards. Falls all the way to " --" when neither
+    // is available (no sample this wake, board has no battery, etc.).
+    let pct_opt = percent.or_else(|| mv.map(battery_mv_to_percent));
+    match pct_opt {
+        Some(pct) => {
             // Right-align pct into a 3-char field with leading spaces.
             let mut buf = [0u8; 5];
             let pct_str = u8_to_str(pct, &mut buf);
@@ -771,12 +785,11 @@ impl<'a> DrawTarget for Mono1bppTarget<'a> {
     }
 }
 
-/// Stringify a u8 percent into the provided buffer, returning a `&str`
-/// view. Avoids pulling `alloc::format!` for the per-refresh path.
+/// Stringify a u8 into the provided buffer, returning a `&str` view.
+/// Pure digits — the trailing `%` is appended by the caller. Avoids
+/// pulling `alloc::format!` for the per-refresh path.
 fn u8_to_str<'a>(n: u8, buf: &'a mut [u8; 5]) -> &'a str {
     let mut i = buf.len();
-    i -= 1;
-    buf[i] = b'%';
     let mut n = n as u16;
     if n == 0 {
         i -= 1;

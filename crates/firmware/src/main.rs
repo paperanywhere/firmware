@@ -29,12 +29,12 @@ use esp_println::println;
 // scope.
 esp_bootloader_esp_idf::esp_app_desc!();
 
+mod battery;
 mod boards;
 mod boot;
+mod diagnostics;
 mod http;
-mod http_proxy;
 mod network;
-mod wifi_proxy;
 mod nvs;
 mod ota;
 mod panel;
@@ -184,6 +184,22 @@ fn main() -> ! {
         "no panel-hardware wiring for the active board feature yet — add a cfg block above"
     );
 
+    // E1001 (and the rest of the reTerminal family) gates the battery
+    // divider behind GPIO21 and reads on GPIO1. Sourced from Seeed's
+    // ESPHome cookbook for the board:
+    //   adc: { pin: GPIO1, attenuation: 12db, multiply: 2.0 }
+    //   output: { platform: gpio, pin: GPIO21, id: bsp_battery_enable }
+    // Boards without a battery (generic ESP32-S3 carriers etc.)
+    // would set `battery: None` and ship the `NoBatteryGauge`.
+    #[cfg(feature = "board-reterminal-e1001")]
+    let battery = Some(resources::BatteryHardware {
+        adc1: peripherals.ADC1,
+        batt_sense: peripherals.GPIO1,
+        batt_enable: peripherals.GPIO21,
+    });
+    #[cfg(not(feature = "board-reterminal-e1001"))]
+    let battery: Option<resources::BatteryHardware> = None;
+
     let resources = resources::FirmwareResources {
         board,
         timg0: peripherals.TIMG0,
@@ -195,6 +211,7 @@ fn main() -> ! {
         cpu_ctrl: peripherals.CPU_CTRL,
         sw_int1: sw_ints.software_interrupt1,
         panel,
+        battery,
     };
 
     boot::run(resources)

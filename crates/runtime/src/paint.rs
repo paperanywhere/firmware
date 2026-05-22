@@ -202,6 +202,10 @@ pub type LastUpdateStr = HString<24>;
 pub type ClaimCodeStr = HString<16>;
 /// Bounded adopt-URL string.
 pub type AdoptUrlStr = HString<64>;
+/// Bounded owner-email string (matches the chrome KV slot size).
+pub type OwnerEmailStr = HString<64>;
+/// Bounded project-name string (matches the chrome KV slot size).
+pub type ProjectNameStr = HString<48>;
 
 /// All view-change + chrome-update commands the actor can process.
 /// Variants are deliberately split into "view changes" (the actor
@@ -225,6 +229,17 @@ pub enum PaintCmd {
         ip: IpStr,
         adopt_url: AdoptUrlStr,
         retry_notice: Option<&'static str>,
+    },
+
+    /// Main-view placeholder shown when the device is adopted but
+    /// the backend has not yet pushed an image. Carries everything
+    /// the placeholder layout needs so the actor never has to call
+    /// back into shared state. Full-LUT view transition.
+    ShowMain {
+        ip: IpStr,
+        last_update: Option<LastUpdateStr>,
+        owner_email: Option<OwnerEmailStr>,
+        project_name: Option<ProjectNameStr>,
     },
 
     /// Terminal halt-screen view. Carries the headline + detail +

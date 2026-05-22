@@ -18,6 +18,7 @@ use crate::boards;
 use crate::http::FwHttp;
 use crate::nvs::FwNvs;
 use crate::ota::FwOta;
+use crate::battery::FwBatteryGauge;
 use crate::power::FwSleeper;
 use crate::provisioning::SetupPath;
 use crate::resources::FirmwareResources;
@@ -49,6 +50,7 @@ static HTTP: StaticCell<FwHttp> = StaticCell::new();
 static NVS: StaticCell<FwNvs> = StaticCell::new();
 static PANEL: StaticCell<boards::Panel> = StaticCell::new();
 static SLEEPER: StaticCell<FwSleeper> = StaticCell::new();
+static BATTERY: StaticCell<FwBatteryGauge> = StaticCell::new();
 static OTA: StaticCell<FwOta> = StaticCell::new();
 static STACK_HANDLE: StaticCell<Stack<'static>> = StaticCell::new();
 static EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
@@ -144,6 +146,7 @@ pub fn run(resources: FirmwareResources) -> ! {
         cpu_ctrl,
         sw_int1,
         panel,
+        battery,
     } = resources;
 
     if factory_reset_held(board) {
@@ -193,6 +196,10 @@ pub fn run(resources: FirmwareResources) -> ! {
     let nvs_ref = NVS.init(nvs);
     let panel_ref = PANEL.init(boards::build_panel(panel, board));
     let sleeper_ref = SLEEPER.init(FwSleeper::new(lpwr));
+    // Battery gauge built from the per-board hardware bundle. Owned
+    // by core 1 alongside the runtime (it's a peripheral-access path,
+    // not a network-stack one).
+    let battery_ref = BATTERY.init(crate::battery::new_from_resources(battery));
     let ota_ref = OTA.init(FwOta::new());
 
     // Hand the NVS instance to the chrome persistence hook so
@@ -307,7 +314,10 @@ pub fn run(resources: FirmwareResources) -> ! {
     // startup time) instead of immediately. In practice the panel
     // takes ~3 s for its full-LUT refresh anyway, so the delta is
     // imperceptible.
-    panel_ref.set_chrome(sleeper_ref.battery_mv(), None);
+    // Battery starts unknown — the first real sample comes from the
+    // runtime's wake cycle once the gauge is owned by core 1. The
+    // status bar renders "--" until that lands (~immediately).
+    panel_ref.set_chrome(None, None);
     // IP stays unset (None) pre-DHCP — the boot-screen render
     // displays "--" rather than the old "connecting..." placeholder.
     // The WiFi field carries the link-state signalling instead, set
@@ -416,11 +426,19 @@ pub fn run(resources: FirmwareResources) -> ! {
         core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
     static OTA_HANDOFF: core::sync::atomic::AtomicPtr<FwOta> =
         core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+    static BATTERY_HANDOFF: core::sync::atomic::AtomicPtr<FwBatteryGauge> =
+        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+    // FwWifi + FwHttp moved to core 1 after the embassy-net fork made
+    // `&Stack` cross-core safe (#101). The proxy pattern's main cost
+    // was a `Vec<u8>` buffer per blob download — removing it streams
+    // bytes directly from FwHttp → runtime → panel, which is what
+    // was blowing the heap on /state. esp-radio's only hard core-0
+    // pin remains net_task (the Stack Runner).
+    static WIFI_HANDOFF: core::sync::atomic::AtomicPtr<crate::wifi::FwWifi> =
+        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+    static HTTP_HANDOFF: core::sync::atomic::AtomicPtr<crate::http::FwHttp> =
+        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
     static IDENTITY_CELL: StaticCell<paperanywhere_ports::DeviceIdentity> =
-        StaticCell::new();
-    static HTTP_PROXY_CLIENT_CELL: StaticCell<crate::http_proxy::HttpProxyClient> =
-        StaticCell::new();
-    static WIFI_PROXY_CLIENT_CELL: StaticCell<crate::wifi_proxy::WifiProxyClient> =
         StaticCell::new();
     PANEL_HANDOFF.store(
         panel_ref as *mut boards::Panel,
@@ -438,12 +456,18 @@ pub fn run(resources: FirmwareResources) -> ! {
         ota_ref as *mut FwOta,
         core::sync::atomic::Ordering::Release,
     );
-    // FwWifi stays on core 0 (owned by wifi_proxy_task) because it
-    // accesses the embassy-net Stack, which is !Send. Runtime on
-    // core 1 uses WifiProxyClient which forwards async ops through
-    // a channel and reads sync IP/RSSI/gateway values from the
-    // chrome KV (the wifi_proxy_task keeps those fresh on a 200 ms
-    // poll).
+    BATTERY_HANDOFF.store(
+        battery_ref as *mut FwBatteryGauge,
+        core::sync::atomic::Ordering::Release,
+    );
+    WIFI_HANDOFF.store(
+        wifi_ref as *mut crate::wifi::FwWifi,
+        core::sync::atomic::Ordering::Release,
+    );
+    HTTP_HANDOFF.store(
+        http_ref as *mut crate::http::FwHttp,
+        core::sync::atomic::Ordering::Release,
+    );
     // DeviceIdentity goes through a StaticCell because it's an
     // owned, Send, !Copy value — capturing it by-value in the
     // closure would consume it, and the runtime needs an owned
@@ -451,10 +475,6 @@ pub fn run(resources: FirmwareResources) -> ! {
     // can clone from cleanly.
     let identity_ref: &'static paperanywhere_ports::DeviceIdentity =
         IDENTITY_CELL.init(identity);
-    let http_client_ref: &'static mut crate::http_proxy::HttpProxyClient =
-        HTTP_PROXY_CLIENT_CELL.init(crate::http_proxy::HttpProxyClient);
-    let wifi_client_ref: &'static mut crate::wifi_proxy::WifiProxyClient =
-        WIFI_PROXY_CLIENT_CELL.init(crate::wifi_proxy::WifiProxyClient);
 
     let app_stack = APP_CORE_STACK.init(CoreStack::new());
     esp_rtos::start_second_core(
@@ -475,6 +495,15 @@ pub fn run(resources: FirmwareResources) -> ! {
             let ota_ref: &'static mut FwOta = unsafe {
                 &mut *OTA_HANDOFF.load(core::sync::atomic::Ordering::Acquire)
             };
+            let battery_ref: &'static mut FwBatteryGauge = unsafe {
+                &mut *BATTERY_HANDOFF.load(core::sync::atomic::Ordering::Acquire)
+            };
+            let wifi_ref_core1: &'static mut crate::wifi::FwWifi = unsafe {
+                &mut *WIFI_HANDOFF.load(core::sync::atomic::Ordering::Acquire)
+            };
+            let http_ref_core1: &'static mut crate::http::FwHttp = unsafe {
+                &mut *HTTP_HANDOFF.load(core::sync::atomic::Ordering::Acquire)
+            };
             let core1_executor =
                 CORE1_EXECUTOR.init(esp_rtos::embassy::Executor::new());
             core1_executor.run(|spawner| {
@@ -487,14 +516,16 @@ pub fn run(resources: FirmwareResources) -> ! {
                 .expect("panel_actor_task pool");
                 spawner.spawn(actor_token);
                 // Runtime: now on core 1 alongside the actor, talks
-                // to the network via HttpProxyClient → REQ_CHANNEL →
-                // http_proxy_task on core 0.
+                // to FwHttp + FwWifi directly. Cross-core access to
+                // the embassy-net Stack is safe because the vendored
+                // fork wraps the inner RefCell in a CSRawMutex.
                 let rt_token = runtime_task(
-                    wifi_client_ref,
-                    http_client_ref,
+                    wifi_ref_core1,
+                    http_ref_core1,
                     nvs_ref,
                     sleeper_ref,
                     ota_ref,
+                    battery_ref,
                     policy,
                     identity_ref.clone(),
                     &OTA_PROGRESS,
@@ -506,31 +537,35 @@ pub fn run(resources: FirmwareResources) -> ! {
         },
     );
 
-    // Core 0's executor: net_task + http_proxy_task only. No app
-    // logic, no panel work, no chrome-state mutation. The runtime
-    // on core 1 may still write to chrome via the CriticalSection
-    // mutex (cross-core safe), but the bulk of CPU stays off this
-    // core.
+    // Core 0's executor: net_task + heartbeat only. esp-radio's
+    // embassy-net Runner has a hard core-0 pin (esp-wifi-sys#412),
+    // so net_task can't migrate — but every other path moved to
+    // core 1 once the embassy-net fork made `&Stack` Sync. Removing
+    // the proxies also removed the per-blob `Vec<u8>` buffer in
+    // stream_blob, which was the prime OOM suspect on /state.
     let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
     executor.run(|spawner| {
         let net_token = crate::network::net_task(runner).expect("net_task pool");
         spawner.spawn(net_token);
-        let http_token =
-            crate::http_proxy::http_proxy_task(http_ref).expect("http_proxy_task pool");
-        spawner.spawn(http_token);
-        let wifi_token =
-            crate::wifi_proxy::wifi_proxy_task(wifi_ref).expect("wifi_proxy_task pool");
-        spawner.spawn(wifi_token);
+        // Periodic heartbeat: 5-second heap + chrome-state dumps so
+        // a stuck wake gets a continuous "where things are" trace on
+        // the serial monitor without needing a JTAG attach. Lives
+        // on core 0 alongside net_task so it can't itself be
+        // starved by application work.
+        let diag_token =
+            crate::diagnostics::heartbeat_task().expect("heartbeat_task pool");
+        spawner.spawn(diag_token);
     })
 }
 
 #[embassy_executor::task]
 async fn runtime_task(
-    wifi: &'static mut crate::wifi_proxy::WifiProxyClient,
-    http: &'static mut crate::http_proxy::HttpProxyClient,
+    wifi: &'static mut crate::wifi::FwWifi,
+    http: &'static mut crate::http::FwHttp,
     nvs: &'static mut FwNvs,
     sleeper: &'static mut FwSleeper,
     ota: &'static mut FwOta,
+    battery: &'static mut FwBatteryGauge,
     policy: paperanywhere_ports::PowerPolicy,
     identity: paperanywhere_ports::DeviceIdentity,
     ota_progress: &'static paperanywhere_runtime::OtaProgressChannel,
@@ -542,6 +577,7 @@ async fn runtime_task(
         nvs,
         sleeper,
         ota,
+        battery,
         policy,
         identity,
         ota_progress,

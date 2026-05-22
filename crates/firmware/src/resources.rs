@@ -13,10 +13,28 @@
 use esp_hal::Async;
 use esp_hal::gpio::{Input, Output};
 use esp_hal::interrupt::software::SoftwareInterrupt;
-use esp_hal::peripherals::{CPU_CTRL, FLASH, LPWR, RNG, TIMG0, WIFI};
+use esp_hal::peripherals::{ADC1, CPU_CTRL, FLASH, GPIO1, GPIO21, LPWR, RNG, TIMG0, WIFI};
 use esp_hal::spi::master::Spi;
 
 use crate::boards::BoardConfig;
+
+/// Hardware bundle for the battery gauge. Construction is board-
+/// specific (different boards drive different GPIOs / use different
+/// fuel-gauge chips), so this carries only the peripheral handles —
+/// the per-board module turns them into a real `BatteryGauge`.
+pub struct BatteryHardware {
+    /// SAR-ADC1 peripheral. On the reTerminal E1001 family the
+    /// battery-sense divider is wired to a GPIO that lives on ADC1.
+    pub adc1: ADC1<'static>,
+    /// GPIO1: voltage-divider output (battery_voltage / 2 in steady
+    /// state). Source the schematic net name from Seeed's ESPHome
+    /// board YAML — confirmed `gpio1` with `multiply: 2.0`.
+    pub batt_sense: GPIO1<'static>,
+    /// GPIO21: drives the high-side enable for the divider so we
+    /// only burn the divider current during a sample. Seeed's
+    /// `bsp_battery_enable` net. Active-high.
+    pub batt_enable: GPIO21<'static>,
+}
 
 /// Peripheral handles + GPIO line drivers the panel needs. `main.rs`
 /// constructs this per-board (cfg-gated pin selection); from here on
@@ -53,6 +71,9 @@ pub struct FirmwareResources {
 
     // ── Panel transport (board-specific pin map, built in main.rs) ──
     pub panel: PanelHardware,
+
+    // ── Battery readout (board-specific; None on USB-only carriers) ──
+    pub battery: Option<BatteryHardware>,
 
     // ── Second-core embassy executor (reserved) ──
     //

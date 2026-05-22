@@ -35,15 +35,16 @@ use embassy_sync::signal::Signal;
 use heapless::String as HString;
 use log::{error, info, warn};
 use paperanywhere_ports::{
-    AckPhase, DeviceAck, DeviceIdentity, DeviceStatus, FirmwareUpdater, HttpTransport, NvsStore,
-    OtaPhase, PowerPolicy, Sleeper, WifiLink,
+    AckPhase, BatteryGauge, DeviceAck, DeviceIdentity, DeviceStatus, FirmwareUpdater, HttpTransport,
+    NvsStore, OtaPhase, PowerPolicy, Sleeper, WifiLink,
 };
 use paperanywhere_ports::chrome::{self, Persist};
 
 pub mod paint;
 pub use paint::{
-    AdoptUrlStr, ClaimCodeStr, DeviceIdStr, IpStr, LastUpdateStr, PaintChannel, PaintCmd,
-    PaintHandle, SeqCmd, PAINT_CHANNEL_DEPTH, mark_processed, submit, submit_silent,
+    AdoptUrlStr, ClaimCodeStr, DeviceIdStr, IpStr, LastUpdateStr, OwnerEmailStr, PaintChannel,
+    PaintCmd, PaintHandle, ProjectNameStr, SeqCmd, PAINT_CHANNEL_DEPTH, mark_processed, submit,
+    submit_silent,
 };
 
 /// Cross-task channel for OTA progress events. The OTA install path
@@ -100,12 +101,13 @@ const MAX_BACKOFF_SEC: u32 = 30;
 /// `default_policy` is used when a `/state` call fails before the
 /// device has learned the server's preferred policy; subsequent wakes
 /// honour whatever the server most recently returned.
-pub async fn run<W, H, N, S, F>(
+pub async fn run<W, H, N, S, F, B>(
     wifi: &mut W,
     http: &mut H,
     nvs: &mut N,
     sleeper: &mut S,
     fw_updater: &mut F,
+    battery: &mut B,
     default_policy: PowerPolicy,
     // Hardware identity used by `POST /api/device/register` on the first
     // unclaimed boot. The MAC + panel_model_id let the backend create an
@@ -130,6 +132,7 @@ where
     N: NvsStore,
     S: Sleeper,
     F: FirmwareUpdater,
+    B: BatteryGauge,
 {
     // Accepted for forward compatibility; the actor consumes the OTA
     // signal directly. Keeping it on the signature so call sites in
@@ -161,6 +164,13 @@ where
     // and then leaves the actor alone until an image or the adoption
     // screen replaces it.
     let mut boot_screen_finalized: bool = false;
+    // Main-view placeholder is rendered once on the first wake where
+    // the device is adopted. Subsequent wakes skip the re-render via
+    // the actor's framebuffer-hash dedup, but we also gate at the
+    // runtime level so we don't queue a paint command that's about
+    // to be a no-op. Reset to false on unpair so the next adoption
+    // cycle does the visible boot -> main transition again.
+    let mut main_view_finalized: bool = false;
 
     loop {
         wake_counter = wake_counter.wrapping_add(1);
@@ -174,9 +184,11 @@ where
             nvs,
             sleeper,
             fw_updater,
+            battery,
             &identity,
             paint,
             &mut boot_screen_finalized,
+            &mut main_view_finalized,
         )
         .await
         {
@@ -251,15 +263,17 @@ where
 /// Single wake: associate, fetch state, maybe render, ack, disconnect.
 /// Returns `(seconds_to_sleep, policy_to_use)` so the outer loop knows
 /// when and how to sleep next.
-async fn single_wake_cycle<W, H, N, S, F>(
+async fn single_wake_cycle<W, H, N, S, F, B>(
     wifi: &mut W,
     http: &mut H,
     nvs: &mut N,
     sleeper: &mut S,
     fw_updater: &mut F,
+    battery: &mut B,
     identity: &DeviceIdentity,
     paint: &'static PaintChannel,
     boot_screen_finalized: &mut bool,
+    main_view_finalized: &mut bool,
 ) -> Result<(u32, PowerPolicy), WakeError>
 where
     W: WifiLink,
@@ -267,6 +281,7 @@ where
     N: NvsStore,
     S: Sleeper,
     F: FirmwareUpdater,
+    B: BatteryGauge,
 {
     let creds = nvs.load_wifi_creds().ok_or(WakeError::NoWifiCreds)?;
     paint::submit_silent(paint, PaintCmd::UpdateStatus(DeviceStatus::Connecting))
@@ -291,8 +306,18 @@ where
         return Err(WakeError::WifiAssociate);
     }
     info!("wake: wifi associated ok");
+    // One battery sample per wake. Published straight into chrome so
+    // the status bar's battery widget refreshes alongside the rssi
+    // sample the actor publishes via UpdateChrome below. Doing it
+    // once at the top of the wake cycle (rather than on every paint)
+    // keeps the divider's bleed current bounded.
+    let battery_sample = battery.sample().await;
+    if let Some(ref s) = battery_sample {
+        info!("wake: battery {}mv ({}%)", s.mv, s.percent);
+    }
+    chrome::set_battery(battery_sample);
     paint::submit_silent(paint, PaintCmd::UpdateChrome {
-            battery_mv: sleeper.battery_mv(),
+            battery_mv: battery_sample.map(|s| s.mv),
             rssi_dbm: wifi.rssi_dbm(),
         })
         .await;
@@ -406,8 +431,13 @@ where
     );
     let Some(token) = token_opt else {
         warn!(
-            "wake: no device token (unclaimed) Ã¢â‚¬â€ adoption screen on main region, skipping /state"
+            "wake: no device token (unclaimed) -- adoption screen on main region, skipping /state"
         );
+        // Re-arm the main-view gate. If a prior wake painted main and
+        // we lost the token (factory reset / unpair), the next adopted
+        // /state cycle should redo the visible boot -> main transition
+        // instead of silently skipping it.
+        *main_view_finalized = false;
         paint::submit_silent(
             paint,
             PaintCmd::UpdateStatus(DeviceStatus::WaitingForAdoption),
@@ -500,17 +530,61 @@ where
         return Ok((FAILURE_RETRY_SEC, PowerPolicy::AlwaysOn));
     };
 
-    // Claimed device: continue to /state. Subsequent wakes don't touch
-    // the boot screen Ã¢â‚¬â€ /state's image render is what next touches the
-    // main region. The boot screen isn't re-rendered on every poll
-    // because that would burn an e-ink refresh for no visible change.
-    paint::submit_silent(paint, PaintCmd::UpdateStatus(DeviceStatus::Ready)).await;
+    // Claimed device: transition out of the boot screen into the main
+    // view placeholder so the user sees a clean boot -> adopted hand-
+    // off BEFORE /state is in flight. Subsequent wakes (where the
+    // boot screen was already torn down) skip this re-render because
+    // the actor's framebuffer-hash dedup catches the identical
+    // placeholder bytes -- no wasted refresh.
+    if !*main_view_finalized {
+        paint::submit_silent(paint, PaintCmd::UpdateStatus(DeviceStatus::Ready)).await;
+        let main_handle = paint::submit(
+            paint,
+            build_show_main_cmd(ip_string.as_deref(), sleeper),
+        )
+        .await;
+        info!(
+            "wake: main placeholder paint queued (seq={}) -- awaiting refresh before /state",
+            main_handle.seq()
+        );
+        main_handle.await_processed().await;
+        info!("wake: main placeholder refresh complete -- proceeding to /state");
+        *main_view_finalized = true;
+    } else {
+        paint::submit_silent(paint, PaintCmd::UpdateStatus(DeviceStatus::Ready)).await;
+    }
 
     paint::submit_silent(paint, PaintCmd::UpdateStatus(DeviceStatus::DownloadingConfig))
         .await;
     let state = match http.get_state(&token).await {
         Ok(s) => s,
         Err(e) => {
+            // Backend rejected our token -- device was unpaired from
+            // the dashboard. Wipe NVS + drop back to adoption so the
+            // next wake re-registers and the user gets a fresh code.
+            if H::is_unauthorized_error(&e) {
+                warn!(
+                    "wake: /state returned Unauthorized -- device unpaired server-side, resetting to adoption"
+                );
+                nvs.clear_device_token();
+                nvs.clear_claim_code();
+                chrome::set_device_uuid_with(None, Persist::Flash);
+                chrome::set_device_name_with(None, Persist::Flash);
+                paint::submit_silent(
+                    paint,
+                    PaintCmd::UpdateStatus(DeviceStatus::WaitingForAdoption),
+                )
+                .await;
+                let retry_notice = adoption_retry_notice(ip_string.as_deref(), nvs);
+                let adoption_handle =
+                    paint_adoption_screen(paint, nvs, wifi, retry_notice).await;
+                adoption_handle.await_processed().await;
+                // Re-arm the main-view gate so the NEXT successful
+                // adoption -> /state cycle does the visible boot ->
+                // main transition again instead of silently dedup'ing.
+                *main_view_finalized = false;
+                return Ok((FAILURE_RETRY_SEC, PowerPolicy::AlwaysOn));
+            }
             error!("wake: get_state failed: {:?}", e);
             paint::submit_silent(paint, PaintCmd::UpdateStatus(DeviceStatus::Stalled)).await;
             return Err(WakeError::StateFetch);
@@ -532,6 +606,24 @@ where
     }
     if let Some(name) = state.name.as_deref() {
         chrome::set_device_name_with(Some(name), Persist::Flash);
+    }
+    // Owner identity Ã¢â‚¬â€ surfaced on the main-view placeholder. Not
+    // persisted to NVS (would require a migration + extra storage)
+    // since /state delivers fresh values on every poll. Idle screen
+    // shows "--" between cold boot and the first /state success.
+    chrome::set_owner_email(state.owner_email.as_deref());
+    chrome::set_project_name(state.project_name.as_deref());
+    // Re-issue ShowMain so the placeholder picks up the now-populated
+    // owner + project values. Actor's framebuffer-hash dedup skips
+    // the actual e-paper refresh when nothing changed (e.g. a wake
+    // that found the same owner/project and no image), so this is
+    // free in steady state.
+    if state.image.is_none() {
+        paint::submit_silent(
+            paint,
+            build_show_main_cmd(ip_string.as_deref(), sleeper),
+        )
+        .await;
     }
 
     // Firmware update offered? Today no device consumes the backend-
@@ -555,7 +647,7 @@ where
         // stream so the status bar reflects "just associated, currently
         // rendering image N" rather than stale values.
         paint::submit_silent(paint, PaintCmd::UpdateChrome {
-                battery_mv: sleeper.battery_mv(),
+                battery_mv: battery_sample.map(|s| s.mv),
                 rssi_dbm: wifi.rssi_dbm(),
             })
             .await;
@@ -576,7 +668,7 @@ where
             image_id: image.image_id.clone(),
             phase,
             error: render_result.as_ref().err().map(|e| format!("{:?}", e)),
-            battery_mv: sleeper.battery_mv(),
+            battery_mv: battery_sample.map(|s| s.mv),
             rssi_dbm: wifi.rssi_dbm(),
         };
         if let Err(e) = http.post_ack(&token, &ack).await {
@@ -805,4 +897,24 @@ fn to_hstring<const N: usize>(s: &str) -> HString<N> {
         .unwrap_or(0);
     let _ = h.push_str(&s[..safe_end]);
     h
+}
+
+/// Snapshot the values [`PaintCmd::ShowMain`] needs into a fresh
+/// command. Reads owner + project from chrome (populated by /state).
+/// Used both for the pre-/state initial paint (where owner/project
+/// land as None/None and render as "--") and the post-/state re-paint
+/// (where they're populated). Letting both call sites share one
+/// builder keeps the placeholder's view contract in one place.
+fn build_show_main_cmd<S: Sleeper>(ip: Option<&str>, sleeper: &S) -> PaintCmd {
+    let ip_str: IpStr = ip.map(to_hstring).unwrap_or_else(IpStr::new);
+    let last_update = format_local_now(sleeper);
+    let snap = chrome::snapshot();
+    let owner = snap.owner_email.as_deref().map(to_hstring);
+    let project = snap.project_name.as_deref().map(to_hstring);
+    PaintCmd::ShowMain {
+        ip: ip_str,
+        last_update,
+        owner_email: owner,
+        project_name: project,
+    }
 }

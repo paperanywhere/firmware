@@ -63,6 +63,7 @@ use alloc::vec::Vec;
 use paperanywhere_ports::{ColorMode, EpaperPanel, OtaPhase};
 
 pub mod adoption_screen;
+pub mod main_placeholder;
 pub mod ota_progress;
 pub mod halt_screen;
 pub mod icons;
@@ -358,6 +359,39 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
             ip,
             adopt_url,
             retry_notice,
+        );
+    }
+
+    fn render_main_placeholder(
+        &mut self,
+        ip: &str,
+        last_update: Option<&str>,
+        owner_email: Option<&str>,
+        project_name: Option<&str>,
+    ) {
+        // View transition — clear ghosting with a full refresh.
+        self.force_full_next_refresh = true;
+        for b in self.framebuffer.iter_mut() {
+            *b = 0xFF;
+        }
+        self.main_cursor =
+            main_region_offset(self.width_px, self.status_bar_height, self.color_mode);
+        let width_px = self.width_px;
+        let height_px = self.main_height_px();
+        let color_mode = self.color_mode;
+        let offset = main_region_offset(width_px, self.status_bar_height, color_mode);
+        let mut region = MainRegion {
+            bytes: &mut self.framebuffer[offset..],
+            width_px,
+            height_px,
+            color_mode,
+        };
+        crate::main_placeholder::draw_main_placeholder(
+            &mut region,
+            ip,
+            last_update,
+            owner_email,
+            project_name,
         );
     }
 

@@ -62,14 +62,4 @@ impl Sleeper for FwSleeper {
         // which is the right fallback.
         0
     }
-
-    fn battery_mv(&self) -> Option<u16> {
-        battery_mv()
-    }
-}
-
-/// Battery voltage in millivolts. Wired in a follow-up once the board's
-/// `battery_adc` channel is bound to an `esp_hal::analog::adc::Adc`.
-pub fn battery_mv() -> Option<u16> {
-    None
 }

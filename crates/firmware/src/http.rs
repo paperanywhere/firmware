@@ -129,6 +129,10 @@ fn parse_backend_url(url: &str) -> Option<(Scheme, String, u16)> {
 impl HttpTransport for FwHttp {
     type Error = HttpError;
 
+    fn is_unauthorized_error(err: &Self::Error) -> bool {
+        matches!(err, HttpError::BadStatus(401))
+    }
+
     async fn register(
         &mut self,
         identity: &DeviceIdentity,
@@ -217,11 +221,36 @@ async fn request_with_full_body(
     path: &str,
     response: &mut Vec<u8>,
 ) -> Result<(), HttpError> {
+    // Per-stage instrumentation (task #102). Each stage logs entry +
+    // duration so a serial-monitor capture of a slow / hung request
+    // localises the stall without needing a JTAG attach. Cheap —
+    // `Instant::now()` is a single read, the `info!` macros only fire
+    // at log level info+ (which is the firmware default in dev builds).
+    use embassy_time::Instant;
+    let t_enter = Instant::now();
+    log::info!("http: [{} {}] stage=enter", method, path);
+
     // DHCP runs in the background as soon as `wifi.associate` brings the
     // link up. The first /state call after a fresh wake hits this before
     // an IP is assigned; the call resolves immediately on subsequent ones.
     http.stack.wait_config_up().await;
+    log::info!(
+        "http: [{} {}] stage=config_up +{}ms",
+        method,
+        path,
+        (Instant::now() - t_enter).as_millis()
+    );
+
+    let t_resolve = Instant::now();
     let addr = resolve(http.stack, &http.host).await?;
+    log::info!(
+        "http: [{} {}] stage=resolved addr={:?} +{}ms",
+        method,
+        path,
+        addr,
+        (Instant::now() - t_resolve).as_millis()
+    );
+
     // Disjoint borrows — each &mut points at a different field of `http`.
     let FwHttp {
         stack,
@@ -233,16 +262,34 @@ async fn request_with_full_body(
         tls_read_buf,
         tls_write_buf,
     } = http;
+    let t_connect = Instant::now();
     let mut socket = TcpSocket::new(**stack, &mut tcp_rx_buf[..], &mut tcp_tx_buf[..]);
-    socket.connect((addr, *port)).await.map_err(|_| HttpError::SocketConnect)?;
+    socket
+        .connect((addr, *port))
+        .await
+        .map_err(|_| HttpError::SocketConnect)?;
+    log::info!(
+        "http: [{} {}] stage=tcp_connect +{}ms",
+        method,
+        path,
+        (Instant::now() - t_connect).as_millis()
+    );
 
     match scheme {
         Scheme::Http => {
             let mut adapted = Eio0607(socket);
+            let t_exch = Instant::now();
             http_exchange_full(
                 &mut adapted, host, method, path, token, content_type, body, response,
             )
             .await?;
+            log::info!(
+                "http: [{} {}] stage=exchange +{}ms (resp_bytes={})",
+                method,
+                path,
+                (Instant::now() - t_exch).as_millis(),
+                response.len()
+            );
             adapted.0.close();
         }
         Scheme::Https => {
@@ -251,14 +298,35 @@ async fn request_with_full_body(
                 &mut tls_read_buf[..],
                 &mut tls_write_buf[..],
             );
+            let t_tls = Instant::now();
             tls_handshake(&mut tls, host).await?;
+            log::info!(
+                "http: [{} {}] stage=tls_handshake +{}ms",
+                method,
+                path,
+                (Instant::now() - t_tls).as_millis()
+            );
+            let t_exch = Instant::now();
             http_exchange_full(
                 &mut tls, host, method, path, token, content_type, body, response,
             )
             .await?;
+            log::info!(
+                "http: [{} {}] stage=exchange +{}ms (resp_bytes={})",
+                method,
+                path,
+                (Instant::now() - t_exch).as_millis(),
+                response.len()
+            );
             // Drop closes both TLS and the underlying socket.
         }
     }
+    log::info!(
+        "http: [{} {}] stage=done total+{}ms",
+        method,
+        path,
+        (Instant::now() - t_enter).as_millis()
+    );
     Ok(())
 }
 

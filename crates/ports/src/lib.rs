@@ -60,6 +60,14 @@ pub struct DeviceState {
     /// recover it via /state alone. The runtime saves this to NVS on
     /// every successful poll.
     pub device_uuid: Option<String>,
+    /// Email of the user whose project this device is filed under.
+    /// `None` for unclaimed devices (still in the system-owned
+    /// pool). Surfaced on the main-view placeholder so the idle
+    /// screen says who the device belongs to.
+    pub owner_email: Option<String>,
+    /// Friendly name of the user's project the device sits in
+    /// (e.g. "Kitchen Displays"). `None` for unclaimed devices.
+    pub project_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +251,8 @@ pub fn parse_device_state(body: &str) -> Option<DeviceState> {
 
     let name = extract_str(body, "name");
     let device_uuid = extract_str(body, "device_uuid");
+    let owner_email = extract_str(body, "owner_email");
+    let project_name = extract_str(body, "project_name");
 
     Some(DeviceState {
         image,
@@ -251,6 +261,8 @@ pub fn parse_device_state(body: &str) -> Option<DeviceState> {
         firmware_update,
         name,
         device_uuid,
+        owner_email,
+        project_name,
     })
 }
 
@@ -531,6 +543,15 @@ pub trait HttpTransport {
         on_chunk: &mut (dyn FnMut(&[u8]) -> Result<(), ()> + Send),
     ) -> Result<(), Self::Error>;
     async fn post_ack(&mut self, token: &str, ack: &DeviceAck) -> Result<(), Self::Error>;
+    /// Did this error represent the backend rejecting our device
+    /// token? On `true` the runtime treats the device as unpaired,
+    /// wipes the token + claim code, and falls back to the adoption
+    /// flow. Default `false` so transports that don't carry HTTP
+    /// status codes (sim mock, etc.) don't accidentally unpair on a
+    /// transient error.
+    fn is_unauthorized_error(_err: &Self::Error) -> bool {
+        false
+    }
 }
 
 /// Persisted device state.
@@ -598,6 +619,15 @@ pub trait NvsStore {
     fn save_device_uuid(&mut self, _uuid: &str) {}
     /// Persist the friendly name returned by /state. Default no-op.
     fn save_device_name(&mut self, _name: &str) {}
+    /// Wipe the device token. Called by the runtime when the backend
+    /// returns 401/Unauthorized on a token-bearing call — the device
+    /// has been unpaired server-side and must re-register on the next
+    /// wake. Default no-op for impls without a token slot.
+    fn clear_device_token(&mut self) {}
+    /// Wipe the cached claim code. Paired with [`clear_device_token`]
+    /// on unpair so the next wake's adoption screen starts from a
+    /// clean "(requesting...)" placeholder while register is in flight.
+    fn clear_claim_code(&mut self) {}
 }
 
 /// Three-state WiFi link status as surfaced on the boot screen's
@@ -760,6 +790,22 @@ pub trait EpaperPanel {
     /// why; `code` is a stable short identifier the user can look up
     /// at `paperanywhere.io/errors/<code>`.
     fn render_halt_screen(&mut self, _headline: &str, _detail: &str, _code: &str) {}
+
+    /// Paint the "main view" placeholder shown when the device is
+    /// adopted but the backend hasn't pushed an image yet. Carries
+    /// the device's current IP, an optional last-update timestamp,
+    /// and the owning user + project so the idle screen advertises
+    /// who the device belongs to. `None` on either ownership field
+    /// renders "--" (unclaimed pool, or first wake before /state).
+    /// Default no-op for bare panels.
+    fn render_main_placeholder(
+        &mut self,
+        _ip: &str,
+        _last_update: Option<&str>,
+        _owner_email: Option<&str>,
+        _project_name: Option<&str>,
+    ) {
+    }
 
     /// Paint the OTA-progress view (live "Updating firmware..." screen
     /// with a progress bar + status line). Called by the runtime
@@ -953,6 +999,54 @@ impl OtaPhase {
     }
 }
 
+/// One battery sample: voltage + best available state-of-charge.
+///
+/// For boards with only a voltage divider, `percent` is the result of
+/// pushing `mv` through the shared LiPo curve below. For boards with
+/// a dedicated fuel-gauge IC (MAX17048-class) the chip's own SoC
+/// reading goes here instead — it's typically more accurate than a
+/// voltage-derived guess because the gauge does columb counting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatterySample {
+    pub mv: u16,
+    pub percent: u8,
+}
+
+/// Per-board battery readout. Implementations own whatever hardware
+/// they need to sample the pack (ADC + voltage divider on most
+/// boards; an I2C fuel gauge on others; nothing at all on a USB-
+/// powered carrier).
+///
+/// `sample` is async so impls can space a settling delay between
+/// enabling the divider and taking the reading without busy-spinning.
+/// Returns `None` on either a transient sample failure or "this board
+/// has no battery" — callers treat both the same.
+#[allow(async_fn_in_trait)]
+pub trait BatteryGauge {
+    async fn sample(&mut self) -> Option<BatterySample>;
+}
+
+/// Map a single-cell LiPo cell voltage in millivolts to an approximate
+/// state-of-charge percentage. Coarse linear curve between 3.30 V (0%)
+/// and 4.20 V (100%); good enough for a status-bar widget, not a
+/// substitute for a real fuel gauge.
+///
+/// Same curve as the now-private compositor helper — exposed here so
+/// per-board `BatteryGauge` impls can call it directly without taking
+/// a compositor dependency.
+pub fn lipo_percent_from_mv(mv: u16) -> u8 {
+    const EMPTY: u32 = 3_300;
+    const FULL: u32 = 4_200;
+    let mv = mv as u32;
+    if mv <= EMPTY {
+        return 0;
+    }
+    if mv >= FULL {
+        return 100;
+    }
+    (((mv - EMPTY) * 100) / (FULL - EMPTY)) as u8
+}
+
 pub trait Sleeper {
     /// Sleep `seconds` honoring `policy`. For [`PowerPolicy::ScheduledWake`]
     /// this is the chip's deep-sleep + RTC wake on real hardware; for
@@ -970,7 +1064,6 @@ pub trait Sleeper {
         policy: PowerPolicy,
     ) -> impl core::future::Future<Output = ()>;
     fn unix_now(&self) -> u64;
-    fn battery_mv(&self) -> Option<u16>;
 }
 
 // ── Content-hash helper ──

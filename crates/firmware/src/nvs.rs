@@ -292,6 +292,22 @@ impl NvsStore for FwNvs {
     fn save_device_name(&mut self, name: &str) {
         FwNvs::save_device_name(self, name);
     }
+
+    fn clear_device_token(&mut self) {
+        if self.cache.device_token.is_none() {
+            return;
+        }
+        self.cache.device_token = None;
+        self.persist();
+    }
+
+    fn clear_claim_code(&mut self) {
+        if self.cache.claim_code.is_none() {
+            return;
+        }
+        self.cache.claim_code = None;
+        self.persist();
+    }
 }
 
 // ── Public mutators used by provisioning ──────────────────────────────────────
