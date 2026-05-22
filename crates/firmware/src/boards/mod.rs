@@ -83,22 +83,52 @@ pub enum PackingKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerPolicy { ScheduledWake, AlwaysOn }
 
-/// Board-specific SD-card pin assignments. SCK + MOSI are
-/// intentionally not listed here — they're shared with the panel's
-/// SPI bus and live on the panel pin map. The `FwSd` driver borrows
-/// the panel's bus through a shared device wrapper.
+/// Board-specific SD-card binding — pins + behavioural quirks.
+/// The core SD driver (`crate::sd`) is generic over this struct so
+/// the in-firmware logic stays board-agnostic while every per-board
+/// detail (which GPIO holds the card-detect, whether power-enable
+/// is active-high, how many milliseconds the load switch needs to
+/// settle) lives in the board file. The pattern matches the rest
+/// of the per-board catalog and survives the future migration to
+/// the `paperanywhere-devices` submodule (task #69) without
+/// changing the driver.
+///
+/// SCK + MOSI are intentionally not listed here — they're shared
+/// with the panel's SPI bus and live on the panel pin map. The
+/// `FwSd` driver borrows the panel's bus through a shared device
+/// wrapper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SdPinMap {
+pub struct SdBoard {
+    // ── Pins ──
     /// SD's data-out line (MCU input). reTerminal E1001 = GPIO8.
     pub miso: u8,
-    /// SD chip select, active low. reTerminal E1001 = GPIO14.
+    /// SD chip select. reTerminal E1001 = GPIO14.
     pub cs: u8,
-    /// Card-detect input (active low — pulled low when a card is
-    /// inserted). reTerminal E1001 = GPIO15.
+    /// Card-detect input. reTerminal E1001 = GPIO15.
     pub detect: u8,
-    /// SD power-enable output (drives a TPS22916 load switch on the
-    /// E-series). Active high. reTerminal E1001 = GPIO16.
+    /// SD power-enable output. reTerminal E1001 = GPIO16, drives
+    /// a TPS22916 load switch.
     pub power_enable: u8,
+
+    // ── Quirks ──
+    /// `true` if the card-detect line reads LOW when a card is
+    /// inserted (most common; reTerminal = true). `false` for
+    /// boards that wire detect inverted.
+    pub detect_active_low: bool,
+    /// `true` if the power-enable line must go HIGH to supply the
+    /// card (TPS22916-style; reTerminal = true). `false` for
+    /// active-low PMOS load switches.
+    pub power_enable_active_high: bool,
+    /// Settle time after asserting power-enable before the first
+    /// SPI command. TPS22916 rise time on the E-series is ~1 ms;
+    /// 10 ms gives a comfortable margin across power-rail
+    /// tolerances and avoids racy "card not responding" failures.
+    pub power_up_delay_ms: u32,
+    /// Max number of CMD0/ACMD41 init retries before declaring the
+    /// card dead. embedded-sdmmc's default is conservative; some
+    /// E-series carriers tolerate fewer because the power supply
+    /// is tighter.
+    pub init_retry_count: u8,
 }
 
 /// Capabilities + pin map for a specific physical device. Constructed once at
@@ -135,11 +165,10 @@ pub struct BoardConfig {
     pub panel_sclk: u8,
     pub panel_mosi: u8,
     pub battery_adc: Option<u8>,
-    /// SD card SPI pin map. `None` on boards without an SD slot
-    /// wired to the MCU. On the reTerminal E-series the SD shares
-    /// SCK + MOSI with the panel (same SPI2 bus, different CS) and
-    /// adds its own MISO + CS + card-detect + power-enable lines.
-    pub sd: Option<SdPinMap>,
+    /// SD card binding (pins + per-board behavioural quirks).
+    /// `None` on boards without an SD slot. On the reTerminal
+    /// E-series the SD shares SCK + MOSI with the panel.
+    pub sd: Option<SdBoard>,
     /// Whether the panel's data plane is natively `0 = white, 1 = black`
     /// (opposite of the renderer-friendly convention). True for most Good
     /// Display 7.5" V2 BW modules including the one in reTerminal E1001;

@@ -36,11 +36,19 @@ pub const CONFIG: BoardConfig = BoardConfig {
     // (202004307_reTerminal_E1001_V1.0_SCH_250805.pdf). The SD slot
     // sits on SPI2 alongside the panel; SCK + MOSI are shared, and
     // CS / DET / EN / MISO are SD-only.
-    sd: Some(super::SdPinMap {
+    sd: Some(super::SdBoard {
         miso: 8,
         cs: 14,
         detect: 15,
         power_enable: 16,
+        // TPS22916 + standard microSD socket: detect grounded
+        // through the card body (active low), power gated high-
+        // side (active high enable). ~1 ms rise time on the load
+        // switch; 10 ms gives margin.
+        detect_active_low: true,
+        power_enable_active_high: true,
+        power_up_delay_ms: 10,
+        init_retry_count: 8,
     }),
     // Good Display GDEW075T7 (the panel module Seeed integrates here)
     // wants `0 = white, 1 = black` on its DTM2 plane. Verified by flashing

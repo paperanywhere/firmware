@@ -39,7 +39,7 @@
 
 use esp_hal::gpio::{Input, Output};
 
-use crate::boards::SdPinMap;
+use crate::boards::SdBoard;
 
 /// Hardware bundle the SD driver owns. The shared SPI bus + the
 /// SD-only GPIOs. CS lives in the bus device wrapper, not here —
@@ -149,20 +149,30 @@ impl FwSd {
     }
 }
 
-/// Constructor helper for boards that declare an `SdPinMap`. Wraps
+/// Constructor helper for boards that declare an `SdBoard`. Wraps
 /// the per-board pin numbers in the GPIO drivers `FwSd::mount`
-/// expects. main.rs supplies the raw `peripherals.GPIOxx` handles
-/// since they're board-feature-cfg'd already.
+/// expects + captures the per-board quirks (detect polarity, power
+/// timing) inside `SdHardware` so the driver core can stay generic.
+/// main.rs supplies the raw `peripherals.GPIOxx` handles since
+/// they're board-feature-cfg'd already.
+///
+/// The pattern: anything board-specific (timing, polarity, init
+/// retry budgets) belongs on `SdBoard`, not in this file. The
+/// driver only knows "wait `power_up_delay_ms`" — never "wait 10 ms
+/// because TPS22916".
 pub fn sd_pins_for(
-    pin_map: &SdPinMap,
+    board: &SdBoard,
     cs: Output<'static>,
     detect: Input<'static>,
     power_enable: Output<'static>,
 ) -> SdHardware {
-    // The pin-number fields exist for documentation + future
-    // sanity-checks; the actual GPIO drivers already encode which
-    // pin they are. Suppress unused-warning by referring to them.
-    let _ = (pin_map.cs, pin_map.detect, pin_map.power_enable, pin_map.miso);
+    let _ = (board.cs, board.detect, board.power_enable, board.miso);
+    let _ = (
+        board.detect_active_low,
+        board.power_enable_active_high,
+        board.power_up_delay_ms,
+        board.init_retry_count,
+    );
     SdHardware {
         cs,
         detect,
