@@ -192,6 +192,12 @@ pub mod diag {
     /// in — this is smoltcp's own user-timeout (default disabled in
     /// embassy-net 0.7, but bounded for our own pre-flight checks).
     pub static TCP_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+
+    /// Number of gratuitous ARP announces actually dispatched to the
+    /// device's TX path. Incremented only on successful dispatch —
+    /// if the radio back-pressured and we re-queued, this stays put.
+    /// Paperanywhere fork.
+    pub static GRATUITOUS_ARPS_SENT: AtomicU32 = AtomicU32::new(0);
 }
 
 #[cfg(all(

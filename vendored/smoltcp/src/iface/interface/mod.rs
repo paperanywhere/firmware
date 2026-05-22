@@ -145,6 +145,13 @@ pub struct InterfaceInner {
     routes: Routes,
     #[cfg(feature = "multicast")]
     multicast: multicast::State,
+    /// IPv4 address we should send a gratuitous ARP announce for on
+    /// the next egress poll. Paperanywhere fork addition: smoltcp
+    /// doesn't announce on its own after DHCP, which makes some APs
+    /// (notably UniFi with Proxy ARP off) never learn our MAC↔IP
+    /// binding. Linux/lwIP/ESP-IDF all do this by default.
+    #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+    pending_gratuitous_arp_v4: Option<Ipv4Address>,
 }
 
 /// Configuration structure used for creating a network interface.
@@ -263,8 +270,21 @@ impl Interface {
                 #[cfg(feature = "proto-sixlowpan")]
                 sixlowpan_address_context: Vec::new(),
                 rand,
+                #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+                pending_gratuitous_arp_v4: None,
             },
         }
+    }
+
+    /// Queue a gratuitous ARP announce for `addr` on the next egress
+    /// poll. Paperanywhere fork addition — call this after a fresh
+    /// DHCP lease binds so the AP / other LAN clients update their
+    /// neighbor caches with our MAC↔IP binding. Without this, some
+    /// APs (UniFi with Proxy ARP off) never learn the binding and
+    /// drop unicast traffic to us.
+    #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+    pub fn announce_address_v4(&mut self, addr: Ipv4Address) {
+        self.inner.pending_gratuitous_arp_v4 = Some(addr);
     }
 
     /// Get the socket context.
@@ -514,7 +534,72 @@ impl Interface {
         #[cfg(feature = "multicast")]
         self.multicast_egress(device);
 
+        // Paperanywhere fork: opportunistic gratuitous ARP. If the
+        // user (via Interface::announce_address_v4) queued an
+        // announce, emit it now before the socket egress phase.
+        #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+        self.emit_pending_gratuitous_arp(device);
+
         self.socket_egress(device, sockets)
+    }
+
+    /// Emit any queued gratuitous-ARP announce. Best-effort: if the
+    /// device has no TX token available right now we just leave the
+    /// pending address in place and try again next poll. Paperanywhere
+    /// fork only.
+    #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+    fn emit_pending_gratuitous_arp(&mut self, device: &mut (impl Device + ?Sized)) {
+        let addr = match self.inner.pending_gratuitous_arp_v4.take() {
+            Some(a) => a,
+            None => return,
+        };
+        if !matches!(self.inner.caps.medium, Medium::Ethernet) {
+            return;
+        }
+        let src_hw = match self.inner.hardware_addr {
+            HardwareAddress::Ethernet(eth) => eth,
+            #[allow(unreachable_patterns)]
+            _ => return,
+        };
+        let tx_token = match device.transmit(self.inner.now) {
+            Some(t) => t,
+            None => {
+                // Driver back-pressured — re-queue and try later.
+                self.inner.pending_gratuitous_arp_v4 = Some(addr);
+                return;
+            }
+        };
+        // Gratuitous = ARP REPLY with sender_proto == target_proto +
+        // broadcast target MAC. Some stacks send ARP REQUEST with
+        // sender_proto == target_proto instead; both work. We pick
+        // REPLY because it's the form RFC 5227 (IPv4 ACD) defines for
+        // announce. Linux's `arping -A` and lwIP's etharp_gratuitous
+        // both emit REPLY.
+        let arp_repr = ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Reply,
+            source_hardware_addr: src_hw,
+            source_protocol_addr: addr,
+            target_hardware_addr: EthernetAddress::BROADCAST,
+            target_protocol_addr: addr,
+        };
+        let result = self.inner.dispatch_ethernet(
+            tx_token,
+            arp_repr.buffer_len(),
+            |mut frame| {
+                frame.set_dst_addr(EthernetAddress::BROADCAST);
+                frame.set_ethertype(EthernetProtocol::Arp);
+                arp_repr.emit(&mut ArpPacket::new_unchecked(frame.payload_mut()));
+            },
+        );
+        match result {
+            Ok(()) => {
+                crate::diag::GRATUITOUS_ARPS_SENT
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => {
+                net_debug!("gratuitous ARP dispatch failed: {:?}", e);
+            }
+        }
     }
 
     /// Process one incoming packet queued in the device.

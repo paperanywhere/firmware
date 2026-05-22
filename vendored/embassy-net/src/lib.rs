@@ -880,6 +880,18 @@ impl Inner {
         // Apply addresses
         self.iface.update_ip_addrs(|a| *a = addrs);
 
+        // Paperanywhere fork: queue a gratuitous ARP announce for the
+        // freshly-bound IPv4 address so AP bridge tables + other LAN
+        // clients learn our MAC↔IP binding. Linux / lwIP / ESP-IDF do
+        // this automatically; upstream smoltcp/embassy-net don't,
+        // which is exactly the root cause of the UniFi unicast-
+        // blackhole bug we hit. The smoltcp fork emits this on the
+        // next egress poll.
+        #[cfg(feature = "proto-ipv4")]
+        if let Some(config) = &self.static_v4 {
+            self.iface.announce_address_v4(config.address.address());
+        }
+
         // Apply gateways
         #[cfg(feature = "proto-ipv4")]
         if let Some(gateway) = gateway_v4 {
@@ -1066,7 +1078,7 @@ pub mod diag {
     // ── Re-exports from the vendored smoltcp fork ─────────────
     // Saves firmware the trouble of adding a direct smoltcp dep just
     // to read TCP-layer counters.
-    pub use smoltcp::diag::{TCP_RETRANSMITS, TCP_TIMEOUTS};
+    pub use smoltcp::diag::{GRATUITOUS_ARPS_SENT, TCP_RETRANSMITS, TCP_TIMEOUTS};
 
     pub const TX_SLOTS: usize = 30;
     pub const RX_SLOTS: usize = 12;
