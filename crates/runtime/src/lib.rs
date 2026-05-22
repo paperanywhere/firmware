@@ -83,6 +83,13 @@ pub enum WakeError {
 /// Minimum time between polls when a wake fails before its
 /// `next_check_at` arrives. Keeps a misbehaving server from causing a
 /// device to spin.
+///
+/// Note: a faster cadence here for the pre-adoption state was tried
+/// and reverted — under the UniFi-blackhole conditions we've seen,
+/// rapid wake cycles caused the radio to refuse far more TX
+/// (NET_TX_NONE went from ~50 to ~10500 within a 3-min window)
+/// because of WPA handshake churn. 60 s gives the AP / radio time to
+/// settle between attempts.
 const FAILURE_RETRY_SEC: u32 = 60;
 
 /// Halt threshold Ã¢â‚¬â€ number of consecutive `single_wake_cycle` failures
