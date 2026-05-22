@@ -72,6 +72,15 @@ critical-section = "1"
 # that the old `esp-wifi` 0.15 required. That fixes the resolver.
 esp-hal = { version = "1.1", features = ["esp32s3", "unstable"] }
 esp-radio = { version = "0.18", features = ["esp32s3", "wifi"] }
+# Direct dep on the esp-wifi-sys FFI surface so we can call
+# `esp_wifi_set_mac` to rotate the station MAC. Used for the
+# "freshen UniFi STA-table state" workaround — UniFi APs keep
+# per-MAC bridge / threat-detection state that survives our
+# disconnect/reconnect attempts; a new MAC reads as a brand-new
+# client and bypasses that state. Pinned to match the version
+# esp-radio 0.18 pulls in transitively (otherwise there are two
+# copies of the same sys crate in the build graph).
+esp-wifi-sys-esp32s3 = "0.2"
 # `esp-radio` feature gates the module inside esp-rtos that registers the
 # `esp_rtos_*` scheduler/queue/semaphore/timer ABI symbols esp-radio's wifi
 # driver expects. Without it, link fails with "undefined reference to

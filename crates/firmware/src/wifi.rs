@@ -163,6 +163,59 @@ impl FwWifi {
         }
     }
 
+    /// Override the station MAC with a randomized one (Espressif OUI
+    /// preserved, lower 3 bytes from the HW TRNG). Logs the new MAC
+    /// + readback for verification. Call between `esp_radio::wifi::new`
+    /// and the first `set_config` — that's the window ESP-IDF allows
+    /// `esp_wifi_set_mac` in. Returns silently on any failure (we
+    /// fall back to the eFuse MAC).
+    ///
+    /// SAFETY: calls into the esp-wifi-sys FFI which is unsafe by
+    /// nature. The MAC buffer is on the stack and outlives the call.
+    /// The set_mode → set_mac → get_mac sequence matches the ESP-IDF
+    /// API contract.
+    fn rotate_station_mac() {
+        let mut new_mac = [0u8; 6];
+        new_mac[0] = 0x44;
+        new_mac[1] = 0x1b;
+        new_mac[2] = 0xf6;
+        let mut rng = esp_hal::rng::Rng::new();
+        let r = rand_core::RngCore::next_u32(&mut rng);
+        new_mac[3] = (r >> 16) as u8;
+        new_mac[4] = (r >> 8) as u8;
+        new_mac[5] = r as u8;
+        log::info!(
+            "wifi: rotating station MAC to {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (was eFuse default)",
+            new_mac[0], new_mac[1], new_mac[2], new_mac[3], new_mac[4], new_mac[5]
+        );
+        unsafe {
+            let _ = esp_wifi_sys_esp32s3::include::esp_wifi_set_mode(
+                esp_wifi_sys_esp32s3::include::wifi_mode_t_WIFI_MODE_STA,
+            );
+            let rc = esp_wifi_sys_esp32s3::include::esp_wifi_set_mac(
+                esp_wifi_sys_esp32s3::include::wifi_interface_t_WIFI_IF_STA,
+                new_mac.as_ptr(),
+            );
+            if rc != esp_wifi_sys_esp32s3::include::ESP_OK as i32 {
+                log::warn!(
+                    "wifi: esp_wifi_set_mac returned err {} — using eFuse MAC",
+                    rc
+                );
+            } else {
+                let mut readback = [0u8; 6];
+                let rc2 = esp_wifi_sys_esp32s3::include::esp_wifi_get_mac(
+                    esp_wifi_sys_esp32s3::include::wifi_interface_t_WIFI_IF_STA,
+                    readback.as_mut_ptr(),
+                );
+                log::info!(
+                    "wifi: esp_wifi_get_mac readback rc={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    rc2, readback[0], readback[1], readback[2],
+                    readback[3], readback[4], readback[5],
+                );
+            }
+        }
+    }
+
     /// Forcibly tear down the current association and re-join the same
     /// SSID. Used by the HTTP retry-on-blackhole path: when the AP is
     /// silently dropping our unicast frames post-DHCP (UniFi bridge-
@@ -244,6 +297,24 @@ impl FwWifi {
         let (controller, interfaces) =
             esp_radio::wifi::new(wifi, ControllerConfig::default())
                 .map_err(|_| WifiError::ConnectFailed)?;
+
+        // ── MAC rotation (task #127, OFF by default) ──────────────
+        // The plumbing is in place: rotate_station_mac() calls
+        // esp_wifi_set_mac via the FFI and verifies via get_mac.
+        // BUT — empirically validated on the Foxpaws Network UniFi:
+        // rotated MACs cannot get a DHCP lease (UniFi has per-MAC
+        // allow-listing / DHCP fingerprinting that only honours
+        // specific known MACs). The original eFuse MAC was on the
+        // allow-list; randomized ones are silently dropped at DHCP
+        // DISCOVER. Useful elsewhere; not on this network.
+        //
+        // Toggle this at the call site (e.g. via a future provtool
+        // flag or NVS bit) when the deployment is known to live on
+        // a network that auto-trusts any MAC.
+        const ROTATE_MAC: bool = false;
+        if ROTATE_MAC {
+            Self::rotate_station_mac();
+        }
 
         // NOTE on WiFi power-save: esp-radio 0.18 defaults to
         // PowerSaveMode::None (no modem sleep), which is what we want

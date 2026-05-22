@@ -246,6 +246,18 @@ impl FwNvs {
         self.persist();
     }
 
+    /// Drop any cached DHCP lease. Used by the MAC-rotation path to
+    /// force a fresh DHCP DISCOVER under the new MAC instead of
+    /// re-using a lease that the gateway's ARP table has bound to
+    /// the previous MAC.
+    pub fn clear_wifi_lease(&mut self) {
+        if self.cache.wifi_lease.is_none() {
+            return;
+        }
+        self.cache.wifi_lease = None;
+        self.persist();
+    }
+
     /// Look up a cached lease for `ssid`. Returns `None` if no lease is
     /// stored or the cached lease was for a different SSID.
     pub fn load_wifi_lease(&self, ssid: &str) -> Option<CachedLease> {
