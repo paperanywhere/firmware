@@ -15,3 +15,11 @@ heapless.workspace = true
 # both on the firmware (cross-core safe via critical-section's esp-hal
 # impl) and the sim (no-op CS on host).
 embassy-sync = "0.7"
+# Cardstock playlist schema. Carried by `DeviceState.playlist` so the
+# runtime can hand it to the panel actor. Deserialised via serde_json
+# below.
+cardstock = { workspace = true }
+# Full serde_json — no_std with alloc — to deserialise the playlist
+# field of the /state response. The hand-rolled extract_str path is
+# fine for flat fields but the nested Card variants need real serde.
+serde_json = { version = "1", default-features = false, features = ["alloc"] }

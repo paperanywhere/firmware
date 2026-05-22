@@ -613,17 +613,51 @@ where
     // shows "--" between cold boot and the first /state success.
     chrome::set_owner_email(state.owner_email.as_deref());
     chrome::set_project_name(state.project_name.as_deref());
-    // Re-issue ShowMain so the placeholder picks up the now-populated
-    // owner + project values. Actor's framebuffer-hash dedup skips
-    // the actual e-paper refresh when nothing changed (e.g. a wake
-    // that found the same owner/project and no image), so this is
-    // free in steady state.
+
+    // Choose the "ready" view for this wake:
+    //   * Image pending (from the device queue)  -> handled below
+    //   * Non-empty playlist                     -> ShowPlaylistPage
+    //   * Otherwise                              -> ShowMain fallback
+    // The user authored the playlist; we paint exactly one page per
+    // wake here. Page selection cycles across wakes (see
+    // PLAYLIST_PAGE_INDEX). When the AdvancePolicy on the painted
+    // page is `After { seconds }` the outer loop overrides the
+    // backend-supplied next_check_at so the next wake lands at the
+    // dwell deadline.
+    let mut playlist_advance_override: Option<u32> = None;
     if state.image.is_none() {
-        paint::submit_silent(
-            paint,
-            build_show_main_cmd(ip_string.as_deref(), sleeper),
-        )
-        .await;
+        match state.playlist.as_ref() {
+            Some(playlist) if !playlist.pages.is_empty() => {
+                let total = playlist.pages.len();
+                let idx = next_playlist_page_index(total);
+                let page = playlist.pages[idx].clone();
+                if let cardstock::AdvancePolicy::After { seconds } = page.advance {
+                    playlist_advance_override = Some(seconds.max(1));
+                }
+                info!(
+                    "wake: playlist page {}/{} (id={}, advance={:?})",
+                    idx + 1,
+                    total,
+                    page.id,
+                    page.advance
+                );
+                paint::submit_silent(paint, PaintCmd::ShowPlaylistPage {
+                    page,
+                    index: idx as u16,
+                    total: total as u16,
+                })
+                .await;
+            }
+            _ => {
+                // Empty / absent playlist -> fall back to the main
+                // placeholder so the panel still reflects identity.
+                paint::submit_silent(
+                    paint,
+                    build_show_main_cmd(ip_string.as_deref(), sleeper),
+                )
+                .await;
+            }
+        }
     }
 
     // Firmware update offered? Today no device consumes the backend-
@@ -687,6 +721,15 @@ where
         .saturating_sub(now)
         .min(u32::MAX as u64) as u32;
     let sleep_for = sleep_for.max(FAILURE_RETRY_SEC);
+    // Playlist override: if the current page uses
+    // `AdvancePolicy::After { seconds }`, wake again at the dwell
+    // deadline (clamped against the backend's next_check_at so we
+    // never wait LONGER than the server expected). Sticky / Manual
+    // pages don't override -- they re-poll on the normal cadence.
+    let sleep_for = match playlist_advance_override {
+        Some(dwell) => dwell.min(sleep_for),
+        None => sleep_for,
+    };
 
     // Return the backend's policy unmodified Ã¢â‚¬â€ the outer loop applies
     // the bringup-gate ("don't sleep until both boot screen + adoption
@@ -897,6 +940,19 @@ fn to_hstring<const N: usize>(s: &str) -> HString<N> {
         .unwrap_or(0);
     let _ = h.push_str(&s[..safe_end]);
     h
+}
+
+/// Monotonic playlist page cursor. The runtime advances this on
+/// every wake that paints a playlist page. Index wraps modulo the
+/// playlist length at read time, so a playlist that shrinks (e.g.
+/// user deleted a page) doesn't strand us pointing past the end.
+static PLAYLIST_PAGE_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+fn next_playlist_page_index(total: usize) -> usize {
+    let raw = PLAYLIST_PAGE_INDEX
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    raw % total.max(1)
 }
 
 /// Snapshot the values [`PaintCmd::ShowMain`] needs into a fresh

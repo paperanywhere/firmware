@@ -68,6 +68,11 @@ pub struct DeviceState {
     /// Friendly name of the user's project the device sits in
     /// (e.g. "Kitchen Displays"). `None` for unclaimed devices.
     pub project_name: Option<String>,
+    /// Cardstock playlist for the device's "ready" view. `None`
+    /// when no playlist has been authored yet (or for unclaimed
+    /// devices); firmware falls back to the built-in main
+    /// placeholder.
+    pub playlist: Option<cardstock::Playlist>,
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +258,7 @@ pub fn parse_device_state(body: &str) -> Option<DeviceState> {
     let device_uuid = extract_str(body, "device_uuid");
     let owner_email = extract_str(body, "owner_email");
     let project_name = extract_str(body, "project_name");
+    let playlist = parse_playlist(body);
 
     Some(DeviceState {
         image,
@@ -263,7 +269,62 @@ pub fn parse_device_state(body: &str) -> Option<DeviceState> {
         device_uuid,
         owner_email,
         project_name,
+        playlist,
     })
+}
+
+/// Pull the optional `playlist` object out of the /state JSON body
+/// and run it through serde_json. The hand-rolled extractors above
+/// can't handle the nested `Card` variants (each is a tagged enum
+/// with per-variant fields), so we delegate this single field to
+/// real serde. A malformed playlist is treated as "no playlist" —
+/// the device falls back to the main placeholder rather than
+/// erroring the wake cycle.
+fn parse_playlist(body: &str) -> Option<cardstock::Playlist> {
+    // Locate the `"playlist":` key. Slice from the opening `{`
+    // through its matching `}`, then hand that substring to
+    // serde_json::from_str. We track nesting depth across `{` and
+    // `}` so embedded objects in the card tree don't terminate the
+    // slice early. String contents are skipped via a tiny escape-
+    // aware scanner so a `}` inside a value never closes the outer
+    // object.
+    let key = "\"playlist\"";
+    let key_at = body.find(key)?;
+    let after_key = &body[key_at + key.len()..];
+    let open_rel = after_key.find('{')?;
+    let bytes = after_key.as_bytes();
+    let start = open_rel;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut end = None;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
+    let slice = &after_key[start..end];
+    serde_json::from_str::<cardstock::Playlist>(slice).ok()
 }
 
 fn parse_firmware_update(body: &str) -> Option<FirmwareUpdate> {
@@ -804,6 +865,19 @@ pub trait EpaperPanel {
         _last_update: Option<&str>,
         _owner_email: Option<&str>,
         _project_name: Option<&str>,
+    ) {
+    }
+
+    /// Paint a cardstock playlist page into the main region. Walks
+    /// the card tree, dispatches each system-widget variant to its
+    /// renderer (which reads the value from chrome at paint time).
+    /// `index` + `total` are surfaced as a position indicator. The
+    /// default is a no-op for bare panels.
+    fn render_playlist_page(
+        &mut self,
+        _page: &cardstock::Page,
+        _index: u16,
+        _total: u16,
     ) {
     }
 

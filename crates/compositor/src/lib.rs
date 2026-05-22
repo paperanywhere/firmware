@@ -67,6 +67,7 @@ pub mod main_placeholder;
 pub mod ota_progress;
 pub mod halt_screen;
 pub mod icons;
+pub mod playlist_page;
 pub mod status_bar;
 
 // StatusInputs is gone — state lives in paperanywhere_ports::chrome.
@@ -393,6 +394,33 @@ impl<P: EpaperPanel> EpaperPanel for Compositor<P> {
             owner_email,
             project_name,
         );
+    }
+
+    fn render_playlist_page(
+        &mut self,
+        page: &cardstock::Page,
+        index: u16,
+        total: u16,
+    ) {
+        // View transition — full LUT so any prior placeholder /
+        // image / page is fully cleared before this one paints.
+        self.force_full_next_refresh = true;
+        for b in self.framebuffer.iter_mut() {
+            *b = 0xFF;
+        }
+        self.main_cursor =
+            main_region_offset(self.width_px, self.status_bar_height, self.color_mode);
+        let width_px = self.width_px;
+        let height_px = self.main_height_px();
+        let color_mode = self.color_mode;
+        let offset = main_region_offset(width_px, self.status_bar_height, color_mode);
+        let mut region = MainRegion {
+            bytes: &mut self.framebuffer[offset..],
+            width_px,
+            height_px,
+            color_mode,
+        };
+        crate::playlist_page::draw_playlist_page(&mut region, page, index, total);
     }
 
     fn render_ota_progress(&mut self, phase: OtaPhase) {

@@ -242,6 +242,17 @@ pub enum PaintCmd {
         project_name: Option<ProjectNameStr>,
     },
 
+    /// Render one page from a `cardstock::Playlist`. The card tree
+    /// is owned + cloned into the command so the actor never reaches
+    /// back into shared state during paint. Page index + total are
+    /// included so the renderer can show "1/3" position pips along
+    /// the bottom edge.
+    ShowPlaylistPage {
+        page: cardstock::Page,
+        index: u16,
+        total: u16,
+    },
+
     /// Terminal halt-screen view. Carries the headline + detail +
     /// stable error code. After processing this command the actor
     /// stays on this view forever (no further refreshes).

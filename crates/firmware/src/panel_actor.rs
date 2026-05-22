@@ -106,6 +106,7 @@ pub async fn panel_actor_task(
         Boot,
         Adoption,
         Main,
+        PlaylistPage,
         Image,
         Halt,
         // OTA progress is handled separately (the OTA latch above)
@@ -197,6 +198,7 @@ pub async fn panel_actor_task(
             PaintCmd::RedrawBootScreen => current_view = CurrentView::Boot,
             PaintCmd::ShowAdoption { .. } => current_view = CurrentView::Adoption,
             PaintCmd::ShowMain { .. } => current_view = CurrentView::Main,
+            PaintCmd::ShowPlaylistPage { .. } => current_view = CurrentView::PlaylistPage,
             PaintCmd::ShowHalt { .. } => current_view = CurrentView::Halt,
             PaintCmd::ShowImage { .. } => current_view = CurrentView::Image,
             PaintCmd::ChromeChanged(kind) => {
@@ -332,6 +334,10 @@ async fn handle_cmd(
             );
             commit_view(panel, last_painted_hash, "main").await;
         }
+        PaintCmd::ShowPlaylistPage { page, index, total } => {
+            panel.render_playlist_page(&page, index, total);
+            commit_view(panel, last_painted_hash, "playlist-page").await;
+        }
         PaintCmd::ShowHalt { headline, detail, code } => {
             panel.render_halt_screen(headline, detail, code);
             commit_view(panel, last_painted_hash, "halt").await;
@@ -396,6 +402,7 @@ fn cmd_name(cmd: &PaintCmd) -> &'static str {
         PaintCmd::RedrawBootScreen => "RedrawBootScreen",
         PaintCmd::ShowAdoption { .. } => "ShowAdoption",
         PaintCmd::ShowMain { .. } => "ShowMain",
+        PaintCmd::ShowPlaylistPage { .. } => "ShowPlaylistPage",
         PaintCmd::ShowHalt { .. } => "ShowHalt",
         PaintCmd::ShowImage { .. } => "ShowImage",
         PaintCmd::UpdateChrome { .. } => "UpdateChrome",

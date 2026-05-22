@@ -10,6 +10,7 @@ description = "Device-runtime polling loop shared between paperanywhere firmware
 # host hooks up (`esp-println` on firmware, `env_logger` on sim).
 [dependencies]
 paperanywhere-ports.workspace = true
+cardstock.workspace = true
 log.workspace = true
 # Used for polling `WifiLink::local_ip()` after associate with a small
 # back-off. `generic-queue-8` matches the firmware crate's feature so
