@@ -91,3 +91,8 @@ strip = "none"
 # alongside the runtime and delete the proxies.
 [patch.crates-io]
 embassy-net = { path = "vendored/embassy-net" }
+# Vendored to expose `Interface::neighbor_cache_snapshot` for diag (task #120).
+# Upstream's NeighborCache is fully private; we add a single read-only
+# snapshot accessor so firmware can answer "is ARP resolving?" without
+# packet-capture tooling. See vendored/smoltcp/CHANGELOG-paperanywhere.md.
+smoltcp = { path = "vendored/smoltcp" }

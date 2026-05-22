@@ -430,6 +430,22 @@ async fn request_with_full_body(
                 rx_count,
                 socket.state()
             );
+            // Dump the smoltcp neighbor (ARP) cache. If the destination
+            // IP is missing here, smoltcp never had a hardware address
+            // to send to — the SYN went out to a broadcast MAC or
+            // never went out at all. Vendored-smoltcp patch from task
+            // #120.
+            let neighbors = stack.snapshot_neighbors(16);
+            if neighbors.is_empty() {
+                log::warn!("http: neighbor cache is EMPTY (no ARP entries resolved)");
+            } else {
+                for entry in neighbors.iter() {
+                    log::info!(
+                        "neighbor: {:?} -> {:?} (expires_at={:?})",
+                        entry.addr, entry.hw, entry.expires_at
+                    );
+                }
+            }
             // Retry-on-blackhole (task #117): we associated and DHCP'd
             // successfully, but the AP is silently dropping unicast to
             // our MAC. A force-reassociate kicks UniFi's bridge table

@@ -61,6 +61,21 @@ use heapless::Vec;
 pub use smoltcp::config::DNS_MAX_SERVER_COUNT;
 #[cfg(feature = "multicast")]
 pub use smoltcp::iface::MulticastError;
+
+/// One snapshot row of the smoltcp neighbor cache. Returned by
+/// [`Stack::snapshot_neighbors`]. Paperanywhere fork only.
+#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+#[derive(Debug, Clone, Copy)]
+pub struct NeighborEntry {
+    /// The IP address mapped by this entry.
+    pub addr: smoltcp::wire::IpAddress,
+    /// Hardware (MAC) address smoltcp will send to for this IP.
+    pub hw: smoltcp::wire::HardwareAddress,
+    /// When this cache entry expires. Compare against the current
+    /// `embassy_time::Instant` (well, smoltcp's Instant — they're
+    /// related but not identical; for diag it's enough to print).
+    pub expires_at: smoltcp::time::Instant,
+}
 #[cfg(any(feature = "dns", feature = "dhcpv4"))]
 use smoltcp::iface::SocketHandle;
 use smoltcp::iface::{Interface, SocketSet, SocketStorage};
@@ -547,6 +562,37 @@ impl<'d> Stack<'d> {
     #[cfg(feature = "proto-ipv6")]
     pub fn config_v6(&self) -> Option<StaticConfigV6> {
         self.with(|i| i.static_v6.clone())
+    }
+
+    /// Snapshot the smoltcp neighbor cache. Paperanywhere fork only —
+    /// answers the diagnostic question "is ARP resolving for the
+    /// destinations we care about?". Each returned entry is the
+    /// protocol address, the cached hardware address, and the
+    /// expiry instant (so consumers can tell stale vs fresh).
+    /// `max_entries` caps the output; pass IFACE_NEIGHBOR_CACHE_COUNT
+    /// (or any value at least that large) for "everything".
+    ///
+    /// Requires the medium to support neighbor caches (Ethernet /
+    /// IEEE 802.15.4). On medium-ip builds returns an empty Vec.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn snapshot_neighbors(
+        &self,
+        max_entries: usize,
+    ) -> heapless::Vec<NeighborEntry, 16> {
+        let mut out = heapless::Vec::new();
+        self.with(|i| {
+            for (addr, n) in i.iface.neighbor_cache().iter() {
+                if out.len() >= max_entries || out.is_full() {
+                    break;
+                }
+                let _ = out.push(NeighborEntry {
+                    addr: *addr,
+                    hw: n.hardware_addr(),
+                    expires_at: n.expires_at(),
+                });
+            }
+        });
+        out
     }
 
     /// Set the IPv4 configuration.
