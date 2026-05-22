@@ -1,3 +1,6 @@
 [submodule "crates/cardstock"]
 	path = crates/cardstock
 	url = git@github.com:paperanywhere/cardstock.git
+[submodule "crates/paperanywhere-proto"]
+	path = crates/paperanywhere-proto
+	url = git@github.com:paperanywhere/proto.git
