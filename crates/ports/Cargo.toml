@@ -14,7 +14,7 @@ heapless.workspace = true
 # Mutex wrapping the global chrome state. CriticalSectionRawMutex works
 # both on the firmware (cross-core safe via critical-section's esp-hal
 # impl) and the sim (no-op CS on host).
-embassy-sync = "0.7"
+embassy-sync = "0.8"
 # Cardstock playlist schema. Carried by `DeviceState.playlist` so the
 # runtime can hand it to the panel actor. Deserialised via serde_json
 # below.

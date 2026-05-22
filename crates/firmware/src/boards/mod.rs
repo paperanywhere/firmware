@@ -8,10 +8,9 @@
 //! the active board) and `build_panel`, which assembles the driver from the
 //! GPIO/SPI handles main.rs gathered into `FirmwareResources`.
 
-use core::cell::RefCell;
-
-use critical_section::Mutex;
-use embedded_hal_bus::spi::ExclusiveDevice;
+use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice as SharedAsyncSpiDevice;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
 use esp_hal::Async;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Input, Output};
@@ -20,16 +19,17 @@ use paperanywhere_panel_uc8179::{Pins, Uc8179};
 
 use crate::resources::PanelHardware;
 
-/// Future home of the panel+SD shared SPI2 bus. Today the panel
-/// owns the bus exclusively via `ExclusiveDevice`; sharing requires
-/// a blocking-over-async adapter (the panel uses async SpiDevice,
-/// embedded-sdmmc uses blocking) which is its own focused chunk of
-/// work — see task #116 + `crate::sd` for the design path.
-///
-/// Type alias kept as a documentation handle so the SD module can
-/// reference the eventual shape without us having to plumb the
-/// final wrapper through every call site preemptively.
-pub type SharedSpiBus = Mutex<RefCell<Spi<'static, Async>>>;
+/// Shared SPI2 bus: panel + SD card both draw against it. Backed
+/// by `embassy_sync::mutex::Mutex<CriticalSectionRawMutex, _>` —
+/// the async-aware mutex serves both the panel's async SpiDevice
+/// wrapper (`embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice`)
+/// and the SD's blocking adapter in `crate::sd` (which calls
+/// `embassy_futures::block_on` around the async lock + bus ops).
+/// `CriticalSectionRawMutex` is what makes the wrapper safe to
+/// share across cores — both the panel actor and the SD-driving
+/// runtime live on core 1, but this also survives a future core-0
+/// consumer cleanly.
+pub type SharedSpiBus = Mutex<CriticalSectionRawMutex, Spi<'static, Async>>;
 
 /// Bare panel driver, before the compositor wraps it. The SPI bus
 /// runs in **async** mode (`Spi<'static, Async>`) so each transfer
@@ -44,8 +44,15 @@ pub type SharedSpiBus = Mutex<RefCell<Spi<'static, Async>>>;
 /// invoke its DelayNs slot, so this is effectively unused — but the
 /// trait bound has to be satisfied for `AsyncSpiDevice` to be in
 /// scope on the ExclusiveDevice wrapper.
+/// Async SpiDevice wrapper around the shared bus. The panel
+/// holds one of these; the SD holds a separate blocking adapter
+/// against the same Mutex (`crate::sd::SharedBusSdSpi`). Both
+/// coexist on the same physical SPI2 transport.
+pub type PanelSpiDevice =
+    SharedAsyncSpiDevice<'static, CriticalSectionRawMutex, Spi<'static, Async>, Output<'static>>;
+
 pub type BarePanel = Uc8179<
-    ExclusiveDevice<Spi<'static, Async>, Output<'static>, embassy_time::Delay>,
+    PanelSpiDevice,
     Output<'static>,
     Output<'static>,
     Input<'static>,
@@ -59,18 +66,31 @@ pub type BarePanel = Uc8179<
 /// land in the main region only.
 pub type Panel = paperanywhere_compositor::Compositor<BarePanel>;
 
-/// Assemble the SPI device (bus + CS), instantiate the UC8179
-/// driver against the runtime-typed pins main.rs gathered, and
-/// wrap it in the compositor so the runtime sees a layered
-/// framebuffer. `invert_data_plane` is sourced from the board's
-/// `BoardConfig`.
-pub fn build_panel(hw: PanelHardware, board: BoardConfig) -> Panel {
+/// Pin handles + CS line for the panel. SPI bus itself lives in
+/// a shared `'static` mutex (see [`SharedSpiBus`]). This struct
+/// carries everything the build_panel call needs except the bus
+/// reference.
+pub struct PanelPins {
+    pub cs: Output<'static>,
+    pub dc: Output<'static>,
+    pub rst: Output<'static>,
+    pub busy: Input<'static>,
+}
+
+/// Assemble the panel against a shared SPI bus: build a
+/// per-panel async SpiDevice around the shared `Spi<Async>` +
+/// the panel's CS line, instantiate the UC8179 driver, wrap in
+/// the compositor.
+pub fn build_panel(
+    bus: &'static SharedSpiBus,
+    pins: PanelPins,
+    board: BoardConfig,
+) -> Panel {
     let delay = Delay::new();
-    let spi_device = ExclusiveDevice::new(hw.spi_bus, hw.cs, embassy_time::Delay)
-        .expect("ExclusiveDevice::new (embassy_time::Delay is infallible)");
+    let spi_device = SharedAsyncSpiDevice::new(bus, pins.cs);
     let bare = Uc8179::new(
         spi_device,
-        Pins { rst: hw.rst, dc: hw.dc, busy: hw.busy },
+        Pins { rst: pins.rst, dc: pins.dc, busy: pins.busy },
         delay,
         board.panel_data_inverted,
     );

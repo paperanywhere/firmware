@@ -49,6 +49,9 @@ static WIFI: StaticCell<FwWifi> = StaticCell::new();
 static HTTP: StaticCell<FwHttp> = StaticCell::new();
 static NVS: StaticCell<FwNvs> = StaticCell::new();
 static PANEL: StaticCell<boards::Panel> = StaticCell::new();
+/// Shared SPI2 bus the panel and the SD card both draw against.
+/// Populated once at boot from main.rs's `Spi<Async>` handle.
+static SHARED_SPI_BUS: StaticCell<boards::SharedSpiBus> = StaticCell::new();
 static SLEEPER: StaticCell<FwSleeper> = StaticCell::new();
 static BATTERY: StaticCell<FwBatteryGauge> = StaticCell::new();
 static OTA: StaticCell<FwOta> = StaticCell::new();
@@ -195,16 +198,28 @@ pub fn run(resources: FirmwareResources) -> ! {
     wifi_ref.attach_stack(stack_ref);
     let http_ref = HTTP.init(FwHttp::new(stack_ref, backend_url.as_deref()));
     let nvs_ref = NVS.init(nvs);
-    let panel_ref = PANEL.init(boards::build_panel(panel, board));
-    // SD scaffolding: today this just probes card-detect and logs
-    // the result. Actual mount + format-as-FAT32 lands once the
-    // SPI-bus-share work in task #116 wires the SD's
-    // `CriticalSectionDevice` against the same bus the panel uses
-    // (`boards::SharedSpiBus`). The pins, board quirks, and module
-    // structure are already in place.
-    if let Some(sd_hw) = sd {
-        let state = crate::sd::FwSd::mount(sd_hw);
-        log::info!("sd: mount() returned {:?}", state);
+    // Park the panel's SPI bus into the shared `'static` async
+    // Mutex. Panel uses an async SpiDevice wrapper; SD wraps the
+    // same Mutex with a blocking-over-async adapter. The Mutex
+    // serves both worlds.
+    let crate::resources::PanelHardware { spi_bus, cs, dc, rst, busy } = panel;
+    let shared_bus_ref: &'static boards::SharedSpiBus =
+        SHARED_SPI_BUS.init(embassy_sync::mutex::Mutex::new(spi_bus));
+    let panel_pins = boards::PanelPins { cs, dc, rst, busy };
+    let panel_ref =
+        PANEL.init(boards::build_panel(shared_bus_ref, panel_pins, board));
+    // Now bring up the SD card against the same shared bus.
+    let sd_board = board.sd;
+    if let (Some(sd_hw), Some(sd_quirks)) = (sd, sd_board) {
+        let state = crate::sd::FwSd::mount(shared_bus_ref, sd_hw, &sd_quirks);
+        log::info!("sd: mount() returned {}", state.describe());
+        // Driver handle drops here — once a consumer (e.g. the
+        // panel actor for graph rasters, or SwapAlloc) wants it,
+        // pull it out and StaticCell-park alongside the rest of
+        // the firmware's '_static handles.
+        let _ = state;
+    } else {
+        log::info!("sd: skipping mount — board has no SD slot or pins not wired");
     }
     let sleeper_ref = SLEEPER.init(FwSleeper::new(lpwr));
     // Battery gauge built from the per-board hardware bundle. Owned

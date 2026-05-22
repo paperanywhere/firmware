@@ -2104,13 +2104,15 @@ name = "paperanywhere-firmware"
 version = "0.1.0"
 dependencies = [
  "critical-section",
+ "embassy-embedded-hal",
  "embassy-executor",
  "embassy-futures",
  "embassy-net",
  "embassy-net-driver",
- "embassy-sync 0.7.2",
+ "embassy-sync 0.8.0",
  "embassy-time",
  "embedded-hal 1.0.0",
+ "embedded-hal-async",
  "embedded-hal-bus",
  "embedded-io 0.6.1",
  "embedded-io 0.7.1",
@@ -2157,7 +2159,7 @@ name = "paperanywhere-ports"
 version = "0.1.0"
 dependencies = [
  "cardstock",
- "embassy-sync 0.7.2",
+ "embassy-sync 0.8.0",
  "heapless 0.8.0",
  "paperanywhere-proto",
  "serde_json",
@@ -2181,7 +2183,7 @@ version = "0.1.0"
 dependencies = [
  "cardstock",
  "embassy-futures",
- "embassy-sync 0.7.2",
+ "embassy-sync 0.8.0",
  "embassy-time",
  "heapless 0.8.0",
  "log",

@@ -46,6 +46,15 @@ paperanywhere-compositor.workspace = true
 # schematic wires the SD slot in SPI mode anyway (SCK=GPIO7,
 # MOSI=GPIO9, MISO=GPIO8, CS=GPIO14, DET=GPIO15, EN=GPIO16).
 embedded-sdmmc = { version = "0.8", default-features = false }
+# Async SpiBus trait is needed at our SD adapter's call sites so
+# we can dispatch through the async impl on Spi<Async>.
+embedded-hal-async = "1"
+# embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice — the
+# async SpiDevice wrapper the panel uses against the shared
+# Mutex-backed bus. Version pinned to 0.6 to match esp-hal's own
+# transitive use (esp-radio + esp-rtos + esp-storage all pull 0.6),
+# which avoids dual-crate-version trait incompatibilities.
+embassy-embedded-hal = "0.6"
 # critical-section: explicitly declared so the panel+SD shared
 # bus type alias in boards/mod.rs (`SharedSpiBus`) can name
 # `critical_section::Mutex`. The crate is transitively pulled in
@@ -123,7 +132,7 @@ embassy-futures = "0.1"
 embassy-executor = "0.10"
 embassy-net = { version = "0.7", default-features = false, features = ["proto-ipv4", "medium-ethernet", "tcp", "dhcpv4", "dns"] }
 embassy-net-driver = "0.2"
-embassy-sync = "0.7"
+embassy-sync = "0.8"
 # `generic-queue-8` enables a software timer queue that doesn't require
 # the calling task's waker to come from `embassy_executor`. We need it
 # because the WifiLink::associate path uses `embassy_futures::block_on`
