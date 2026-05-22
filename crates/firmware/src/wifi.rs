@@ -21,7 +21,7 @@ use esp_hal::timer::timg::TimerGroup;
 use esp_radio::wifi::{
     Config, ControllerConfig, Interface as RadioInterface, WifiController, sta::StationConfig,
 };
-use paperanywhere_ports::{WifiCreds, WifiLink};
+use paperanywhere_ports::{NvsStore, WifiCreds, WifiLink};
 
 // The variants are read by the runtime via the derived `Debug` impl when
 // logging WakeError contexts; `dead_code` doesn't see through `{:?}`.
@@ -65,6 +65,12 @@ pub struct FwWifi {
     /// finish, leaving the device stuck in a connect / disconnect /
     /// reconnect loop that never makes progress past the boot screen.
     had_ip_in_session: bool,
+    /// SSID we most recently called `set_config` for. Keys into the
+    /// per-SSID DHCP-lease cache in NVS so we can fall back to a
+    /// static config on DHCP timeout (UniFi / AP bridge-table glitches
+    /// have been observed where a device that already has a valid
+    /// lease can't re-DHCP after a soft reset).
+    current_ssid: alloc::string::String,
 }
 
 impl FwWifi {
@@ -73,6 +79,142 @@ impl FwWifi {
     /// produces the stack.
     pub fn attach_stack(&mut self, stack: &'static embassy_net::Stack<'static>) {
         self.stack = Some(stack);
+    }
+
+    /// Wait for embassy-net to acquire an IPv4 config (DHCP). On
+    /// timeout, fall back to a static config built from a previously
+    /// cached lease in NVS (if one exists for the SSID we're currently
+    /// associated to). Returns `true` if the stack ended up with an
+    /// IP, `false` if neither DHCP nor cached-fallback yielded one.
+    ///
+    /// Saves a fresh DHCP lease to NVS on success so the next boot
+    /// has a fallback to use.
+    ///
+    /// `unsafe`-via-AtomicPtr access to FwNvs follows the same handoff
+    /// pattern as `boot::flash_persist_hook` — see NVS_HANDOFF
+    /// in boot.rs for the SAFETY contract.
+    pub async fn wait_for_ip_or_fallback(
+        &mut self,
+        dhcp_timeout: Duration,
+    ) -> bool {
+        let stack = match self.stack {
+            Some(s) => s,
+            None => return false,
+        };
+        // Fast path: DHCP came back already.
+        if stack.config_v4().is_some() {
+            if let Some(cfg) = stack.config_v4() {
+                self.cache_lease(&cfg);
+            }
+            return true;
+        }
+        // Race DHCP against the timeout.
+        let dhcp_result = embassy_futures::select::select(
+            stack.wait_config_up(),
+            Timer::after(dhcp_timeout),
+        )
+        .await;
+        match dhcp_result {
+            embassy_futures::select::Either::First(()) => {
+                if let Some(cfg) = stack.config_v4() {
+                    self.cache_lease(&cfg);
+                }
+                true
+            }
+            embassy_futures::select::Either::Second(()) => {
+                let lease = crate::wifi::load_cached_lease(&self.current_ssid);
+                match lease {
+                    Some(l) => {
+                        log::warn!(
+                            "wifi: DHCP timed out — using cached lease ip={:?}/{} gw={:?} dns={:?}",
+                            l.ipv4, l.prefix, l.gateway, l.dns
+                        );
+                        let cidr = embassy_net::Ipv4Cidr::new(
+                            embassy_net::Ipv4Address::from_bits(u32::from_be_bytes(l.ipv4)),
+                            l.prefix,
+                        );
+                        let gateway = l.gateway.map(|g| {
+                            embassy_net::Ipv4Address::from_bits(u32::from_be_bytes(g))
+                        });
+                        let mut dns_servers = heapless::Vec::new();
+                        if let Some(dns) = l.dns {
+                            let _ = dns_servers.push(
+                                embassy_net::Ipv4Address::from_bits(u32::from_be_bytes(dns)),
+                            );
+                        }
+                        stack.set_config_v4(embassy_net::ConfigV4::Static(
+                            embassy_net::StaticConfigV4 {
+                                address: cidr,
+                                gateway,
+                                dns_servers,
+                            },
+                        ));
+                        true
+                    }
+                    None => {
+                        log::warn!(
+                            "wifi: DHCP timed out and no cached lease for {:?}",
+                            self.current_ssid
+                        );
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    /// Forcibly tear down the current association and re-join the same
+    /// SSID. Used by the HTTP retry-on-blackhole path: when the AP is
+    /// silently dropping our unicast frames post-DHCP (UniFi bridge-
+    /// table glitch — see [`project_register_unifi_blackhole`] memory),
+    /// a deauth-then-reassociate kicks the AP into re-learning our MAC
+    /// + repopulating its forwarding table.
+    ///
+    /// No-op if we haven't successfully associated yet (no SSID to
+    /// reuse). Returns the result of the re-`associate` call.
+    pub async fn force_reconnect(&mut self) -> Result<(), WifiError> {
+        if self.current_ssid.is_empty() {
+            log::warn!("wifi: force_reconnect called before first associate — skipping");
+            return Err(WifiError::ConnectFailed);
+        }
+        log::warn!(
+            "wifi: force_reconnect — disconnecting + re-associating to {:?}",
+            self.current_ssid
+        );
+        // disconnect_async, then clear the sticky associated flag so
+        // associate() doesn't short-circuit.
+        let _ = self.controller.disconnect_async().await;
+        self.associated = false;
+        // Re-read creds from NVS so we don't have to cache a password
+        // copy on the heap inside FwWifi.
+        let nvs_raw = crate::boot::NVS_HANDOFF
+            .load(core::sync::atomic::Ordering::Acquire);
+        if nvs_raw.is_null() {
+            return Err(WifiError::BadCreds);
+        }
+        let nvs: &crate::nvs::FwNvs = unsafe { &*nvs_raw };
+        let creds = match nvs.load_wifi_creds() {
+            Some(c) => c,
+            None => return Err(WifiError::BadCreds),
+        };
+        self.associate(&creds).await
+    }
+
+    fn cache_lease(&self, cfg: &embassy_net::StaticConfigV4) {
+        if self.current_ssid.is_empty() {
+            return;
+        }
+        let ip_octets = cfg.address.address().octets();
+        let gateway = cfg.gateway.map(|g| g.octets());
+        let dns = cfg.dns_servers.first().map(|d| d.octets());
+        let lease = crate::nvs::CachedLease {
+            ssid: self.current_ssid.clone(),
+            ipv4: ip_octets,
+            prefix: cfg.address.prefix_len(),
+            gateway,
+            dns,
+        };
+        crate::wifi::save_cached_lease(&lease);
     }
 }
 
@@ -122,6 +264,7 @@ impl FwWifi {
                 stack: None,
                 associated: false,
                 had_ip_in_session: false,
+                current_ssid: alloc::string::String::new(),
             },
             interfaces.station,
         ))
@@ -194,9 +337,23 @@ impl WifiLink for FwWifi {
         match result {
             Either::First(Ok(_info)) => {
                 self.associated = true;
+                self.current_ssid.clear();
+                self.current_ssid.push_str(creds.ssid.as_str());
+                // Best-effort wait for DHCP (15 s). On timeout, fall
+                // back to a cached static lease if available. Ignore
+                // the boolean — the runtime's wait_for_local_ip will
+                // surface the no-IP failure via its own retry path,
+                // and we don't want a missing cached-lease to look
+                // like a fresh association failure.
+                let _ = self
+                    .wait_for_ip_or_fallback(Duration::from_secs(15))
+                    .await;
                 Ok(())
             }
-            Either::First(Err(_)) => Err(WifiError::ConnectFailed),
+            Either::First(Err(e)) => {
+                log::error!("wifi: esp-radio connect_async err: {:?}", e);
+                Err(WifiError::ConnectFailed)
+            }
             Either::Second(_) => Err(WifiError::Timeout),
         }
     }
@@ -235,6 +392,53 @@ impl WifiLink for FwWifi {
         // — None when DHCP didn't include one. Forward as-is.
         cfg.gateway.map(|g| g.octets())
     }
+}
+
+/// Look up a cached DHCP lease for `ssid`. Returns `None` if NVS hasn't
+/// been wired in yet, or no lease exists for this SSID.
+///
+/// SAFETY: dereferences the global NVS pointer published by
+/// [`crate::boot::NVS_HANDOFF`]. The pointer is set once at boot before
+/// any task starts; reads are Acquire-ordered. After publication the
+/// pointed-to FwNvs lives for the entire program lifetime.
+pub(crate) fn load_cached_lease(ssid: &str) -> Option<crate::nvs::CachedLease> {
+    let raw = crate::boot::NVS_HANDOFF
+        .load(core::sync::atomic::Ordering::Acquire);
+    if raw.is_null() {
+        return None;
+    }
+    // Read-only access here — safe to take a shared reference even if
+    // another task holds a separate &mut, since save_* methods that
+    // mutate are called from the same single-threaded async runtime.
+    let nvs: &crate::nvs::FwNvs = unsafe { &*raw };
+    nvs.load_wifi_lease(ssid)
+}
+
+/// Persist a successful DHCP lease for future fallback. Same SAFETY
+/// contract as [`load_cached_lease`].
+pub(crate) fn save_cached_lease(lease: &crate::nvs::CachedLease) {
+    let raw = crate::boot::NVS_HANDOFF
+        .load(core::sync::atomic::Ordering::Acquire);
+    if raw.is_null() {
+        return;
+    }
+    let nvs: &mut crate::nvs::FwNvs = unsafe { &mut *raw };
+    nvs.save_wifi_lease(lease);
+}
+
+/// Force a WiFi reassociate via the module-level FwWifi handoff.
+/// Called from the HTTP retry-on-blackhole path. SAFETY: same as
+/// [`save_cached_lease`] — relies on the boot-time-published pointer
+/// in [`crate::boot::WIFI_HANDOFF_GLOBAL`].
+pub(crate) async fn force_reconnect_via_handoff() -> Result<(), WifiError> {
+    let raw = crate::boot::WIFI_HANDOFF_GLOBAL
+        .load(core::sync::atomic::Ordering::Acquire);
+    if raw.is_null() {
+        log::warn!("wifi: force_reconnect: WIFI handoff not yet published");
+        return Err(WifiError::ConnectFailed);
+    }
+    let wifi: &mut FwWifi = unsafe { &mut *raw };
+    wifi.force_reconnect().await
 }
 
 /// Captive-portal AP for first-time provisioning. Hosts an HTTP server on

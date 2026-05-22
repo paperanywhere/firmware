@@ -85,6 +85,35 @@ const TAG_DEVICE_UUID: u8 = 8;
 /// the dashboard. Displayed on the boot screen / status bar in
 /// preference to the UUID once set.
 const TAG_DEVICE_NAME: u8 = 9;
+/// Last known-good DHCP lease, keyed by SSID. Binary payload:
+///   1 byte  : ssid length (0..=32)
+///   N bytes : ssid utf-8
+///   4 bytes : ipv4
+///   1 byte  : prefix length
+///   1 byte  : has_gw (0 / 1)
+///   4 bytes : gateway ipv4 (zeros if !has_gw)
+///   1 byte  : has_dns (0 / 1)
+///   4 bytes : dns ipv4   (zeros if !has_dns)
+/// Used as a static fallback when DHCP times out on a known-good
+/// network — works around UniFi / AP bridge-table glitches where a
+/// device that already has a valid lease can't re-DHCP after a soft
+/// reset.
+const TAG_WIFI_LEASE: u8 = 10;
+
+/// One persisted DHCP lease. Only IPv4 today — the device's network
+/// stack is IPv4-only (see embassy-net feature flags in firmware
+/// Cargo.toml). Lifetime is "until manually overwritten" — no expiry
+/// stamp because the device has no wall clock at the relevant boot
+/// stage. Fresh DHCP whenever it works overwrites this; SSID change
+/// invalidates the cache (load_wifi_lease checks ssid match).
+#[derive(Debug, Clone)]
+pub struct CachedLease {
+    pub ssid: alloc::string::String,
+    pub ipv4: [u8; 4],
+    pub prefix: u8,
+    pub gateway: Option<[u8; 4]>,
+    pub dns: Option<[u8; 4]>,
+}
 
 #[derive(Default)]
 struct NvsCache {
@@ -105,6 +134,19 @@ struct NvsCache {
     /// User-supplied friendly name set during adoption. Refreshed on every
     /// /state call (cheap — the field comes back on every response).
     device_name: Option<HString<64>>,
+    /// Last-known-good DHCP lease for *one* SSID. See [`CachedLease`].
+    wifi_lease: Option<CachedLeaseStored>,
+}
+
+/// Stored form of [`CachedLease`] using fixed-size types so the
+/// in-memory cache stays no-std friendly without heap.
+#[derive(Clone)]
+struct CachedLeaseStored {
+    ssid: HString<32>,
+    ipv4: [u8; 4],
+    prefix: u8,
+    gateway: Option<[u8; 4]>,
+    dns: Option<[u8; 4]>,
 }
 
 pub struct FwNvs {
@@ -172,6 +214,52 @@ impl FwNvs {
         }
         self.cache.device_name = into_hstring::<64>(name);
         self.persist();
+    }
+
+    /// Persist a DHCP lease so a future boot can use it as a static
+    /// fallback when DHCP times out. Overwrites any previously cached
+    /// lease — only one is kept (keyed by SSID). Idempotent if the
+    /// new lease matches the existing cached one.
+    pub fn save_wifi_lease(&mut self, lease: &CachedLease) {
+        let new_ssid: HString<32> = match into_hstring::<32>(&lease.ssid) {
+            Some(h) => h,
+            None => return,
+        };
+        let stored = CachedLeaseStored {
+            ssid: new_ssid,
+            ipv4: lease.ipv4,
+            prefix: lease.prefix,
+            gateway: lease.gateway,
+            dns: lease.dns,
+        };
+        if let Some(existing) = &self.cache.wifi_lease {
+            if existing.ssid == stored.ssid
+                && existing.ipv4 == stored.ipv4
+                && existing.prefix == stored.prefix
+                && existing.gateway == stored.gateway
+                && existing.dns == stored.dns
+            {
+                return;
+            }
+        }
+        self.cache.wifi_lease = Some(stored);
+        self.persist();
+    }
+
+    /// Look up a cached lease for `ssid`. Returns `None` if no lease is
+    /// stored or the cached lease was for a different SSID.
+    pub fn load_wifi_lease(&self, ssid: &str) -> Option<CachedLease> {
+        let stored = self.cache.wifi_lease.as_ref()?;
+        if stored.ssid.as_str() != ssid {
+            return None;
+        }
+        Some(CachedLease {
+            ssid: alloc::string::String::from(ssid),
+            ipv4: stored.ipv4,
+            prefix: stored.prefix,
+            gateway: stored.gateway,
+            dns: stored.dns,
+        })
     }
 
     /// Try to migrate a `prov.bin` blob from the prov partition into NVS.
@@ -452,6 +540,30 @@ fn encode_tlv(cache: &NvsCache, payload: &mut [u8]) -> Result<usize, NvsError> {
     if let Some(s) = &cache.device_name {
         pos = write_record(payload, pos, TAG_DEVICE_NAME, s.as_bytes())?;
     }
+    if let Some(lease) = &cache.wifi_lease {
+        let ssid_bytes = lease.ssid.as_bytes();
+        let ssid_len = ssid_bytes.len().min(32);
+        // Layout matches the TAG_WIFI_LEASE comment above.
+        let mut buf = [0u8; 1 + 32 + 4 + 1 + 1 + 4 + 1 + 4];
+        buf[0] = ssid_len as u8;
+        buf[1..1 + ssid_len].copy_from_slice(&ssid_bytes[..ssid_len]);
+        let mut p = 1 + ssid_len;
+        buf[p..p + 4].copy_from_slice(&lease.ipv4);
+        p += 4;
+        buf[p] = lease.prefix;
+        p += 1;
+        buf[p] = lease.gateway.is_some() as u8;
+        if let Some(gw) = lease.gateway {
+            buf[p + 1..p + 5].copy_from_slice(&gw);
+        }
+        p += 5;
+        buf[p] = lease.dns.is_some() as u8;
+        if let Some(dns) = lease.dns {
+            buf[p + 1..p + 5].copy_from_slice(&dns);
+        }
+        p += 5;
+        pos = write_record(payload, pos, TAG_WIFI_LEASE, &buf[..p])?;
+    }
     // tag 0 terminator
     if pos < payload.len() {
         payload[pos] = 0;
@@ -505,6 +617,13 @@ fn parse_tlv(payload: &[u8]) -> Result<NvsCache, NvsError> {
             i = val_end;
             continue;
         }
+        if tag == TAG_WIFI_LEASE {
+            if let Some(lease) = decode_lease(value) {
+                cache.wifi_lease = Some(lease);
+            }
+            i = val_end;
+            continue;
+        }
         let value_str = core::str::from_utf8(value).map_err(|_| NvsError::Truncated)?;
         match tag {
             TAG_DEVICE_TOKEN => cache.device_token = into_hstring::<64>(value_str),
@@ -519,6 +638,43 @@ fn parse_tlv(payload: &[u8]) -> Result<NvsCache, NvsError> {
         i = val_end;
     }
     Ok(cache)
+}
+
+fn decode_lease(value: &[u8]) -> Option<CachedLeaseStored> {
+    if value.is_empty() {
+        return None;
+    }
+    let ssid_len = value[0] as usize;
+    if ssid_len > 32 {
+        return None;
+    }
+    let total_needed = 1 + ssid_len + 4 + 1 + 1 + 4 + 1 + 4;
+    if value.len() < total_needed {
+        return None;
+    }
+    let ssid_bytes = &value[1..1 + ssid_len];
+    let ssid_str = core::str::from_utf8(ssid_bytes).ok()?;
+    let ssid = into_hstring::<32>(ssid_str)?;
+    let mut p = 1 + ssid_len;
+    let mut ipv4 = [0u8; 4];
+    ipv4.copy_from_slice(&value[p..p + 4]);
+    p += 4;
+    let prefix = value[p];
+    p += 1;
+    let has_gw = value[p] != 0;
+    let mut gw = [0u8; 4];
+    gw.copy_from_slice(&value[p + 1..p + 5]);
+    p += 5;
+    let has_dns = value[p] != 0;
+    let mut dns = [0u8; 4];
+    dns.copy_from_slice(&value[p + 1..p + 5]);
+    Some(CachedLeaseStored {
+        ssid,
+        ipv4,
+        prefix,
+        gateway: if has_gw { Some(gw) } else { None },
+        dns: if has_dns { Some(dns) } else { None },
+    })
 }
 
 fn into_hstring<const N: usize>(s: &str) -> Option<HString<N>> {

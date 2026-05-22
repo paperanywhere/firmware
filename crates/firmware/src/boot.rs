@@ -73,7 +73,19 @@ static EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
 ///     so Acquire/Release ordering is enough — no further sync needed.
 ///   * The pointed-to FwNvs lives `'static` (via the NVS StaticCell)
 ///     so the pointer is always valid for the lifetime of the program.
-static CHROME_NVS_HANDOFF: core::sync::atomic::AtomicPtr<FwNvs> =
+pub(crate) static NVS_HANDOFF: core::sync::atomic::AtomicPtr<FwNvs> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Module-level pointer to the FwWifi instance, published once at boot.
+/// Lets the HTTP retry-on-blackhole path force a WiFi reassociation when
+/// post-DHCP unicast traffic gets blackholed by the AP (see
+/// `project_register_unifi_blackhole` memory) without threading a
+/// `&mut FwWifi` through the HTTP call sites.
+///
+/// SAFETY: same contract as [`NVS_HANDOFF`] — set once at boot before
+/// any task starts; reads are Acquire-ordered; the pointed-to FwWifi
+/// lives `'static`.
+pub(crate) static WIFI_HANDOFF_GLOBAL: core::sync::atomic::AtomicPtr<crate::wifi::FwWifi> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 /// Persistence hook installed via `chrome::register_persistence_hook`.
@@ -83,11 +95,11 @@ static CHROME_NVS_HANDOFF: core::sync::atomic::AtomicPtr<FwNvs> =
 /// ssid) into NVS. Each `nvs.save_*` early-returns if the value is
 /// unchanged, so spurious calls are cheap.
 fn flash_persist_hook() {
-    let raw = CHROME_NVS_HANDOFF.load(core::sync::atomic::Ordering::Acquire);
+    let raw = NVS_HANDOFF.load(core::sync::atomic::Ordering::Acquire);
     if raw.is_null() {
         return;
     }
-    // SAFETY: see CHROME_NVS_HANDOFF invariants. Single mutable
+    // SAFETY: see NVS_HANDOFF invariants. Single mutable
     // reference is fine here because save_* methods don't await or
     // recurse into chrome.
     let nvs = unsafe { &mut *raw };
@@ -232,7 +244,7 @@ pub fn run(resources: FirmwareResources) -> ! {
     // `chrome::set_*_with(.., Persist::Flash)` from any task can write
     // through to flash. Pointer published BEFORE register_persistence_hook
     // so a setter racing this couldn't dereference a stale null.
-    CHROME_NVS_HANDOFF.store(
+    NVS_HANDOFF.store(
         nvs_ref as *mut FwNvs,
         core::sync::atomic::Ordering::Release,
     );
@@ -490,6 +502,13 @@ pub fn run(resources: FirmwareResources) -> ! {
         wifi_ref as *mut crate::wifi::FwWifi,
         core::sync::atomic::Ordering::Release,
     );
+    // Also publish to the module-level handoff so the retry-on-
+    // blackhole path in http.rs / wifi.rs can find it without
+    // having to plumb a &mut FwWifi through every call.
+    WIFI_HANDOFF_GLOBAL.store(
+        wifi_ref as *mut crate::wifi::FwWifi,
+        core::sync::atomic::Ordering::Release,
+    );
     HTTP_HANDOFF.store(
         http_ref as *mut crate::http::FwHttp,
         core::sync::atomic::Ordering::Release,
@@ -541,24 +560,15 @@ pub fn run(resources: FirmwareResources) -> ! {
                 )
                 .expect("panel_actor_task pool");
                 spawner.spawn(actor_token);
-                // Runtime: now on core 1 alongside the actor, talks
-                // to FwHttp + FwWifi directly. Cross-core access to
-                // the embassy-net Stack is safe because the vendored
-                // fork wraps the inner RefCell in a CSRawMutex.
-                let rt_token = runtime_task(
-                    wifi_ref_core1,
-                    http_ref_core1,
-                    nvs_ref,
-                    sleeper_ref,
-                    ota_ref,
-                    battery_ref,
-                    policy,
-                    identity_ref.clone(),
-                    &OTA_PROGRESS,
-                    &PAINT_CHANNEL,
-                )
-                .expect("runtime_task pool");
-                spawner.spawn(rt_token);
+                // DIAG (task #117): runtime moved BACK to core 0 to
+                // share an executor with net_task. Tests whether the
+                // cross-core arrangement is what's breaking TCP
+                // connect (SYN goes out but never completes
+                // handshake). The unused captures below are kept so
+                // the closure still compiles; runtime spawn is now
+                // in core 0's executor.run below.
+                let _ = (wifi_ref_core1, http_ref_core1, nvs_ref,
+                         sleeper_ref, ota_ref, battery_ref);
             });
         },
     );
@@ -581,6 +591,24 @@ pub fn run(resources: FirmwareResources) -> ! {
         let diag_token =
             crate::diagnostics::heartbeat_task().expect("heartbeat_task pool");
         spawner.spawn(diag_token);
+        // DIAG (task #117): runtime co-located with net_task on
+        // core 0 instead of core 1. Same executor → smoltcp's
+        // wakers fire in-executor instead of crossing the IPI
+        // boundary that's been breaking TCP handshake.
+        let rt_token = runtime_task(
+            wifi_ref,
+            http_ref,
+            nvs_ref,
+            sleeper_ref,
+            ota_ref,
+            battery_ref,
+            policy,
+            identity_ref.clone(),
+            &OTA_PROGRESS,
+            &PAINT_CHANNEL,
+        )
+        .expect("runtime_task pool");
+        spawner.spawn(rt_token);
     })
 }
 

@@ -264,7 +264,119 @@ async fn request_with_full_body(
         tls_write_buf,
     } = http;
     let t_connect = Instant::now();
+
+    // ── One-shot network reachability probe (task #117) ────────────
+    // The first time through, before we ever try the real backend,
+    // probe two well-known endpoints to localise the connect
+    // timeout: the DHCP-advertised gateway (proves on-LAN ARP +
+    // L2 RX works) and 8.8.8.8:53 (proves egress through the
+    // router works). Both run with a 3-second timeout — enough to
+    // see SYN-ACK arrive over a healthy connection but short enough
+    // to keep boot reasonable when there's no internet.
+    {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static PROBED: AtomicBool = AtomicBool::new(false);
+        if !PROBED.swap(true, Ordering::SeqCst) {
+            // Dump full DHCP cfg — heartbeat truncates gateway display.
+            if let Some(cfg) = stack.config_v4() {
+                log::info!(
+                    "probe: cfg dump address={:?}/{} gateway={:?} dns={:?}",
+                    cfg.address.address(),
+                    cfg.address.prefix_len(),
+                    cfg.gateway,
+                    cfg.dns_servers.as_slice(),
+                );
+            }
+            // UDP probe via DNS query. Differentiates UDP-egress
+            // broken vs TCP-only broken. DHCP works, but the DHCP
+            // server might be local; this hits an external resolver.
+            log::info!("probe: UDP DNS query for example.com ...");
+            match embassy_time::with_timeout(
+                embassy_time::Duration::from_secs(5),
+                stack.dns_query("example.com", embassy_net::dns::DnsQueryType::A),
+            )
+            .await
+            {
+                Ok(Ok(addrs)) => log::info!(
+                    "probe: DNS OK — UDP egress works; first addr = {:?}",
+                    addrs.first()
+                ),
+                Ok(Err(e)) => log::warn!("probe: DNS err: {:?}", e),
+                Err(_) => log::warn!("probe: DNS TIMEOUT (5s) — UDP egress broken too"),
+            }
+            if let Some(cfg) = stack.config_v4() {
+                if let Some(gw) = cfg.gateway {
+                    log::info!("probe: connecting to gateway {:?}:80 ...", gw);
+                    let mut rx_buf = [0u8; 256];
+                    let mut tx_buf = [0u8; 256];
+                    let mut sk = TcpSocket::new(**stack, &mut rx_buf, &mut tx_buf);
+                    sk.set_timeout(Some(embassy_time::Duration::from_secs(3)));
+                    let f = sk.connect((embassy_net::IpAddress::Ipv4(gw), 80u16));
+                    match embassy_time::with_timeout(
+                        embassy_time::Duration::from_secs(3),
+                        f,
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => log::info!(
+                            "probe: gateway {:?}:80 connected OK — on-LAN ARP works",
+                            gw
+                        ),
+                        Ok(Err(e)) => log::warn!(
+                            "probe: gateway {:?}:80 connect err: {:?}",
+                            gw, e
+                        ),
+                        Err(_) => log::warn!(
+                            "probe: gateway {:?}:80 TIMEOUT (3s) sock_state={:?}",
+                            gw,
+                            sk.state()
+                        ),
+                    }
+                    sk.close();
+                }
+            }
+            // 8.8.8.8:53 — egress probe
+            log::info!("probe: connecting to 8.8.8.8:53 ...");
+            let mut rx_buf = [0u8; 256];
+            let mut tx_buf = [0u8; 256];
+            let mut sk = TcpSocket::new(**stack, &mut rx_buf, &mut tx_buf);
+            sk.set_timeout(Some(embassy_time::Duration::from_secs(3)));
+            let target = embassy_net::IpAddress::Ipv4(
+                embassy_net::Ipv4Address::new(8, 8, 8, 8),
+            );
+            let f = sk.connect((target, 53u16));
+            match embassy_time::with_timeout(
+                embassy_time::Duration::from_secs(3),
+                f,
+            )
+            .await
+            {
+                Ok(Ok(())) => log::info!("probe: 8.8.8.8:53 connected OK — egress works"),
+                Ok(Err(e)) => log::warn!("probe: 8.8.8.8:53 connect err: {:?}", e),
+                Err(_) => log::warn!(
+                    "probe: 8.8.8.8:53 TIMEOUT (3s) sock_state={:?}",
+                    sk.state()
+                ),
+            }
+            sk.close();
+        }
+    }
+
     let mut socket = TcpSocket::new(**stack, &mut tcp_rx_buf[..], &mut tcp_tx_buf[..]);
+    // Link-state probe right before the TCP connect attempt. If the
+    // radio dropped between DHCP/IP-assignment and now (AP de-auth,
+    // esp-radio task starvation, smoltcp internal state drift) the
+    // connect will time out and we want the log to make that obvious
+    // rather than just showing "TIMEOUT after 10s".
+    log::info!(
+        "http: [{} {}] stage=pre_connect link_up={} cfg_v4={:?} polls={}",
+        method,
+        path,
+        stack.is_link_up(),
+        stack.config_v4().map(|c| c.address),
+        embassy_net::diag::NET_RUNNER_POLLS
+            .load(core::sync::atomic::Ordering::Relaxed)
+    );
     log::info!(
         "http: [{} {}] stage=connect_begin (addr={:?}, port={})",
         method, path, addr, *port
@@ -299,11 +411,79 @@ async fn request_with_full_body(
             return Err(HttpError::SocketConnect);
         }
         Err(_) => {
+            let tx_count = embassy_net::diag::NET_TX_PKTS
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let rx_count = embassy_net::diag::NET_RX_PKTS
+                .load(core::sync::atomic::Ordering::Relaxed);
             log::error!(
-                "http: [{} {}] connect TIMEOUT after 10s (addr={:?}, port={})",
-                method, path, addr, *port
+                "http: [{} {}] connect TIMEOUT after 10s (addr={:?}, port={}) — \
+                 post: link_up={} cfg_v4={:?} polls={} tx={} rx={} sock_state={:?}",
+                method,
+                path,
+                addr,
+                *port,
+                stack.is_link_up(),
+                stack.config_v4().map(|c| c.address),
+                embassy_net::diag::NET_RUNNER_POLLS
+                    .load(core::sync::atomic::Ordering::Relaxed),
+                tx_count,
+                rx_count,
+                socket.state()
             );
-            return Err(HttpError::SocketConnect);
+            // Retry-on-blackhole (task #117): we associated and DHCP'd
+            // successfully, but the AP is silently dropping unicast to
+            // our MAC. A force-reassociate kicks UniFi's bridge table
+            // into re-learning us. Done at most ONCE per HTTP call so
+            // a genuinely-down backend doesn't get hammered with
+            // re-associations every 10 seconds.
+            drop(socket);
+            log::warn!(
+                "http: [{} {}] post-DHCP blackhole detected — forcing WiFi reconnect + 1 retry",
+                method, path
+            );
+            if crate::wifi::force_reconnect_via_handoff().await.is_err() {
+                return Err(HttpError::SocketConnect);
+            }
+            // Give DHCP a moment to land before retrying the connect.
+            embassy_time::Timer::after(embassy_time::Duration::from_secs(2)).await;
+            let mut retry_socket = TcpSocket::new(
+                **stack,
+                &mut tcp_rx_buf[..],
+                &mut tcp_tx_buf[..],
+            );
+            let retry_fut = retry_socket.connect((addr, *port));
+            match embassy_time::with_timeout(
+                embassy_time::Duration::from_secs(10),
+                retry_fut,
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    log::info!(
+                        "http: [{} {}] retry connect OK after reassociate",
+                        method, path
+                    );
+                    // Replace the original socket with the retry one
+                    // for the rest of the exchange path below.
+                    socket = retry_socket;
+                }
+                Ok(Err(e)) => {
+                    log::error!(
+                        "http: [{} {}] retry connect FAILED: {:?}",
+                        method, path, e
+                    );
+                    return Err(HttpError::SocketConnect);
+                }
+                Err(_) => {
+                    log::error!(
+                        "http: [{} {}] retry connect TIMEOUT after reassociate",
+                        method, path
+                    );
+                    return Err(HttpError::SocketConnect);
+                }
+            }
+            // Retry succeeded — `socket` has been replaced and control
+            // falls through to the exchange phase below.
         }
     }
 
