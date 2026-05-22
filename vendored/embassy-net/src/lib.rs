@@ -925,11 +925,47 @@ impl<'d, D: Driver> Runner<'d, D> {
     ///
     /// You must call this in a background task, to process network events.
     pub async fn run(&mut self) -> ! {
-        poll_fn(|cx| {
-            self.stack.with_mut(|i| i.poll(cx, &mut self.driver));
-            Poll::<()>::Pending
-        })
-        .await;
-        unreachable!()
+        // Cross-core waker workaround (paperanywhere task #104).
+        //
+        // The upstream embassy-net runner parks on its waker after
+        // each poll, relying on socket / device wakers to wake it
+        // again when work appears. That assumes the runner shares
+        // an executor with whoever's calling socket methods. In
+        // paperanywhere the application runtime lives on core 1
+        // and net_task on core 0; esp-rtos's IPI-based cross-core
+        // wakers don't reliably cross the executor boundary, so
+        // when core 1's `socket.connect()` modifies stack state,
+        // the wake never reaches core 0's runner — TCP handshake
+        // sits idle until something else (the 5-second heartbeat
+        // task) happens to wake core 0's executor.
+        //
+        // Fix: poll the stack on a 2 ms ticker instead of relying
+        // on wakers. Each iteration runs smoltcp's poll once + an
+        // embassy_time::Timer await. Cost: ~500 polls/sec when
+        // idle (smoltcp's poll is cheap — interface state check
+        // + state machine tick). Under load it's the same poll
+        // rate as before, just driven by the timer rather than
+        // the (cross-core-broken) waker.
+        let ticker = embassy_time::Duration::from_millis(2);
+        loop {
+            poll_fn(|cx| {
+                crate::diag::NET_RUNNER_POLLS
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                self.stack.with_mut(|i| i.poll(cx, &mut self.driver));
+                Poll::Ready(())
+            })
+            .await;
+            embassy_time::Timer::after(ticker).await;
+        }
     }
+}
+
+/// Diagnostic counter exposed on the embassy-net side. Incremented
+/// once per `Runner::run` poll. Consumers can sample at any cadence;
+/// reading is `Ordering::Relaxed` so there's no synchronization
+/// cost. paperanywhere uses this in its core-0 heartbeat to confirm
+/// net_task is actually running during /state hangs.
+pub mod diag {
+    use core::sync::atomic::AtomicU32;
+    pub static NET_RUNNER_POLLS: AtomicU32 = AtomicU32::new(0);
 }
