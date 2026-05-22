@@ -1,0 +1,3 @@
+[submodule "crates/cardstock"]
+	path = crates/cardstock
+	url = git@github.com:paperanywhere/cardstock.git

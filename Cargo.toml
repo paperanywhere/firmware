@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/cardstock",
     "crates/ports",
     "crates/runtime",
     "crates/panel-uc8179",
@@ -29,6 +30,7 @@ log = "0.4"
 # via the workspace; never published.
 paperanywhere-ports = { path = "crates/ports" }
 paperanywhere-runtime = { path = "crates/runtime" }
+cardstock = { path = "crates/cardstock" }
 paperanywhere-panel-uc8179 = { path = "crates/panel-uc8179" }
 paperanywhere-boot-screen = { path = "crates/boot-screen" }
 paperanywhere-compositor = { path = "crates/compositor" }
