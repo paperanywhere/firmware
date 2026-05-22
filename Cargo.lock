@@ -2139,6 +2139,7 @@ dependencies = [
  "paperanywhere-runtime",
  "rand_core 0.6.4",
  "sha2",
+ "smoltcp",
  "static_cell",
 ]
 

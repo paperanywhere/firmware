@@ -595,6 +595,33 @@ impl<'d> Stack<'d> {
         out
     }
 
+    /// Insert a static neighbor (ARP) entry. Paperanywhere fork only.
+    ///
+    /// Use case: APs that drop unicast ARP REPLY between clients break
+    /// smoltcp's normal "resolve before send" path — the SYN sits in
+    /// SynSent forever because no L2 destination is ever learned.
+    /// Pre-populating the cache with (`target_ip → gateway_mac`)
+    /// works around this: smoltcp sends the packet to the gateway's
+    /// MAC, the gateway L3-forwards it within the subnet, replies
+    /// come back through the gateway (which we DO receive unicast
+    /// from, since DHCP works).
+    ///
+    /// Caller is responsible for picking the right `hw` — usually
+    /// the gateway's MAC, read from `snapshot_neighbors()` after the
+    /// gateway has ARP'd us. Entry lifetime matches smoltcp's normal
+    /// ENTRY_LIFETIME (60 s) — call again to refresh.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn add_neighbor_entry(
+        &self,
+        addr: smoltcp::wire::IpAddress,
+        hw: smoltcp::wire::HardwareAddress,
+    ) {
+        let timestamp = instant_to_smoltcp(Instant::now());
+        self.with_mut(|i| {
+            i.iface.neighbor_cache_mut().fill(addr, hw, timestamp);
+        });
+    }
+
     /// Set the IPv4 configuration.
     #[cfg(feature = "proto-ipv4")]
     pub fn set_config_v4(&self, config: ConfigV4) {

@@ -362,6 +362,55 @@ async fn request_with_full_body(
         }
     }
 
+    // ── Static-ARP-to-gateway preflight (task #123) ─────────────────
+    // Before opening a socket, check the neighbor cache. If the target
+    // IP isn't there but the gateway is, pre-populate (target →
+    // gateway_mac) so smoltcp's first SYN goes to a known L2 dest.
+    // The gateway then L3-forwards within its subnet. Bypasses the
+    // AP-side "client-to-client unicast blackhole" pattern observed on
+    // UniFi (see reference_unifi_esp32_settings memory). Idempotent —
+    // if the real ARP entry arrives later, smoltcp updates the cache.
+    {
+        let neighbors = stack.snapshot_neighbors(16);
+        let target_smol = match addr {
+            embassy_net::IpAddress::Ipv4(a) => Some(
+                smoltcp::wire::IpAddress::Ipv4(
+                    smoltcp::wire::Ipv4Address::from(a.octets()),
+                ),
+            ),
+            _ => None,
+        };
+        let already_resolved = target_smol
+            .as_ref()
+            .map(|t| neighbors.iter().any(|e| &e.addr == t))
+            .unwrap_or(true);
+        let gw_mac = if !already_resolved {
+            neighbors
+                .iter()
+                .find(|e| {
+                    if let Some(cfg) = stack.config_v4() {
+                        if let Some(gw_ip) = cfg.gateway {
+                            let gw_smol =
+                                smoltcp::wire::Ipv4Address::from(gw_ip.octets());
+                            return matches!(e.addr,
+                                smoltcp::wire::IpAddress::Ipv4(ip) if ip == gw_smol);
+                        }
+                    }
+                    false
+                })
+                .map(|e| e.hw)
+        } else {
+            None
+        };
+        if let (Some(hw), Some(target)) = (gw_mac, target_smol) {
+            log::info!(
+                "http: [{} {}] preflight: populating ARP cache target={:?} via gateway={:?}",
+                method, path, target, hw
+            );
+            stack.add_neighbor_entry(target, hw);
+        }
+    }
+
     let mut socket = TcpSocket::new(**stack, &mut tcp_rx_buf[..], &mut tcp_tx_buf[..]);
     // Link-state probe right before the TCP connect attempt. If the
     // radio dropped between DHCP/IP-assignment and now (AP de-auth,
@@ -456,13 +505,12 @@ async fn request_with_full_body(
                     );
                 }
             }
-            // Retry-on-blackhole (task #117): we associated and DHCP'd
-            // successfully, but the AP is silently dropping unicast to
-            // our MAC. A force-reassociate kicks UniFi's bridge table
-            // into re-learning us. Done at most ONCE per HTTP call so
-            // a genuinely-down backend doesn't get hammered with
-            // re-associations every 10 seconds.
             drop(socket);
+
+            // ── force_reconnect fallback (task #117) ─────────────────
+            // Static-ARP preflight didn't save us — the actual SYN
+            // delivery is broken at L2 even with a known gateway MAC.
+            // Force a wifi reassociate and try once more.
             log::warn!(
                 "http: [{} {}] post-DHCP blackhole detected — forcing WiFi reconnect + 1 retry",
                 method, path
@@ -508,8 +556,8 @@ async fn request_with_full_body(
                     return Err(HttpError::SocketConnect);
                 }
             }
-            // Retry succeeded — `socket` has been replaced and control
-            // falls through to the exchange phase below.
+            // force_reconnect succeeded — `socket` has been replaced
+            // and control falls through to the exchange phase below.
         }
     }
 

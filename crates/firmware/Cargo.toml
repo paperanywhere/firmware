@@ -132,6 +132,11 @@ embassy-futures = "0.1"
 embassy-executor = "0.10"
 embassy-net = { version = "0.7", default-features = false, features = ["proto-ipv4", "medium-ethernet", "tcp", "dhcpv4", "dns"] }
 embassy-net-driver = "0.2"
+# Direct smoltcp dep so http.rs can refer to smoltcp::wire types when
+# populating the neighbor cache for the static-ARP-to-gateway fallback
+# (task #123). Vendored via the workspace [patch.crates-io] entry, same
+# as embassy-net.
+smoltcp = { version = "0.12", default-features = false, features = ["proto-ipv4", "medium-ethernet", "socket-tcp", "socket-dhcpv4", "socket-dns"] }
 embassy-sync = "0.8"
 # `generic-queue-8` enables a software timer queue that doesn't require
 # the calling task's waker to come from `embassy_executor`. We need it

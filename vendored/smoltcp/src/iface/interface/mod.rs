@@ -283,6 +283,17 @@ impl Interface {
         &self.inner.neighbor_cache
     }
 
+    /// Mutable access to the neighbor cache for inserting static
+    /// entries. Paperanywhere fork addition — needed for the
+    /// "route-via-gateway" fallback when an AP refuses to forward
+    /// ARP REPLY for client-to-client traffic. The consumer takes
+    /// the gateway's known MAC and populates `(target_ip →
+    /// gateway_mac)`; smoltcp then sends the packet to the gateway
+    /// and lets the gateway L3-forward within the subnet.
+    pub fn neighbor_cache_mut(&mut self) -> &mut super::neighbor::Cache {
+        &mut self.inner.neighbor_cache
+    }
+
     /// Get the HardwareAddress address of the interface.
     ///
     /// # Panics
