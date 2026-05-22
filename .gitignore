@@ -13,3 +13,14 @@ prov.bin
 # Standalone espflash binary the user dropped in (Windows .exe).
 espflash.exe
 espflash-x86_64-pc-windows-msvc.zip
+
+# Flash dumps + intermediate firmware bins produced during on-device
+# debugging (espflash read-flash, app slot inspection, etc.). Multi-
+# MB each, regenerated freely from the live device. The only `.bin`
+# inputs the build legitimately needs (e.g. compiled boot-screen
+# raster) live under `crates/*/target/` or are emitted from build.rs
+# into OUT_DIR, neither of which sits at the repo root.
+*.bin
+# Scratch packet-capture scripts the user drops in at the repo root
+# while diagnosing network issues. Not project code.
+.tmp_*
