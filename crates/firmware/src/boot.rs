@@ -583,6 +583,13 @@ pub fn run(resources: FirmwareResources) -> ! {
     executor.run(|spawner| {
         let net_token = crate::network::net_task(runner).expect("net_task pool");
         spawner.spawn(net_token);
+        // Periodic gratuitous-ARP announcer (task #125, re-enabled
+        // 2026-05-22). Keeps APs (UniFi) from aging out our MAC↔IP
+        // binding while the device sits idle on the adoption screen.
+        // Cost: one broadcast frame every 20 s.
+        let garp_token = crate::network::garp_refresh_task(stack_ref)
+            .expect("garp_refresh_task pool");
+        spawner.spawn(garp_token);
         // Periodic heartbeat: 5-second heap + chrome-state dumps so
         // a stuck wake gets a continuous "where things are" trace on
         // the serial monitor without needing a JTAG attach. Lives

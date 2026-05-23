@@ -564,6 +564,22 @@ impl<'d> Stack<'d> {
         self.with(|i| i.static_v6.clone())
     }
 
+    /// Queue a gratuitous ARP announce for our current IPv4 address.
+    /// Paperanywhere fork — used by a periodic ticker in firmware to
+    /// keep APs (UniFi in particular) from aging out our MAC↔IP
+    /// binding in their bridge tables. The actual emission happens
+    /// on the next embassy-net Runner poll via smoltcp's
+    /// `emit_pending_gratuitous_arp`. No-op if we don't currently
+    /// have a v4 address.
+    #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+    pub fn announce_self_v4(&self) {
+        self.with_mut(|i| {
+            if let Some(cfg) = &i.static_v4 {
+                i.iface.announce_address_v4(cfg.address.address());
+            }
+        });
+    }
+
     /// Snapshot the smoltcp neighbor cache. Paperanywhere fork only —
     /// answers the diagnostic question "is ARP resolving for the
     /// destinations we care about?". Each returned entry is the

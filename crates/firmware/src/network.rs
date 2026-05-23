@@ -50,3 +50,19 @@ pub fn build(
 pub async fn net_task(mut runner: Runner<'static, RadioInterface<'static>>) -> ! {
     runner.run().await
 }
+
+/// Periodic gratuitous-ARP announcer. Re-broadcasts our MAC↔IP
+/// binding every 20 s so APs that auto-age bridge-table entries
+/// (UniFi observed) don't forget where to forward unicast addressed
+/// to us. Wired hosts and the gateway latch onto the announce too.
+///
+/// Smoltcp does a single announce on DHCP bound; this keeps that
+/// behavior fresh. Cost: one broadcast Ethernet frame every 20 s
+/// (~60 B). Effectively free.
+#[embassy_executor::task]
+pub async fn garp_refresh_task(stack: &'static embassy_net::Stack<'static>) -> ! {
+    loop {
+        embassy_time::Timer::after(embassy_time::Duration::from_secs(20)).await;
+        stack.announce_self_v4();
+    }
+}
