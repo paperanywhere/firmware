@@ -87,19 +87,22 @@ pub struct FirmwareResources {
     // the SD's `CriticalSectionDevice` can draw against the same bus.
     pub sd: Option<crate::sd::SdHardware>,
 
-    // ── Second-core embassy executor (reserved) ──
+    // ── Second-core embassy executor ──
     //
-    // Captured but not yet consumed. The plan was to spawn the embassy-net
-    // runner on core 1; that's blocked by `embassy_net::Runner: !Send`, so
-    // we'll re-target these for a panel-refresh worker (or whatever post-
-    // async-refactor concurrency we want) instead. Keeping the handles
-    // claimed here means main.rs doesn't have to remember to re-extract
-    // them once we have a consumer.
-    /// The second core's control peripheral.
-    #[allow(dead_code)]
+    // The second core's control peripheral.
     pub cpu_ctrl: CPU_CTRL<'static>,
-    /// Software interrupt 1 — mirrors `sw_int0` on core 0.
-    #[allow(dead_code)]
+    /// Software interrupt 1 — esp-rtos's scheduler trampoline on core 1.
     pub sw_int1: SoftwareInterrupt<'static, 1>,
+
+    // ── Network-priority interrupt executor ──
+    //
+    // sw_int2 backs the `InterruptExecutor` that hosts `net_task`
+    // (and friends) on core 0 at Priority3. SoftwareInterrupt 3 is
+    // reserved for a future second high-priority queue if we ever
+    // promote another latency-sensitive task. See `boot::run` for
+    // the rationale + setup.
+    pub sw_int2: SoftwareInterrupt<'static, 2>,
+    #[allow(dead_code)]
+    pub sw_int3: SoftwareInterrupt<'static, 3>,
     // Future: SPI2 / DMA channels for panel, ADC1 for battery, etc.
 }

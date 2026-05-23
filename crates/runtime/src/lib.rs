@@ -302,6 +302,22 @@ where
             paperanywhere_ports::WifiLinkState::Connecting,
         ))
         .await;
+    // Take the battery sample BEFORE wifi.associate so the very first
+    // boot-screen paint shows a real percentage. The ADC read is sub-ms
+    // and divider bleed is bounded by the gauge's own enable-gate, so
+    // moving it ahead of the (potentially multi-second) associate has
+    // no power-budget cost. Published into chrome immediately + sent
+    // to the actor so the bar widget sees it on first compose.
+    let battery_sample = battery.sample().await;
+    if let Some(ref s) = battery_sample {
+        info!("wake: battery {}mv ({}%)", s.mv, s.percent);
+    }
+    chrome::set_battery(battery_sample);
+    paint::submit_silent(paint, PaintCmd::UpdateChrome {
+            battery_mv: battery_sample.map(|s| s.mv),
+            rssi_dbm: None,
+        })
+        .await;
     info!("wake: associating to SSID \"{}\"", creds.ssid.as_str());
     let assoc_result = wifi.associate(&creds).await;
     if let Err(e) = assoc_result {
@@ -323,16 +339,9 @@ where
         return Err(WakeError::WifiAssociate);
     }
     info!("wake: wifi associated ok");
-    // One battery sample per wake. Published straight into chrome so
-    // the status bar's battery widget refreshes alongside the rssi
-    // sample the actor publishes via UpdateChrome below. Doing it
-    // once at the top of the wake cycle (rather than on every paint)
-    // keeps the divider's bleed current bounded.
-    let battery_sample = battery.sample().await;
-    if let Some(ref s) = battery_sample {
-        info!("wake: battery {}mv ({}%)", s.mv, s.percent);
-    }
-    chrome::set_battery(battery_sample);
+    // Refresh chrome with the live RSSI now that we're associated. The
+    // battery sample taken pre-associate is still current; we just need
+    // to push the new rssi reading so the wifi-cell flips to Connected.
     paint::submit_silent(paint, PaintCmd::UpdateChrome {
             battery_mv: battery_sample.map(|s| s.mv),
             rssi_dbm: wifi.rssi_dbm(),

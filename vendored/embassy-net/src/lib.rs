@@ -1026,7 +1026,10 @@ impl<'d, D: Driver> Runner<'d, D> {
     ///
     /// You must call this in a background task, to process network events.
     pub async fn run(&mut self) -> ! {
-        // Cross-core waker workaround (paperanywhere task #104).
+        // Wake-driven poll with a backstop ticker (paperanywhere
+        // 2026-05-23 retuning, was 2 ms in task #104).
+        //
+        // # Why this exists
         //
         // The upstream embassy-net runner parks on its waker after
         // each poll, relying on socket / device wakers to wake it
@@ -1036,19 +1039,45 @@ impl<'d, D: Driver> Runner<'d, D> {
         // and net_task on core 0; esp-rtos's IPI-based cross-core
         // wakers don't reliably cross the executor boundary, so
         // when core 1's `socket.connect()` modifies stack state,
-        // the wake never reaches core 0's runner — TCP handshake
-        // sits idle until something else (the 5-second heartbeat
-        // task) happens to wake core 0's executor.
+        // the wake doesn't always reach core 0's runner.
         //
-        // Fix: poll the stack on a 2 ms ticker instead of relying
-        // on wakers. Each iteration runs smoltcp's poll once + an
-        // embassy_time::Timer await. Cost: ~500 polls/sec when
-        // idle (smoltcp's poll is cheap — interface state check
-        // + state machine tick). Under load it's the same poll
-        // rate as before, just driven by the timer rather than
-        // the (cross-core-broken) waker.
-        let ticker = embassy_time::Duration::from_millis(2);
+        // # The 2 ms regression
+        //
+        // The original mitigation (task #104) polled every 2 ms.
+        // That worked for waker reliability but cost ~500 polls/sec
+        // of core-0 CPU. With runtime co-located on core 0 at the
+        // time, esp-radio's MAC kernel threads still got CPU because
+        // the embassy executor ran cooperatively alongside them.
+        // After the runtime moved back to core 1 (2026-05-23) the
+        // ticker became the *only* significant work on core 0's
+        // thread-mode executor — and the polls themselves are short,
+        // so net_task ran almost continuously, starving esp-radio's
+        // MAC threads. Symptom: `tx_denied` saturated (radio TX
+        // queue can't drain), AP de-auths us after the
+        // ESP_WIFI_AP_STA_INACTIVITY_TIMER window (~6 s) without
+        // our esp-radio noticing, and outbound TCP / ARP traffic
+        // goes into a silent black hole.
+        //
+        // # New behaviour
+        //
+        // Park on the waker (the upstream design — `poll_fn` registers
+        // it and returns Pending until smoltcp signals work). The
+        // backstop ticker fires every 100 ms instead of 2 ms — slow
+        // enough that esp-radio always gets the CPU it needs to
+        // service the radio, fast enough that a dropped cross-core
+        // waker only delays the next user-visible action by at most
+        // 100 ms (TCP RTO is 1 s+ anyway). Idle CPU usage on core 0
+        // drops from ~30% to under 1%.
+        //
+        // If a future esp-rtos / esp-radio combination publishes
+        // reliable cross-core wakers, the backstop can be dropped
+        // entirely and we fall through to pure waker-driven polling.
+        let backstop = embassy_time::Duration::from_millis(100);
         loop {
+            // poll_fn here parks on smoltcp's per-stack waker — when
+            // a socket method on any core modifies state, the waker
+            // resolves the future and we re-enter the poll. The
+            // Timer below is the safety net for the cross-core case.
             poll_fn(|cx| {
                 crate::diag::NET_RUNNER_POLLS
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1056,7 +1085,7 @@ impl<'d, D: Driver> Runner<'d, D> {
                 Poll::Ready(())
             })
             .await;
-            embassy_time::Timer::after(ticker).await;
+            embassy_time::Timer::after(backstop).await;
         }
     }
 }

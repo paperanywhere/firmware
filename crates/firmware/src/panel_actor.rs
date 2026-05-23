@@ -202,28 +202,42 @@ pub async fn panel_actor_task(
             PaintCmd::ShowHalt { .. } => current_view = CurrentView::Halt,
             PaintCmd::ShowImage { .. } => current_view = CurrentView::Image,
             PaintCmd::ChromeChanged(kind) => {
-                // Re-render the CURRENT view (not unconditionally
-                // boot). Only the boot screen is currently chrome-
-                // driven enough to benefit from a chrome-triggered
-                // refresh — adoption / image / halt all carry their
-                // own args through PaintCmd, so they need an
-                // explicit ShowXxx to re-render. Once #97 phase 2
-                // migrates those args into chrome too, this match
-                // grows arms for each view.
-                match current_view {
+                // Re-render the CURRENT view. Boot needs the column
+                // block rebuilt (Network / Firmware / Device columns
+                // read chrome directly), so we call redraw_boot_screen
+                // first. Every other live view has its main-region
+                // content baked into the framebuffer by an earlier
+                // ShowXxx and only reads chrome through the status bar
+                // — `panel.compose()` (called inside commit_view)
+                // repaints just the status bar over the existing main
+                // region, so a chrome change (battery sample, status
+                // label, last-update stamp) lands as a fast-LUT
+                // status-bar refresh without disturbing the underlying
+                // image/adoption/halt content. Halt is intentionally
+                // skipped: the halt screen is a terminal view and the
+                // actor stops refreshing once it lands.
+                let should_refresh = match current_view {
                     CurrentView::Boot => {
-                        if matches!(kind, RefreshKind::Full) {
-                            panel.force_full_next_refresh();
-                        }
                         panel.redraw_boot_screen();
-                        commit_view(panel, &mut last_painted_hash, "chrome-boot").await;
+                        true
                     }
-                    other => {
+                    CurrentView::Main
+                    | CurrentView::Adoption
+                    | CurrentView::PlaylistPage
+                    | CurrentView::Image => true,
+                    CurrentView::Halt => {
                         log::debug!(
-                            "panel_actor: ChromeChanged({:?}) suppressed in {:?} view (re-render needs explicit ShowXxx)",
-                            kind, other
+                            "panel_actor: ChromeChanged({:?}) suppressed in Halt view",
+                            kind,
                         );
+                        false
                     }
+                };
+                if should_refresh {
+                    if matches!(kind, RefreshKind::Full) {
+                        panel.force_full_next_refresh();
+                    }
+                    commit_view(panel, &mut last_painted_hash, "chrome").await;
                 }
                 mark_processed(seq);
                 continue;
@@ -288,19 +302,15 @@ async fn handle_cmd(
 
         // ── View transitions (full refresh via compositor's
         //    force_full_next_refresh; hash-dedup skips no-ops) ──
-        //    RedrawBootScreen is treated as a transition-grade refresh:
-        //    when the runtime sends it (post-DHCP, to surface real
-        //    network info), the user expects a clear, unmistakable
-        //    visual change. Fast-LUT updates of small text inside the
-        //    Network column ("connecting..." → "10.0.1.229") looked
-        //    too subtle to register as an update — the panel appeared
-        //    "frozen" between the pre-DHCP and post-DHCP states. Force
-        //    full-LUT here so the populated boot screen lands as a
-        //    clean repaint. The subsequent UpdateBootCountdown ticks
-        //    still use fast LUT (the layout doesn't shift; only the
-        //    bottom row's digit changes).
+        //    RedrawBootScreen is NOT a view transition — it's the same
+        //    boot template with newer Network/IP/Gateway values landed
+        //    after DHCP. Fast LUT cleanly walks the dirty text columns
+        //    without ghosting since the layout doesn't shift, and we
+        //    avoid the full-screen flash that previously fired between
+        //    the pre- and post-DHCP boot screens. The periodic
+        //    FULL_REFRESH_EVERY counter in the compositor still picks
+        //    up any cumulative residual on its own cadence.
         PaintCmd::RedrawBootScreen => {
-            panel.force_full_next_refresh();
             panel.redraw_boot_screen();
             commit_view(panel, last_painted_hash, "boot").await;
         }

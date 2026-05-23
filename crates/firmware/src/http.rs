@@ -111,18 +111,51 @@ impl FwHttp {
 /// by the provisioning step.
 const DEFAULT_BACKEND_URL: &str = "http://192.168.1.100:8080";
 
+/// Lenient URL parser. Accepts the canonical `http://host[:port][/path]` /
+/// `https://host[:port][/path]` forms AND a handful of common malformations
+/// people produce by hand-editing `provision.env`:
+///
+/// * `http:/host:port`  — single slash typo
+/// * `http:host:port`   — both slashes missing
+/// * `host:port`        — no scheme at all (assumed HTTP)
+///
+/// The reason this matters: if the URL doesn't parse, FwHttp silently
+/// falls back to `DEFAULT_BACKEND_URL` (a hardcoded IP that's almost
+/// never reachable from the user's network). The user then sees "TCP
+/// SYN to 192.168.1.100 times out" / "device drops connection" with no
+/// hint that the actual problem is a missing slash in their provisioning
+/// blob. Better to repair the obvious typos at the parser layer than to
+/// debug the symptom miles downstream.
 fn parse_backend_url(url: &str) -> Option<(Scheme, String, u16)> {
+    let url = url.trim();
     let (scheme, rest, default_port) = if let Some(r) = url.strip_prefix("https://") {
+        (Scheme::Https, r, 443u16)
+    } else if let Some(r) = url.strip_prefix("https:/") {
+        // single-slash typo, e.g. "https:/host"
+        (Scheme::Https, r, 443u16)
+    } else if let Some(r) = url.strip_prefix("https:") {
+        // no-slash typo, e.g. "https:host:port"
         (Scheme::Https, r, 443u16)
     } else if let Some(r) = url.strip_prefix("http://") {
         (Scheme::Http, r, 80u16)
+    } else if let Some(r) = url.strip_prefix("http:/") {
+        (Scheme::Http, r, 80u16)
+    } else if let Some(r) = url.strip_prefix("http:") {
+        (Scheme::Http, r, 80u16)
+    } else if !url.is_empty() && !url.starts_with('/') {
+        // No scheme at all — treat as HTTP. Bare ip:port is common in
+        // dev provisioning.
+        (Scheme::Http, url, 80u16)
     } else {
         return None;
     };
     let host_port = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = match host_port.split_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().ok()?),
-        None => (host_port.to_string(), default_port),
+    if host_port.is_empty() {
+        return None;
+    }
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() => (h.to_string(), p.parse().ok()?),
+        _ => (host_port.to_string(), default_port),
     };
     Some((scheme, host, port))
 }

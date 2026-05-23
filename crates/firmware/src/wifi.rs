@@ -14,6 +14,8 @@
 use alloc::string::String;
 
 use embassy_futures::select::{Either, select};
+use embassy_net::Stack;
+use embassy_net::tcp::TcpSocket;
 use embassy_time::{Duration, Timer};
 use esp_hal::interrupt::software::SoftwareInterrupt;
 use esp_hal::peripherals::{RNG, TIMG0, WIFI};
@@ -131,6 +133,11 @@ impl FwWifi {
                 if let Some(cfg) = stack.config_v4() {
                     self.cache_lease(&cfg);
                 }
+                // Warm the gateway's ARP entry before the runtime
+                // sends anything user-facing. See `warm_gateway_arp`
+                // for the why — without this, AP-isolated networks
+                // wedge every subsequent same-subnet TCP attempt.
+                warm_gateway_arp(*stack).await;
                 true
             }
             embassy_futures::select::Either::Second(()) => {
@@ -331,6 +338,24 @@ impl WifiLink for FwWifi {
     type Error = WifiError;
 
     async fn associate(&mut self, creds: &WifiCreds) -> Result<(), Self::Error> {
+        use core::sync::atomic::Ordering;
+        // Connectivity-watchdog override. When the L2 link looks fine
+        // but no packets are landing (AP bridge-table blackhole,
+        // driver queue stall, silent DHCP loss), the watchdog task
+        // raises FORCE_REASSOCIATE; we consume it here to bypass the
+        // "already associated" short-circuit and force a real
+        // disconnect → re-associate sequence. See network.rs::
+        // connectivity_watchdog_task for the silent-failure modes
+        // this catches.
+        let forced = crate::network::FORCE_REASSOCIATE
+            .swap(false, Ordering::AcqRel);
+        if forced && self.associated {
+            log::warn!(
+                "wifi: watchdog forced re-associate — disconnecting current session"
+            );
+            let _ = self.controller.disconnect_async().await;
+            self.associated = false;
+        }
         // Already-connected short-circuit BUT only when we can prove
         // we're still actually on the network. The bug we fixed here:
         // a one-way `associated = true` flag is sticky across radio
@@ -536,4 +561,97 @@ pub(crate) async fn force_reconnect_via_handoff() -> Result<(), WifiError> {
 pub fn captive_portal() -> Result<(), WifiError> {
     esp_println::println!("wifi: captive portal stub (needs IP stack)");
     Err(WifiError::ConnectFailed)
+}
+
+/// Force smoltcp to ARP-resolve the gateway so subsequent HTTP calls
+/// can use the `target → gateway_mac` preflight in `http.rs`. The
+/// canonical "AP wireless-client-isolation" failure mode is:
+///
+/// 1. Device joins WiFi, DHCP completes (broadcast / unicast-via-AP
+///    work — only `DHCP server → us` unicast is touched).
+/// 2. Runtime tries to connect to backend on same subnet (e.g.
+///    `10.20.110.42` from `10.20.110.45`).
+/// 3. Smoltcp ARPs `.42` — broadcast goes out, AP drops it under
+///    client isolation, no reply arrives, neighbor cache stays empty.
+/// 4. TCP SYN sits in `SynSent` forever, eventually we time out.
+///
+/// The existing preflight in `http.rs::request_with_full_body` covers
+/// step 3 by manually inserting `(target → gateway_mac)` into the
+/// neighbor cache, but only if the gateway is already there. The
+/// gateway's MAC is implicitly known after DHCP unicast renew traffic
+/// flows through it, but on a fresh boot DHCP completes broadcast-only
+/// and the cache stays empty until we send something off-subnet.
+///
+/// This function forces that "send something off-subnet" by opening
+/// a short-lived TCP socket to `gateway:80`. We don't care whether
+/// the gateway listens on :80 — what matters is that smoltcp emits
+/// an ARP request for the gateway and processes the reply. After
+/// this call, the neighbor cache has a fresh entry for the gateway,
+/// the preflight can hand out the gateway's MAC for any same-subnet
+/// target, and HTTP works under client isolation just like it would
+/// on a flat un-isolated LAN.
+///
+/// No-op when there's no gateway configured (point-to-point IP, link-
+/// local only, etc.). Always returns; never propagates errors — this
+/// is a best-effort warmup and a failure here just means the next
+/// HTTP attempt will eat the ARP timeout on its own.
+async fn warm_gateway_arp(stack: Stack<'static>) {
+    let Some(cfg) = stack.config_v4() else {
+        return;
+    };
+    let Some(gw) = cfg.gateway else {
+        log::info!("wifi: warmup skipped — DHCP didn't include a gateway");
+        return;
+    };
+    log::info!("wifi: warmup — TCP probe to gateway {:?}:80 to populate ARP cache", gw);
+
+    let mut rx_buf = [0u8; 256];
+    let mut tx_buf = [0u8; 256];
+    let mut sock = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+    sock.set_timeout(Some(Duration::from_secs(2)));
+
+    // 2 s window — enough for ARP round-trip on a healthy LAN
+    // (typically <10 ms), short enough that a missing gateway doesn't
+    // hold up boot. ConnectionReset / ConnectionRefused / Timeout
+    // are all fine outcomes: the ARP request went out either way.
+    // Log each outcome distinctly so a user staring at the serial
+    // monitor can tell "warmup hit a real service" from "warmup
+    // got the ARP it wanted but no service was listening" from
+    // "warmup got nothing back at all" — the last case is the
+    // smoking gun for an AP / link problem and worth surfacing.
+    let connect_fut = sock.connect((
+        embassy_net::IpAddress::Ipv4(gw),
+        80u16,
+    ));
+    match embassy_time::with_timeout(
+        Duration::from_secs(2),
+        connect_fut,
+    )
+    .await
+    {
+        Ok(Ok(())) => log::info!("wifi: warmup — gateway:80 connect OK"),
+        Ok(Err(e)) => log::info!("wifi: warmup — gateway:80 connect err {:?} (ARP still populated)", e),
+        Err(_) => log::warn!("wifi: warmup — gateway:80 connect TIMEOUT (2s); ARP may still be populated by the SYN attempt"),
+    }
+
+    // Best-effort close; if the connect succeeded we want the FIN
+    // out so the gateway doesn't hold a half-open socket.
+    sock.close();
+
+    let neighbors = stack.snapshot_neighbors(8);
+    let gw_in_cache = neighbors.iter().any(|e| {
+        matches!(
+            e.addr,
+            smoltcp::wire::IpAddress::Ipv4(ip)
+                if ip.octets() == gw.octets()
+        )
+    });
+    if gw_in_cache {
+        log::info!("wifi: warmup OK — gateway ARP cached");
+    } else {
+        log::warn!(
+            "wifi: warmup completed but gateway STILL not in ARP cache — \
+             AP may be dropping ARP REPLY too"
+        );
+    }
 }

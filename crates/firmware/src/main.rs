@@ -255,6 +255,8 @@ fn main() -> ! {
         board,
         timg0: peripherals.TIMG0,
         sw_int0: sw_ints.software_interrupt0,
+        sw_int2: sw_ints.software_interrupt2,
+        sw_int3: sw_ints.software_interrupt3,
         rng: peripherals.RNG,
         wifi: peripherals.WIFI,
         lpwr: peripherals.LPWR,

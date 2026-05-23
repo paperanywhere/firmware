@@ -160,6 +160,8 @@ pub fn run(resources: FirmwareResources) -> ! {
         flash,
         cpu_ctrl,
         sw_int1,
+        sw_int2,
+        sw_int3: _sw_int3,
         panel,
         battery,
         sd,
@@ -527,6 +529,18 @@ pub fn run(resources: FirmwareResources) -> ! {
     let identity_ref: &'static paperanywhere_ports::DeviceIdentity =
         IDENTITY_CELL.init(identity);
 
+    // Network-priority InterruptExecutor was attempted here (SWI2 at
+    // Priority3) but panicked on esp-rtos's `current_task()` from an
+    // esp-radio internal path that doesn't tolerate ISR context.
+    // Backed out 2026-05-23; sw_int2/sw_int3 stay reserved for a
+    // future revival once esp-rtos exposes ISR-safe equivalents of
+    // its task-aware primitives. For now the core-1 isolation of
+    // runtime (below) is the load-bearing change: core 0's thread-
+    // mode executor only hosts net_task + garp + heartbeat, so panel
+    // SPI bursts and the wake-cycle state machine on core 1 no
+    // longer compete with packet polling for CPU time.
+    let _ = sw_int2;
+
     let app_stack = APP_CORE_STACK.init(CoreStack::new());
     esp_rtos::start_second_core(
         cpu_ctrl,
@@ -558,7 +572,7 @@ pub fn run(resources: FirmwareResources) -> ! {
             let core1_executor =
                 CORE1_EXECUTOR.init(esp_rtos::embassy::Executor::new());
             core1_executor.run(|spawner| {
-                // Panel actor: unchanged.
+                // Panel actor on core 1.
                 let actor_token = panel_actor::panel_actor_task(
                     panel_ref,
                     &PAINT_CHANNEL,
@@ -566,62 +580,81 @@ pub fn run(resources: FirmwareResources) -> ! {
                 )
                 .expect("panel_actor_task pool");
                 spawner.spawn(actor_token);
-                // DIAG (task #117): runtime moved BACK to core 0 to
-                // share an executor with net_task. Tests whether the
-                // cross-core arrangement is what's breaking TCP
-                // connect (SYN goes out but never completes
-                // handshake). The unused captures below are kept so
-                // the closure still compiles; runtime spawn is now
-                // in core 0's executor.run below.
-                let _ = (wifi_ref_core1, http_ref_core1, nvs_ref,
-                         sleeper_ref, ota_ref, battery_ref);
+                // Runtime back on core 1 alongside the panel actor
+                // (restoring the layout from commit 049434c). The
+                // diag #117 detour that co-located runtime with
+                // net_task on core 0 was a workaround for cross-core
+                // wakers not propagating reliably — that issue is now
+                // covered by the 2 ms ticker in `Runner::run`
+                // (commit 24fdd34), which polls smoltcp at 500 Hz
+                // regardless of which executor woke it. With the
+                // runtime back here, core 0 hosts only network work
+                // (net_task + garp_refresh_task + heartbeat) so panel
+                // SPI bursts, framebuffer recomposes, and the
+                // wake-cycle state machine on core 1 can't starve
+                // TCP / DHCP / DNS polling on core 0 — addresses the
+                // "network occasionally drops" symptom.
+                let rt_token = runtime_task(
+                    wifi_ref_core1,
+                    http_ref_core1,
+                    nvs_ref,
+                    sleeper_ref,
+                    ota_ref,
+                    battery_ref,
+                    policy,
+                    identity_ref.clone(),
+                    &OTA_PROGRESS,
+                    &PAINT_CHANNEL,
+                )
+                .expect("runtime_task pool");
+                spawner.spawn(rt_token);
             });
         },
     );
 
-    // Core 0's executor: net_task + heartbeat only. esp-radio's
-    // embassy-net Runner has a hard core-0 pin (esp-wifi-sys#412),
-    // so net_task can't migrate — but every other path moved to
-    // core 1 once the embassy-net fork made `&Stack` Sync. Removing
-    // the proxies also removed the per-blob `Vec<u8>` buffer in
-    // stream_blob, which was the prime OOM suspect on /state.
+    // Core 0's thread-mode executor: net_task + garp + heartbeat.
+    // esp-radio's embassy-net Runner has a hard core-0 pin
+    // (esp-wifi-sys#412), so net_task can't migrate. With runtime
+    // on core 1 (see start_second_core block above), nothing
+    // application-side competes with the network stack here — panel
+    // SPI bursts, framebuffer composes, and the wake-cycle state
+    // machine all live on core 1. The 2 ms ticker in `Runner::run`
+    // (commit 24fdd34) keeps smoltcp polling regardless of waker
+    // propagation.
     let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
     executor.run(|spawner| {
         let net_token = crate::network::net_task(runner).expect("net_task pool");
         spawner.spawn(net_token);
-        // Periodic gratuitous-ARP announcer (task #125, re-enabled
-        // 2026-05-22). Keeps APs (UniFi) from aging out our MAC↔IP
-        // binding while the device sits idle on the adoption screen.
-        // Cost: one broadcast frame every 20 s.
+        // Periodic gratuitous-ARP announcer (task #125). Keeps APs
+        // (UniFi) from aging out our MAC↔IP binding while the device
+        // sits idle. Cost: one broadcast frame every 20 s.
         let garp_token = crate::network::garp_refresh_task(stack_ref)
             .expect("garp_refresh_task pool");
         spawner.spawn(garp_token);
-        // Periodic heartbeat: 5-second heap + chrome-state dumps so
-        // a stuck wake gets a continuous "where things are" trace on
-        // the serial monitor without needing a JTAG attach. Lives
-        // on core 0 alongside net_task so it can't itself be
-        // starved by application work.
+        // Unicast keepalive — short TCP probe to gateway every 10 s.
+        // Some APs (UniFi observed) only refresh their STA bridge
+        // entry on unicast traffic from the client; broadcast gARP
+        // alone leaves us aging out, which manifests as "pings work
+        // for 30 s after the device transmits, then fail until the
+        // next wake cycle". See network.rs::gateway_keepalive_task
+        // for the full reasoning.
+        let keepalive_token = crate::network::gateway_keepalive_task(stack_ref)
+            .expect("gateway_keepalive_task pool");
+        spawner.spawn(keepalive_token);
+        // Connectivity watchdog. If the link looks up but no packets
+        // are landing (AP blackhole / driver queue stall / silent
+        // DHCP loss), it raises FORCE_REASSOCIATE for the runtime to
+        // pick up on its next wake — see network.rs::connectivity_
+        // watchdog_task for the full failure-mode breakdown.
+        let wd_token = crate::network::connectivity_watchdog_task(stack_ref)
+            .expect("connectivity_watchdog_task pool");
+        spawner.spawn(wd_token);
+        // 5-second heartbeat: heap + chrome-state dumps so a stuck
+        // wake gets a continuous "where things are" trace on the
+        // serial monitor without needing a JTAG attach.
         let diag_token =
             crate::diagnostics::heartbeat_task().expect("heartbeat_task pool");
         spawner.spawn(diag_token);
-        // DIAG (task #117): runtime co-located with net_task on
-        // core 0 instead of core 1. Same executor → smoltcp's
-        // wakers fire in-executor instead of crossing the IPI
-        // boundary that's been breaking TCP handshake.
-        let rt_token = runtime_task(
-            wifi_ref,
-            http_ref,
-            nvs_ref,
-            sleeper_ref,
-            ota_ref,
-            battery_ref,
-            policy,
-            identity_ref.clone(),
-            &OTA_PROGRESS,
-            &PAINT_CHANNEL,
-        )
-        .expect("runtime_task pool");
-        spawner.spawn(rt_token);
     })
 }
 

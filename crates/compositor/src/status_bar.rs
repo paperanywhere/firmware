@@ -17,7 +17,7 @@ use embedded_graphics::{
     geometry::{Point, Size},
     mono_font::{
         MonoTextStyle,
-        ascii::{FONT_4X6, FONT_6X10, FONT_8X13_BOLD},
+        ascii::{FONT_6X10, FONT_8X13_BOLD},
     },
     pixelcolor::BinaryColor,
     prelude::*,
@@ -160,8 +160,27 @@ pub fn render(
         right = next_right - 1;
     }
 
-    // Everything to the left of `right` is the info-text region.
-    draw_left_info(&mut target, &status, inset + 6, right);
+    // Left-side cells, laid out left-to-right starting just inside the
+    // border. Same fixed-width pattern as the right side: each cell
+    // reserves enough room for its widest content so its left/right
+    // edges never shift, followed by a 1 px vertical divider on the
+    // cell's RIGHT edge. We bail out as soon as the next cell would
+    // collide with the right-side cells' `right` boundary — partial
+    // cells would either ghost on the fast LUT or get clipped mid-
+    // glyph, neither of which is worth the extra logic to recover.
+    let mut left = inset;
+    let cell_width = draw_status_cell(&mut target, left, status.device_status);
+    if left + cell_width < right {
+        left += cell_width;
+        draw_vertical_divider(&mut target, left, status_bar_height);
+        left += 1;
+        let cell_width = draw_last_update_cell(&mut target, left, status.last_update_local.as_deref());
+        if left + cell_width < right {
+            left += cell_width;
+            draw_vertical_divider(&mut target, left, status_bar_height);
+        }
+    }
+    let _ = left; // suppress unused-assignment warning when no more cells follow
 }
 
 fn draw_border(target: &mut Mono1bppTarget<'_>, width_px: u32, height_px: u32) {
@@ -406,55 +425,74 @@ fn draw_usb_cell(target: &mut Mono1bppTarget<'_>, right_edge: i32) -> i32 {
     ICON_W + PADDING
 }
 
-// ── Left-side info text ─────────────────────────────────────────────────────
+// ── Left-side cells ─────────────────────────────────────────────────────────
 
-fn draw_left_info(
+fn draw_status_cell(
     target: &mut Mono1bppTarget<'_>,
-    status: &paperanywhere_ports::chrome::ChromeState,
-    left_x: i32,
-    right_limit: i32,
-) {
-    let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
-    let baseline = (target.height as i32) / 2 + 4;
+    left_edge: i32,
+    status: DeviceStatus,
+) -> i32 {
+    // Fixed-width device-status cell. Cell capacity matches the longest
+    // possible value ("STATUS: downloading configuration", 33 chars)
+    // so the cell's right edge never shifts as the device transitions
+    // between lifecycle states — the fast LUT walks shorter labels'
+    // trailing whitespace cleanly. Pattern mirrors the right-side
+    // cells (LEFT_PAD + text + RIGHT_PAD, left-aligned within the cell).
+    const LEFT_PAD: i32 = 4;
+    const RIGHT_PAD: i32 = 4;
+    const CHAR_PX: i32 = 6;
+    const MAX_CHARS: i32 = 33; // "STATUS: downloading configuration"
+    let cell_width = LEFT_PAD + MAX_CHARS * CHAR_PX + RIGHT_PAD;
 
-    // "Status: <state>   |   Last Update: HH:MM" — left-side text.
-    // Status is the device's lifecycle phase (booting / connecting /
-    // downloading configuration / updating / stalled / ready). IP +
-    // Device UUID live on the boot screen, not here.
-    let mut line: HString<96> = HString::new();
-    let _ = line.push_str("Status: ");
-    let _ = line.push_str(status.device_status.label());
-    let _ = line.push_str("   |   Last Update: ");
-    match status.last_update_local.as_ref() {
+    let mut text: HString<48> = HString::new();
+    let _ = text.push_str("STATUS: ");
+    let _ = text.push_str(status.label());
+
+    draw_cell_text(target, left_edge + LEFT_PAD, text.as_str());
+    cell_width
+}
+
+fn draw_last_update_cell(
+    target: &mut Mono1bppTarget<'_>,
+    left_edge: i32,
+    last_update: Option<&str>,
+) -> i32 {
+    // "LAST UPDATE: HH:MM" — 18 chars. The clock string is always
+    // 5 chars (HH:MM) or 2 chars ("--") padded to keep the value's
+    // trailing edge inside the cell on the same pixel every refresh.
+    const LEFT_PAD: i32 = 4;
+    const RIGHT_PAD: i32 = 4;
+    const CHAR_PX: i32 = 6;
+    const MAX_CHARS: i32 = 18; // "LAST UPDATE: HH:MM"
+    let cell_width = LEFT_PAD + MAX_CHARS * CHAR_PX + RIGHT_PAD;
+
+    let mut text: HString<24> = HString::new();
+    let _ = text.push_str("LAST UPDATE: ");
+    match last_update {
         Some(t) => {
-            let _ = line.push_str(t.as_str());
+            let _ = text.push_str(t);
         }
         None => {
-            let _ = line.push_str("--");
+            let _ = text.push_str("--");
         }
     }
 
-    // Clip naively to the available width by chopping the string at
-    // 6 px per char. Past the trim point we just lose the trailing
-    // characters; the alternative (ellipsis logic) isn't worth the
-    // bytes today.
-    let max_chars = ((right_limit - left_x) / 6).max(0) as usize;
-    let s = if line.len() > max_chars {
-        &line.as_str()[..max_chars]
-    } else {
-        line.as_str()
-    };
+    draw_cell_text(target, left_edge + LEFT_PAD, text.as_str());
+    cell_width
+}
 
-    let _ = Text::with_text_style(
-        s,
-        Point::new(left_x, baseline),
-        style,
-        TextStyleBuilder::new()
-            .alignment(Alignment::Left)
-            .baseline(Baseline::Bottom)
-            .build(),
-    )
-    .draw(target);
+/// Shared text-rendering helper for the bar's cells. Uses the same
+/// font + baseline as the right-side widgets so the bar reads as one
+/// row of consistent cells.
+fn draw_cell_text(target: &mut Mono1bppTarget<'_>, text_x: i32, text: &str) {
+    let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+    let left_aligned = TextStyleBuilder::new()
+        .alignment(Alignment::Left)
+        .baseline(Baseline::Middle)
+        .build();
+    let baseline_y = (target.height as i32) / 2;
+    let _ = Text::with_text_style(text, Point::new(text_x, baseline_y), style, left_aligned)
+        .draw(target);
 }
 
 // ── Boot-screen overlay (used by boot.rs after the logo lands) ───────────────
@@ -499,11 +537,6 @@ pub fn draw_build_info(
 
     let body_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
     let header_style = MonoTextStyle::new(&FONT_8X13_BOLD, BinaryColor::On);
-    // Compact font reserved for the UUID line — 36 chars at 4 px/char
-    // = 144 px, fits comfortably in the DEVICE column's value budget.
-    // Used only for the UUID value (the key/label keeps the body font
-    // so the column lines up visually).
-    let small_style = MonoTextStyle::new(&FONT_4X6, BinaryColor::On);
     let key_aligned = TextStyleBuilder::new()
         .alignment(Alignment::Right)
         .baseline(Baseline::Bottom)
@@ -648,31 +681,23 @@ pub fn draw_build_info(
     draw_kv(&mut target, device_colon_x, device_value_x, row_y(2), "Model", info.device_model);
     draw_kv(&mut target, device_colon_x, device_value_x, row_y(3), "Name", name_str);
 
-    // UUID row: key in body font, value in compact font so the full
-    // 36-char UUID fits. Empty/None renders as "(awaiting…)" using
-    // ASCII so the user knows we haven't been issued one yet.
+    // UUID row: rendered in the column's body font so it lines up
+    // visually with Maker / Model / Name. The full 36-char UUID
+    // doesn't fit the column budget at body width, so we show the
+    // first 8 chars (git-style short id) — enough to identify the
+    // device without forcing a font mismatch on a single row. The
+    // small-font path is kept around for callers that need the
+    // full string elsewhere.
     let uuid_y = row_y(4);
-    let mut uuid_key_buf: HString<8> = HString::new();
-    let _ = uuid_key_buf.push_str("UUID:");
-    let _ = Text::with_text_style(
-        uuid_key_buf.as_str(),
-        Point::new(device_colon_x, uuid_y),
-        body_style,
-        key_aligned,
-    )
-    .draw(&mut target);
-    let uuid_value = if device_uuid.is_empty() {
-        "(awaiting...)"
+    let short_uuid: HString<10> = if device_uuid.is_empty() {
+        HString::try_from("(none)").unwrap_or_default()
     } else {
-        device_uuid
+        let take = device_uuid.len().min(8);
+        let mut s: HString<10> = HString::new();
+        let _ = s.push_str(&device_uuid[..take]);
+        s
     };
-    let _ = Text::with_text_style(
-        uuid_value,
-        Point::new(device_value_x, uuid_y),
-        small_style,
-        value_aligned,
-    )
-    .draw(&mut target);
+    draw_kv(&mut target, device_colon_x, device_value_x, uuid_y, "UUID", short_uuid.as_str());
 
     // ── Countdown row (at bottom_y) ─────────────────────────────────
     // Centred and prominent. Always-reserved row so showing/hiding the

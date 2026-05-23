@@ -252,6 +252,29 @@ pub fn with_mut<R>(f: impl FnOnce(&mut ChromeState) -> R) -> R {
 //
 // All other (volatile-only) fields just have the simple form.
 
+// ── Value-equality dedup ────────────────────────────────────────────
+//
+// Every setter below routes through a small "compare-then-write under
+// the lock; return whether anything changed" helper, and only fires
+// the dirty signal (and, for `_with`-flavour setters, the persistence
+// hook) when the value actually transitioned. Without this, repeated
+// `set_X(same_value)` calls from per-wake retry loops, per-paint
+// timestamps, or per-tick polls all queue ChromeChanged events that
+// wake the panel actor, recompose the status bar, hash the
+// framebuffer, and *then* skip refresh on the hash-equality check.
+// That hash-level dedup still catches the rare case where two
+// different field changes produce identical pixels, but value-level
+// dedup here means the actor doesn't even wake when nothing changed —
+// the bar stays "live" (any real transition lands immediately) without
+// burning compose/hash cycles on noise.
+fn set_field<T: PartialEq>(current: &mut T, new: T) -> bool {
+    if *current == new {
+        return false;
+    }
+    *current = new;
+    true
+}
+
 /// `None` clears the field; `Some(&str)` stores it truncated to the
 /// field's heapless capacity. Truncation is silent because every
 /// destination is sized to the spec maximum for what it holds (SSID =
@@ -261,84 +284,108 @@ pub fn set_ssid(ssid: Option<&str>) {
     set_ssid_with(ssid, Persist::Volatile);
 }
 pub fn set_ssid_with(ssid: Option<&str>, persist: Persist) {
-    with_mut(|s| s.ssid = ssid.map(hstring_from));
-    maybe_persist(persist);
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.ssid, ssid.map(hstring_from)));
+    if changed {
+        maybe_persist(persist);
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_ip(ip: Option<&str>) {
-    with_mut(|s| s.ip = ip.map(hstring_from));
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.ip, ip.map(hstring_from)));
+    if changed {
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_gateway(gw: Option<&str>) {
-    with_mut(|s| s.gateway_v4 = gw.map(hstring_from));
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.gateway_v4, gw.map(hstring_from)));
+    if changed {
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_backend_url(url: Option<&str>) {
     set_backend_url_with(url, Persist::Volatile);
 }
 pub fn set_backend_url_with(url: Option<&str>, persist: Persist) {
-    with_mut(|s| s.backend_url = url.map(hstring_from));
-    maybe_persist(persist);
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.backend_url, url.map(hstring_from)));
+    if changed {
+        maybe_persist(persist);
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_wifi_link_state(state: WifiLinkState) {
-    with_mut(|s| s.wifi_link_state = state);
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.wifi_link_state, state));
+    if changed {
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_rssi_dbm(rssi: Option<i16>) {
-    with_mut(|s| s.rssi_dbm = rssi);
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.rssi_dbm, rssi));
+    if changed {
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_device_id(id: Option<&str>) {
-    with_mut(|s| s.device_id = id.map(hstring_from));
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.device_id, id.map(hstring_from)));
+    if changed {
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_device_uuid(uuid: Option<&str>) {
     set_device_uuid_with(uuid, Persist::Volatile);
 }
 pub fn set_device_uuid_with(uuid: Option<&str>, persist: Persist) {
-    with_mut(|s| s.device_uuid = uuid.map(hstring_from));
-    maybe_persist(persist);
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.device_uuid, uuid.map(hstring_from)));
+    if changed {
+        maybe_persist(persist);
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_device_name(name: Option<&str>) {
     set_device_name_with(name, Persist::Volatile);
 }
 pub fn set_device_name_with(name: Option<&str>, persist: Persist) {
-    with_mut(|s| s.device_name = name.map(hstring_from));
-    maybe_persist(persist);
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.device_name, name.map(hstring_from)));
+    if changed {
+        maybe_persist(persist);
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_owner_email(email: Option<&str>) {
     set_owner_email_with(email, Persist::Volatile);
 }
 pub fn set_owner_email_with(email: Option<&str>, persist: Persist) {
-    with_mut(|s| s.owner_email = email.map(hstring_from));
-    maybe_persist(persist);
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.owner_email, email.map(hstring_from)));
+    if changed {
+        maybe_persist(persist);
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_project_name(name: Option<&str>) {
     set_project_name_with(name, Persist::Volatile);
 }
 pub fn set_project_name_with(name: Option<&str>, persist: Persist) {
-    with_mut(|s| s.project_name = name.map(hstring_from));
-    maybe_persist(persist);
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.project_name, name.map(hstring_from)));
+    if changed {
+        maybe_persist(persist);
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_battery_mv(mv: Option<u16>) {
-    with_mut(|s| s.battery_mv = mv);
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.battery_mv, mv));
+    if changed {
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 /// Atomic battery update: mv + percent published together. Used by
@@ -346,31 +393,42 @@ pub fn set_battery_mv(mv: Option<u16>) {
 /// pair where mv reflects a fresh sample but percent is stale (or
 /// vice versa). Pass `None` to clear (e.g. "battery disconnected").
 pub fn set_battery(sample: Option<crate::BatterySample>) {
-    with_mut(|s| {
-        s.battery_mv = sample.map(|x| x.mv);
-        s.battery_percent = sample.map(|x| x.percent);
+    let changed = with_mut(|s| {
+        let mv_changed = set_field(&mut s.battery_mv, sample.map(|x| x.mv));
+        let pct_changed = set_field(&mut s.battery_percent, sample.map(|x| x.percent));
+        mv_changed || pct_changed
     });
-    invalidate(RefreshKind::Fast);
+    if changed {
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_usb_connected(c: Option<bool>) {
-    with_mut(|s| s.usb_connected = c);
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.usb_connected, c));
+    if changed {
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_device_status(status: DeviceStatus) {
-    with_mut(|s| s.device_status = status);
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.device_status, status));
+    if changed {
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_last_update(stamp: Option<&str>) {
-    with_mut(|s| s.last_update_local = stamp.map(hstring_from));
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.last_update_local, stamp.map(hstring_from)));
+    if changed {
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 pub fn set_boot_countdown_secs(secs: Option<u8>) {
-    with_mut(|s| s.boot_countdown_secs = secs);
-    invalidate(RefreshKind::Fast);
+    let changed = with_mut(|s| set_field(&mut s.boot_countdown_secs, secs));
+    if changed {
+        invalidate(RefreshKind::Fast);
+    }
 }
 
 fn maybe_persist(persist: Persist) {
@@ -386,15 +444,13 @@ fn maybe_persist(persist: Persist) {
 fn hstring_from<const N: usize>(s: &str) -> HString<N> {
     let mut h: HString<N> = HString::new();
     let cap = s.len().min(N);
-    // Walk by char boundary to avoid panicking on a sliced multibyte
-    // char. ASCII (the only thing we put here in practice — UUIDs,
-    // IPs, SSIDs, hex tokens) is unaffected.
-    let safe_end = s
-        .char_indices()
-        .take_while(|(i, _)| *i <= cap)
-        .last()
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+    // Back up to the nearest char boundary at or below `cap` so we
+    // never slice through a multibyte char. ASCII (UUIDs, IPs, SSIDs,
+    // hex tokens) lands exactly at `cap`.
+    let mut safe_end = cap;
+    while safe_end > 0 && !s.is_char_boundary(safe_end) {
+        safe_end -= 1;
+    }
     let _ = h.push_str(&s[..safe_end]);
     h
 }

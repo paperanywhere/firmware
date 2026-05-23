@@ -16,3 +16,9 @@ rustflags = [
   "-C", "link-arg=-Tlinkall.x",
   "-C", "link-arg=-nostartfiles",
 ]
+
+# sccache wraps rustc to cache build artifacts across clean builds and
+# branches. Local-disk cache by default at ~/Library/Caches/Mozilla.sccache
+# (macOS). Override via SCCACHE_DIR / SCCACHE_CACHE_SIZE if needed.
+[build]
+rustc-wrapper = "sccache"
