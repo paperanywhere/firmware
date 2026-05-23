@@ -306,10 +306,20 @@ where
     let assoc_result = wifi.associate(&creds).await;
     if let Err(e) = assoc_result {
         error!("wake: wifi.associate FAILED: {:?}", e);
-        // Tell the actor we're disconnected before bailing so any
-        // subsequent forced refresh (e.g. boot screen on a retry)
-        // shows the slashed wifi icon + Disconnected link label.
         paint::submit_silent(paint, PaintCmd::WifiDisconnected).await;
+        // Auth failures are PERMANENT until creds change — looping is
+        // futile and just hammers the AP. Halt with a BSOD that
+        // names the SSID so the user knows exactly what to fix.
+        if W::is_auth_error(&e) {
+            halt_with_screen(
+                paint,
+                "WiFi authentication failed.",
+                "The AP rejected our credentials or refused the handshake. \
+                 Re-provision with `pa-dev provision` to change SSID/password.",
+                "PA-WIFI-AUTH",
+            )
+            .await;
+        }
         return Err(WakeError::WifiAssociate);
     }
     info!("wake: wifi associated ok");
@@ -436,7 +446,16 @@ where
             "no Ã¢â‚¬â€ render adoption screen"
         }
     );
-    let Some(token) = token_opt else {
+    // If we have a token AND a cached claim_code, we registered with
+    // the backend but the user hasn't completed dashboard adoption
+    // yet. Keep showing the adoption screen + poll /state to detect
+    // when the user pairs (backend will clear claim_code in response,
+    // we clear it locally on next register-skip wake).
+    let still_unadopted = token_opt.is_some() && nvs.load_claim_code().is_some();
+    if still_unadopted {
+        info!("wake: registered but claim_code still cached — keep adoption screen + poll /state");
+    }
+    let Some(token) = token_opt.filter(|_| !still_unadopted) else {
         warn!(
             "wake: no device token (unclaimed) -- adoption screen on main region, skipping /state"
         );
@@ -468,6 +487,23 @@ where
         info!("wake: adoption screen paint queued (seq={}) â€” awaiting panel refresh before register", adoption_handle.seq());
         adoption_handle.await_processed().await;
         info!("wake: adoption screen refresh complete â€” proceeding to register");
+
+        // DEBUG: skip /register entirely so the operator can verify
+        // basic network connectivity (ping from another host on the
+        // LAN) before involving the HTTP path. Set DEBUG_SKIP_REGISTER
+        // to false to restore the normal flow. Validated 2026-05-22:
+        // pings to the device work cleanly while in skip mode, so
+        // network is healthy — turning off to test /register again.
+        const DEBUG_SKIP_REGISTER: bool = false;
+        if DEBUG_SKIP_REGISTER {
+            info!(
+                "wake: DEBUG_SKIP_REGISTER — device IP {} is up, sitting at adoption screen. \
+                 Try `ping {}` from another LAN host to verify basic connectivity.",
+                ip_string.as_deref().unwrap_or("--"),
+                ip_string.as_deref().unwrap_or("<no ip>")
+            );
+            return Ok((FAILURE_RETRY_SEC, PowerPolicy::AlwaysOn));
+        }
 
         // Now do the register call. Idempotent on MAC, so a re-wake
         // re-issues a fresh claim code without creating a duplicate
@@ -528,7 +564,27 @@ where
                 }
             }
         } else {
-            info!("wake: claim code already cached in NVS Ã¢â‚¬â€ skipping register");
+            info!("wake: claim code already cached in NVS - probing /state for adoption");
+            // Poll /state with our token. If 200 -> backend has accepted
+            // us as adopted (the dashboard consumed the claim_code);
+            // clear it locally so the next wake takes the /state-only
+            // path. If 401 -> token stale, clear both + re-register.
+            if let Some(t) = nvs.load_device_token() {
+                match http.get_state(&t).await {
+                    Ok(_) => {
+                        info!("wake: /state ok with token - device is adopted, clearing claim_code");
+                        nvs.clear_claim_code();
+                    }
+                    Err(e) if H::is_unauthorized_error(&e) => {
+                        warn!("wake: /state returned 401 - token stale, re-registering on next wake");
+                        nvs.clear_device_token();
+                        nvs.clear_claim_code();
+                    }
+                    Err(e) => {
+                        info!("wake: /state probe transient err {:?} - adoption screen stays", e);
+                    }
+                }
+            }
         }
 
         // Stay AlwaysOn so the backend can reach us to push the
@@ -796,12 +852,22 @@ async fn halt_with_screen(
             code,
         })
         .await;
+    // Slow heartbeat instead of spin_loop. spin_loop on this task
+    // doesn't actively block the executor (other tasks are still
+    // interrupt-scheduled), but it pegs the runtime task at 100% CPU
+    // and prevents serial / dev-tools from seeing periodic life-signs.
+    // A 30 s heartbeat keeps the device discoverable via the monitor
+    // and ensures espflash reset / flash work cleanly without racing
+    // CPU spin. Other tasks (embassy-net, panel actor) continue as
+    // normal because they run on their own executors.
+    let mut tick: u32 = 0;
     loop {
-        // `embassy_futures::yield_now` would be polite but isn't
-        // necessary here: this halt is terminal, and the other tasks
-        // (embassy-net, panel actor) are scheduled by interrupts so
-        // they keep firing even while this task spins.
-        core::hint::spin_loop();
+        embassy_time::Timer::after(embassy_time::Duration::from_secs(30)).await;
+        tick = tick.saturating_add(1);
+        log::warn!(
+            "halt tick #{}: {} ({}) — power-cycle or re-provision to recover",
+            tick, headline, code
+        );
     }
 }
 

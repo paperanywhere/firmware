@@ -343,6 +343,15 @@ pub trait WifiLink {
     fn gateway_v4(&self) -> Option<[u8; 4]> {
         None
     }
+    /// `true` if the error is a permanent authentication failure
+    /// (bad password, WPA handshake rejected) and there's no point
+    /// retrying. The runtime uses this to halt with a clear BSOD
+    /// instead of looping forever against bad credentials. Defaults
+    /// to `false` for impls that can't distinguish auth failures
+    /// from transient connect failures.
+    fn is_auth_error(_err: &Self::Error) -> bool {
+        false
+    }
 }
 
 // Registration shapes also live in proto — the request body

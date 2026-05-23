@@ -36,6 +36,12 @@ pub enum WifiError {
     /// or the WPA handshake stalled. Caller logs + retries on the
     /// next wake instead of blocking forever.
     Timeout,
+    /// WPA / WPA2 authentication was rejected by the AP. Either the
+    /// password is wrong, MAC filtering blocked us, or the AP's
+    /// 4-way handshake didn't complete (FourWayHandshakeTimeout).
+    /// The runtime turns this into a BSOD-style halt — there's no
+    /// point retrying when the AP won't accept us at the WPA layer.
+    AuthFailed,
 }
 
 /// Owns the active controller after a successful `init`. Implements
@@ -81,14 +87,20 @@ impl FwWifi {
         self.stack = Some(stack);
     }
 
-    /// Wait for embassy-net to acquire an IPv4 config (DHCP). On
-    /// timeout, fall back to a static config built from a previously
-    /// cached lease in NVS (if one exists for the SSID we're currently
-    /// associated to). Returns `true` if the stack ended up with an
-    /// IP, `false` if neither DHCP nor cached-fallback yielded one.
+    /// Wait for embassy-net to acquire an IPv4 config (DHCP). Returns
+    /// `true` if DHCP succeeded.
     ///
-    /// Saves a fresh DHCP lease to NVS on success so the next boot
-    /// has a fallback to use.
+    /// Saves a fresh DHCP lease to NVS on success (for future
+    /// observability / out-of-tree static-fallback consumers).
+    ///
+    /// Note: the static-lease *consumption* path was disabled
+    /// 2026-05-22 — empirically the fallback claimed stale leases on
+    /// networks with the same SSID but different subnets, leaving the
+    /// device with an IP no one on the LAN routes to. The save side
+    /// stays because it's harmless and useful for diagnostics. If
+    /// you genuinely need the fallback for an air-gapped same-network
+    /// reboot scenario, gate it on a separate opt-in flag, not on
+    /// every DHCP timeout.
     ///
     /// `unsafe`-via-AtomicPtr access to FwNvs follows the same handoff
     /// pattern as `boot::flash_persist_hook` — see NVS_HANDOFF
@@ -122,43 +134,16 @@ impl FwWifi {
                 true
             }
             embassy_futures::select::Either::Second(()) => {
-                let lease = crate::wifi::load_cached_lease(&self.current_ssid);
-                match lease {
-                    Some(l) => {
-                        log::warn!(
-                            "wifi: DHCP timed out — using cached lease ip={:?}/{} gw={:?} dns={:?}",
-                            l.ipv4, l.prefix, l.gateway, l.dns
-                        );
-                        let cidr = embassy_net::Ipv4Cidr::new(
-                            embassy_net::Ipv4Address::from_bits(u32::from_be_bytes(l.ipv4)),
-                            l.prefix,
-                        );
-                        let gateway = l.gateway.map(|g| {
-                            embassy_net::Ipv4Address::from_bits(u32::from_be_bytes(g))
-                        });
-                        let mut dns_servers = heapless::Vec::new();
-                        if let Some(dns) = l.dns {
-                            let _ = dns_servers.push(
-                                embassy_net::Ipv4Address::from_bits(u32::from_be_bytes(dns)),
-                            );
-                        }
-                        stack.set_config_v4(embassy_net::ConfigV4::Static(
-                            embassy_net::StaticConfigV4 {
-                                address: cidr,
-                                gateway,
-                                dns_servers,
-                            },
-                        ));
-                        true
-                    }
-                    None => {
-                        log::warn!(
-                            "wifi: DHCP timed out and no cached lease for {:?}",
-                            self.current_ssid
-                        );
-                        false
-                    }
-                }
+                // Static-lease fallback intentionally disabled. The cache
+                // was claiming stale IPs on networks with the same SSID
+                // but different subnets, which left the device with an
+                // IP no one on the LAN routes to. The save side stays
+                // (cache_lease above) so out-of-tree code can opt in.
+                log::warn!(
+                    "wifi: DHCP timed out on \"{}\" — wake will retry on next cycle",
+                    self.current_ssid
+                );
+                false
             }
         }
     }
@@ -417,13 +402,40 @@ impl WifiLink for FwWifi {
                 // and we don't want a missing cached-lease to look
                 // like a fresh association failure.
                 let _ = self
-                    .wait_for_ip_or_fallback(Duration::from_secs(15))
+                    .wait_for_ip_or_fallback(Duration::from_secs(30))
                     .await;
                 Ok(())
             }
             Either::First(Err(e)) => {
                 log::error!("wifi: esp-radio connect_async err: {:?}", e);
-                Err(WifiError::ConnectFailed)
+                // Map WPA / authentication failures to AuthFailed so
+                // the runtime knows to halt with BSOD instead of
+                // retrying forever. esp-radio surfaces these as a
+                // Disconnected event with a reason code:
+                //   - AuthenticationFailed: AP outright rejected creds
+                //   - FourWayHandshakeTimeout: AP didn't finish the WPA
+                //     handshake (bad password, MAC ACL, or rate limit)
+                //   - HandshakeTimeout: same family
+                //   - AssocFail / AssocExpire: AP refused association
+                let is_auth = matches!(
+                    &e,
+                    esp_radio::wifi::WifiError::Disconnected(info)
+                    if matches!(
+                        info.reason,
+                        esp_radio::wifi::DisconnectReason::AuthenticationFailed
+                            | esp_radio::wifi::DisconnectReason::AuthenticationExpired
+                            | esp_radio::wifi::DisconnectReason::FourWayHandshakeTimeout
+                            | esp_radio::wifi::DisconnectReason::HandshakeTimeout
+                            | esp_radio::wifi::DisconnectReason::AssociationFailed
+                            | esp_radio::wifi::DisconnectReason::_802_1xAuthenticationFailed
+                            | esp_radio::wifi::DisconnectReason::MicFailure
+                    )
+                );
+                if is_auth {
+                    Err(WifiError::AuthFailed)
+                } else {
+                    Err(WifiError::ConnectFailed)
+                }
             }
             Either::Second(_) => Err(WifiError::Timeout),
         }
@@ -454,6 +466,10 @@ impl WifiLink for FwWifi {
         let stack = self.stack?;
         let cfg = stack.config_v4()?;
         Some(cfg.address.address().octets())
+    }
+
+    fn is_auth_error(err: &Self::Error) -> bool {
+        matches!(err, WifiError::AuthFailed | WifiError::BadCreds)
     }
 
     fn gateway_v4(&self) -> Option<[u8; 4]> {

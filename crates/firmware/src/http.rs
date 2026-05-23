@@ -266,17 +266,20 @@ async fn request_with_full_body(
     let t_connect = Instant::now();
 
     // ── One-shot network reachability probe (task #117) ────────────
-    // The first time through, before we ever try the real backend,
-    // probe two well-known endpoints to localise the connect
-    // timeout: the DHCP-advertised gateway (proves on-LAN ARP +
-    // L2 RX works) and 8.8.8.8:53 (proves egress through the
-    // router works). Both run with a 3-second timeout — enough to
-    // see SYN-ACK arrive over a healthy connection but short enough
-    // to keep boot reasonable when there's no internet.
+    // DISABLED on the runtime path — kept compiled for future diag
+    // sessions but gated behind a const that's `false` by default.
+    // Reason: the probes (DNS to 1.1.1.1 + TCP to gateway + TCP to
+    // 8.8.8.8) burn up to ~11 s of radio time before the actual
+    // register call. On networks where the first connect attempt has
+    // a narrow window of working state (observed empirically on
+    // Foxpaws Network UniFi: device works on fresh boot, then drops
+    // into the blackhole), the probe phase consumes that window
+    // entirely. Flip this to `true` only when actively diagnosing.
+    const RUN_PROBES: bool = false;
     {
         use core::sync::atomic::{AtomicBool, Ordering};
         static PROBED: AtomicBool = AtomicBool::new(false);
-        if !PROBED.swap(true, Ordering::SeqCst) {
+        if RUN_PROBES && !PROBED.swap(true, Ordering::SeqCst) {
             // Dump full DHCP cfg — heartbeat truncates gateway display.
             if let Some(cfg) = stack.config_v4() {
                 log::info!(
@@ -510,57 +513,20 @@ async fn request_with_full_body(
             }
             drop(socket);
 
-            // ── force_reconnect fallback (task #117) ─────────────────
-            // Static-ARP preflight didn't save us — the actual SYN
-            // delivery is broken at L2 even with a known gateway MAC.
-            // Force a wifi reassociate and try once more.
-            log::warn!(
-                "http: [{} {}] post-DHCP blackhole detected — forcing WiFi reconnect + 1 retry",
-                method, path
-            );
-            if crate::wifi::force_reconnect_via_handoff().await.is_err() {
-                return Err(HttpError::SocketConnect);
-            }
-            // Give DHCP a moment to land before retrying the connect.
-            embassy_time::Timer::after(embassy_time::Duration::from_secs(2)).await;
-            let mut retry_socket = TcpSocket::new(
-                **stack,
-                &mut tcp_rx_buf[..],
-                &mut tcp_tx_buf[..],
-            );
-            let retry_fut = retry_socket.connect((addr, *port));
-            match embassy_time::with_timeout(
-                embassy_time::Duration::from_secs(10),
-                retry_fut,
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    log::info!(
-                        "http: [{} {}] retry connect OK after reassociate",
-                        method, path
-                    );
-                    // Replace the original socket with the retry one
-                    // for the rest of the exchange path below.
-                    socket = retry_socket;
-                }
-                Ok(Err(e)) => {
-                    log::error!(
-                        "http: [{} {}] retry connect FAILED: {:?}",
-                        method, path, e
-                    );
-                    return Err(HttpError::SocketConnect);
-                }
-                Err(_) => {
-                    log::error!(
-                        "http: [{} {}] retry connect TIMEOUT after reassociate",
-                        method, path
-                    );
-                    return Err(HttpError::SocketConnect);
-                }
-            }
-            // force_reconnect succeeded — `socket` has been replaced
-            // and control falls through to the exchange phase below.
+            // Force_reconnect retry path used to live here. Removed
+            // 2026-05-22: empirically this makes things worse, not
+            // better. The reassoc fails with FourWayHandshakeTimeout
+            // (AP hasn't processed our deauth yet) and leaves us in a
+            // half-associated state that survives across the next wake
+            // cycle's wait. Better behavior: bubble the SocketConnect
+            // error, let the wake-cycle's 60 s back-off give the AP
+            // time to settle, then try fresh next cycle. The "device
+            // works on fresh boot, broken after one timeout" pattern
+            // is the symptom — fix is to NOT trigger reassoc on first
+            // failure. Kept FwWifi::force_reconnect helper available
+            // for explicit use cases (it's still correct code; just
+            // not the right move on connect timeout).
+            return Err(HttpError::SocketConnect);
         }
     }
 
