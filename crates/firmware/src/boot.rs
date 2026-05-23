@@ -174,6 +174,12 @@ pub fn run(resources: FirmwareResources) -> ! {
     // migration path can write directly into it. The resolver may also
     // migrate from other future sources (SD card, captive portal).
     let mut nvs = FwNvs::init(flash);
+    // 2026-05-22 refactor: token + claim_code are no longer persisted.
+    // Clear any leftover values from older firmware so the wake cycle
+    // always takes the re-register path. UUID stays (chrome-persisted)
+    // for boot-screen continuity.
+    nvs.clear_device_token();
+    nvs.clear_claim_code();
     let path = crate::provisioning::resolve(board, &mut nvs);
     println!("boot: setup path = {:?}", path);
     if matches!(path, SetupPath::NotProvisioned) {

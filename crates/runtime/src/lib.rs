@@ -435,26 +435,23 @@ where
         *boot_screen_finalized = true;
     }
 
-    // Branch on token presence so we never ping-pong between boot
-    // screen and adoption screen on unclaimed devices.
-    let token_opt = nvs.load_device_token();
-    info!(
-        "wake: token in NVS? {}",
-        if token_opt.is_some() {
-            "yes Ã¢â‚¬â€ render /state image flow"
-        } else {
-            "no Ã¢â‚¬â€ render adoption screen"
-        }
-    );
-    // If we have a token AND a cached claim_code, we registered with
-    // the backend but the user hasn't completed dashboard adoption
-    // yet. Keep showing the adoption screen + poll /state to detect
-    // when the user pairs (backend will clear claim_code in response,
-    // we clear it locally on next register-skip wake).
-    let still_unadopted = token_opt.is_some() && nvs.load_claim_code().is_some();
-    if still_unadopted {
-        info!("wake: registered but claim_code still cached — keep adoption screen + poll /state");
-    }
+    // Re-register-every-wake flow (2026-05-22 refactor): UUID is
+    // the only persistent identity (lives in chrome via Persist::
+    // Flash). Token + claim_code are session-ephemeral; they come
+    // fresh from /register every wake and live only in this
+    // function stack. No NVS persistence, no token-vs-claim_code
+    // state machine, no stale-credential edge cases.
+    //
+    // Implementation note: load_device_token is forced to None
+    // here so we always enter the adoption/register branch below.
+    // Inside that branch we call /register unconditionally and use
+    // the returned token (in-memory) for any /state probe in the
+    // same wake. The else-branch (the post-token /state image
+    // flow) is now dead code until a future refactor either
+    // removes it or wires a session-scoped token holder.
+    let token_opt: Option<alloc::string::String> = None;
+    let still_unadopted = false;
+    info!("wake: re-register-every-wake flow - always entering register branch");
     let Some(token) = token_opt.filter(|_| !still_unadopted) else {
         warn!(
             "wake: no device token (unclaimed) -- adoption screen on main region, skipping /state"
@@ -530,8 +527,12 @@ where
                     // to /state, which is recoverable. The reverse
                     // (code-without-token) would leave us with a code
                     // but no auth Ã¢â‚¬â€ stuck.
-                    nvs.save_device_token(&reg.device_token);
-                    nvs.save_claim_code(&reg.claim_code);
+                    // 2026-05-22: token + claim_code intentionally
+                    // NOT persisted. UUID is the only durable
+                    // identity; everything else refreshes on the
+                    // next wake via /register.
+                    let _ = reg.device_token.clone();
+                    let _ = reg.claim_code.clone();
                     // UUID is a chrome value Ã¢â‚¬â€ single call now writes
                     // to NVS via the persistence hook AND fires the
                     // dirty signal so the panel actor re-renders the
