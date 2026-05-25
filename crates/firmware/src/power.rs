@@ -9,7 +9,7 @@
 use core::time::Duration;
 
 use esp_hal::peripherals::LPWR;
-use esp_hal::rtc_cntl::Rtc;
+use esp_hal::rtc_cntl::{Rtc, Rwdt};
 use esp_hal::rtc_cntl::sleep::TimerWakeupSource;
 use paperanywhere_ports::{PowerPolicy, Sleeper};
 
@@ -20,6 +20,25 @@ pub struct FwSleeper {
 impl FwSleeper {
     pub fn new(lpwr: LPWR<'static>) -> Self {
         Self { rtc: Rtc::new(lpwr) }
+    }
+
+    /// Construct a `FwSleeper` alongside an owned `Rwdt` handle, taken
+    /// from the same RTC peripheral. Rwdt is a zero-sized type — its
+    /// state lives in the LP_WDT registers, not in the struct — so
+    /// reading it out via `ptr::read` is safe: both the original
+    /// `rtc.rwdt` slot and the extracted copy operate on the same
+    /// hardware. We give the extracted one to the watchdog feeder
+    /// task and never touch `rtc.rwdt` again from sleep paths
+    /// (sleep_deep doesn't reference it).
+    pub fn new_with_rwdt(lpwr: LPWR<'static>) -> (Self, Rwdt) {
+        let rtc = Rtc::new(lpwr);
+        // SAFETY: Rwdt is a ZST (`pub struct Rwdt(())` — the inner
+        // unit is the only field). ptr::read on a ZST is a no-op at
+        // runtime. Both the original and the duplicate refer to the
+        // same global RTC-WDT register block; there is no per-handle
+        // state to conflict.
+        let rwdt = unsafe { core::ptr::read(&rtc.rwdt as *const Rwdt) };
+        (Self { rtc }, rwdt)
     }
 }
 

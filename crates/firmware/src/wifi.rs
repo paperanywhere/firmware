@@ -286,9 +286,77 @@ impl FwWifi {
         // reads from the hardware RNG through its own driver path.
         let _keep_rng = rng;
 
+        // ─── ROOT-CAUSE NOTE: esp-radio queue sizing ──────────────
+        //
+        // esp-radio 0.18's `Driver::receive()` returns `Option<(RxToken,
+        // TxToken)>` — smoltcp's trait requires every RX delivery to be
+        // PAIRED with a TX token (in case smoltcp wants to immediately
+        // emit a reply: ARP reply to ARP request, ICMP echo reply to
+        // echo request, etc.).
+        //
+        // `rx_token()` therefore reads:
+        //
+        //     if !is_empty {
+        //         self.tx_token().map(|tx| (RxToken, tx))
+        //     } else { None }
+        //
+        // and `tx_token()` requires
+        //
+        //     WIFI_TX_INFLIGHT < tx_queue_size
+        //
+        // With `ControllerConfig::default()` that's `tx_queue_size: 3`.
+        // A few unacked TX retries (very easy on WiFi — broadcasts,
+        // any frame to a peer that's momentarily slow, gratuitous ARP
+        // bursts) fill the in-flight counter. `tx_token()` returns
+        // None → `rx_token()` returns None → inbound frames pile up
+        // at the radio's recv_cb_sta callback, which logs "RX QUEUE
+        // FULL" at *debug* level (silently filtered out by our `info`
+        // log level) and the upper stack receives NOTHING.
+        //
+        // Observed 2026-05-24 on a perfectly healthy AP:
+        //   - rx_pkts frozen at 4 across 750+ runner polls
+        //   - All host-side pings timed out
+        //   - tx_pkts climbed normally (we WERE sending)
+        //   - tx_done callbacks not draining inflight fast enough
+        // Symptoms looked identical to "AP wireless client isolation"
+        // (took the better part of a week to disprove via an iPhone
+        // on the same SSID working fine).
+        //
+        // FIX: bump every queue. The numbers below are conservative
+        // for our workload (HTTP claim + periodic /state polls, no
+        // bulk traffic). Each static_rx buffer is ~1.6 KB; 16 of
+        // them is ~26 KB of SRAM. We have plenty (PSRAM heap free is
+        // ~8 MB at boot).
+        //
+        // DO NOT revert to ControllerConfig::default() without
+        // re-introducing this entire class of failure. The defaults
+        // exist for the "all-in-one-loop" example apps where the
+        // application IS the network stack and never lets TX inflight
+        // climb — they're not appropriate for any real workload that
+        // does keepalive / mDNS / DHCP renewal alongside user traffic.
+        //
+        // See memory: firmware-esp-radio-queue-sizing.
+        // ──────────────────────────────────────────────────────────
+        let cfg = ControllerConfig::default()
+            .with_rx_queue_size(32)
+            .with_tx_queue_size(16)
+            .with_static_rx_buf_num(16)
+            .with_dynamic_rx_buf_num(64)
+            .with_dynamic_tx_buf_num(32)
+            // AMSDU TX aggregates upper-layer frames into a single
+            // 802.11 MAC frame on the way down. Costs ~nothing for
+            // us (we rarely send a burst) but reduces airtime when
+            // we do (HTTP POSTs with chunked /state bodies, OTA
+            // download ACKs). Default OFF in upstream — enable.
+            .with_amsdu_tx_enable(true)
+            // Block-Ack window. Default 6 is sized for low-memory
+            // builds; 16 is the IDF recommendation when PSRAM is
+            // available (we have 8 MB free at boot). Better
+            // reordering tolerance on noisy WiFi == fewer retransmit
+            // storms == fewer false RX silences.
+            .with_rx_ba_win(16);
         let (controller, interfaces) =
-            esp_radio::wifi::new(wifi, ControllerConfig::default())
-                .map_err(|_| WifiError::ConnectFailed)?;
+            esp_radio::wifi::new(wifi, cfg).map_err(|_| WifiError::ConnectFailed)?;
 
         // ── MAC rotation (task #127, OFF by default) ──────────────
         // The plumbing is in place: rotate_station_mac() calls
@@ -306,6 +374,41 @@ impl FwWifi {
         const ROTATE_MAC: bool = false;
         if ROTATE_MAC {
             Self::rotate_station_mac();
+        }
+
+        // Diagnostic: read back the active station MAC so the trace
+        // captures the address other clients on the LAN will see in
+        // ARP / DHCP. Cross-references against `arp -a` on the host.
+        unsafe {
+            let mut mac = [0u8; 6];
+            let rc = esp_wifi_sys_esp32s3::include::esp_wifi_get_mac(
+                esp_wifi_sys_esp32s3::include::wifi_interface_t_WIFI_IF_STA,
+                mac.as_mut_ptr(),
+            );
+            log::info!(
+                "wifi: STA MAC rc={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                rc, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            );
+        }
+
+        // Force WiFi power-save OFF. The wifi.rs:311 comment ASSUMED
+        // esp-radio 0.18 defaults to PowerSaveMode::None, but the
+        // 2026-05-24 RX-stall investigation showed NET_RX_PKTS frozen
+        // at 3 after DHCP regardless of how many frames the AP sent us
+        // (verified host-side: ping requests reaching device, no
+        // replies, even though MAC is in the AP's bridge table). That
+        // is the modem-sleep RX-loss signature. Pin via the FFI to
+        // guarantee NONE regardless of upstream default drift.
+        unsafe {
+            let rc = esp_wifi_sys_esp32s3::include::esp_wifi_set_ps(
+                esp_wifi_sys_esp32s3::include::wifi_ps_type_t_WIFI_PS_NONE,
+            );
+            let mut readback: esp_wifi_sys_esp32s3::include::wifi_ps_type_t = 0;
+            let _ = esp_wifi_sys_esp32s3::include::esp_wifi_get_ps(&mut readback);
+            log::info!(
+                "wifi: esp_wifi_set_ps(NONE) rc={} readback={}",
+                rc, readback
+            );
         }
 
         // NOTE on WiFi power-save: esp-radio 0.18 defaults to

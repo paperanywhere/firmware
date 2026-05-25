@@ -71,7 +71,7 @@ critical-section = "1"
 # the new `esp-rtos` scheduler crate instead of the private feature on esp-hal
 # that the old `esp-wifi` 0.15 required. That fixes the resolver.
 esp-hal = { version = "1.1", features = ["esp32s3", "unstable"] }
-esp-radio = { version = "0.18", features = ["esp32s3", "wifi"] }
+esp-radio = { version = "0.18", features = ["esp32s3", "wifi", "unstable"] }
 # Direct dep on the esp-wifi-sys FFI surface so we can call
 # `esp_wifi_set_mac` to rotate the station MAC. Used for the
 # "freshen UniFi STA-table state" workaround — UniFi APs keep

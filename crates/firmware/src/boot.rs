@@ -241,7 +241,13 @@ pub fn run(resources: FirmwareResources) -> ! {
     } else {
         log::info!("sd: skipping mount — board has no SD slot or pins not wired");
     }
-    let sleeper_ref = SLEEPER.init(FwSleeper::new(lpwr));
+    // Pull the RWDT out of the RTC peripheral group at the same time
+    // we construct the sleeper. The WDT is initialised + armed here
+    // so it covers the rest of boot; the feeder task spawned below
+    // gates feeds on both cores' heartbeats.
+    let (sleeper, rwdt) = FwSleeper::new_with_rwdt(lpwr);
+    let sleeper_ref = SLEEPER.init(sleeper);
+    crate::watchdog::init(rwdt);
     // Battery gauge built from the per-board hardware bundle. Owned
     // by core 1 alongside the runtime (it's a peripheral-access path,
     // not a network-stack one).
@@ -608,6 +614,15 @@ pub fn run(resources: FirmwareResources) -> ! {
                 )
                 .expect("runtime_task pool");
                 spawner.spawn(rt_token);
+                // Core 1 liveness signal for the hw watchdog. Tied to
+                // its own task (not the panel actor / runtime) so a
+                // stall in either of those still surfaces as missed
+                // heartbeats — the WDT bites if THIS task can't get
+                // scheduled, which means core 1's executor itself is
+                // wedged.
+                let c1_hb = crate::diagnostics::core1_heartbeat_task()
+                    .expect("core1_heartbeat_task pool");
+                spawner.spawn(c1_hb);
             });
         },
     );
@@ -655,6 +670,14 @@ pub fn run(resources: FirmwareResources) -> ! {
         let diag_token =
             crate::diagnostics::heartbeat_task().expect("heartbeat_task pool");
         spawner.spawn(diag_token);
+        // Hardware watchdog feeder. Polls per-core heartbeat counters
+        // and feeds the RWDT only when BOTH cores have advanced. If
+        // either core wedges (esp-radio internals stall, runtime
+        // deadlock, etc.) feeds stop and the chip resets within
+        // watchdog::STAGE0_TIMEOUT_SECS.
+        let wdt_token = crate::watchdog::feeder_task()
+            .expect("watchdog feeder pool");
+        spawner.spawn(wdt_token);
     })
 }
 

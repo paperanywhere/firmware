@@ -45,6 +45,7 @@ mod power;
 mod provisioning;
 mod resources;
 mod sd_config;
+mod watchdog;
 mod wifi;
 
 /// Firmware version stamp produced by `build.rs` — e.g. `0.1.0+a1b2c3d4`.
